@@ -50,6 +50,20 @@ function Dropdown({ onSelect }: DropdownProps) {
     saveSettings(items, item);
   };
 
+  const handleDeleteItem = (itemToDelete: string) => {
+    const updatedItems = items.filter((item) => item !== itemToDelete);
+    setItems(updatedItems);
+    
+    let updatedSelected = selectedItem;
+    if (selectedItem === itemToDelete) {
+      updatedSelected = "";
+      setSelectedItem("");
+      if (onSelect) onSelect("");
+    }
+    
+    saveSettings(updatedItems, updatedSelected);
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
       e.preventDefault();
@@ -116,7 +130,7 @@ function Dropdown({ onSelect }: DropdownProps) {
           {/* List of names */}
           <ul className="list-none p-0 m-0">
             {filteredItems.map((item) => (
-              <li key={item}>
+              <li key={item} className="flex items-center">
                 <button 
                   type="button" 
                   onMouseDown={(e) => {
@@ -124,9 +138,20 @@ function Dropdown({ onSelect }: DropdownProps) {
                     e.preventDefault();
                   }}
                   onClick={() => handleSelectItem(item)}
-                  className="w-full text-left bg-transparent border-none py-[5px] px-[10px] cursor-pointer text-sm"
+                  className="text-left bg-transparent border-none py-[5px] px-[10px] cursor-pointer text-sm"
                 >
                   {item}
+                </button>
+                <button
+                  type="button"
+                  onMouseDown={(e) => {
+                    // Prevent input blur before click is handled
+                    e.preventDefault();
+                  }}
+                  onClick={() => handleDeleteItem(item)}
+                  className="bg-transparent border-none py-[5px] px-[10px] cursor-pointer text-xs text-red-500 font-bold"
+                >
+                  x
                 </button>
               </li>
             ))}

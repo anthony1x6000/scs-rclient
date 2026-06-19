@@ -124,26 +124,28 @@ function BackgroundWrapper({ children }: BackgroundWrapperProps) {
   return (
     <div className="relative min-h-screen text-slate-200">
       {/* Master Background Color Layer */}
-      <div className="fixed inset-0 -z-30 bg-black" />
+      <div className="fixed inset-0 z-0 bg-black" />
 
       {/* Master Background Image Layer */}
       {activeImage && (
         <div 
-          className="fixed inset-0 -z-20 bg-cover bg-center bg-no-repeat contrast-[1.1] sepia-[0.15]"
+          className="fixed inset-0 z-0 bg-cover bg-center bg-no-repeat contrast-[1.1] sepia-[0.15]"
           style={{ backgroundImage: `url('${activeImage}')`, opacity }} 
         />
       )}
 
       {/* Master Grain Overlay Layer */}
       <div 
-        className="fixed inset-0 -z-10 mix-blend-multiply pointer-events-none" 
+        className="fixed inset-0 z-0 mix-blend-multiply pointer-events-none" 
         style={{
           filter: `url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'><filter id='noiseFilter'><feTurbulence type='fractalNoise' baseFrequency='0.49' numOctaves='5' result='noise'/><feComponentTransfer in='noise' result='sharpNoise'><feFuncR type='linear' slope='3' intercept='-1'/><feFuncG type='linear' slope='3' intercept='-1'/><feFuncB type='linear' slope='3' intercept='-1'/></feComponentTransfer><feColorMatrix type='matrix' values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0'/></filter></svg>#noiseFilter")`
         }}
       />
 
       {/* Render whatever is inside the wrapper */}
-      {children}
+      <div className="relative z-10 min-h-screen">
+        {children}
+      </div>
     </div>
   );
 }

@@ -3,12 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import Dropdown from "./components/Dropdown";
 import BackgroundWrapper from "./BackgroundWrapper";
 import BaseWebDAVURL from "./components/BaseWebDAVUrl";
-import CommandExecutor from "./components/CommandExecutor";
+import CredentialsForm from "./components/CredentialsForm";
 
 function App() {
   const [mountDir, setMountDir] = useState<string>("");
 
   useEffect(() => {
+    // Fetch and set mount directory
     invoke<string>("get_mount_dir")
       .then(setMountDir)
       .catch(console.error);
@@ -31,8 +32,10 @@ function App() {
             </div>
           )}
         </div>
-        <CommandExecutor />
-        <BaseWebDAVURL />
+        <div className="flex items-center gap-1 w-full">
+          <CredentialsForm />
+          <BaseWebDAVURL />
+        </div>
       </div>
     </BackgroundWrapper>
   );
