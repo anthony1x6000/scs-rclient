@@ -17,7 +17,7 @@ function SettingsView({ onClose }: SettingsViewProps) {
         if (savedSubdir && typeof savedSubdir.value === "string") {
           setTestSubdir(savedSubdir.value);
         } else {
-          setTestSubdir("1052175-dev_asteve18/");
+          setTestSubdir("");
         }
       } catch (e) {
         console.error("Failed to load test subdirectory setting:", e);
