@@ -1,12 +1,11 @@
 import { useState } from "react";
 
 interface DropdownProps {
-  initialItems?: string[];
   onSelect?: (item: string) => void;
 }
 
-function Dropdown({ initialItems = [""], onSelect }: DropdownProps) {
-  const [items, setItems] = useState<string[]>(initialItems);
+function Dropdown({ onSelect }: DropdownProps) {
+  const [items, setItems] = useState<string[]>([]);
   const [selectedItem, setSelectedItem] = useState<string>("");
   const [isOpen, setIsOpen] = useState<boolean>(false);
   const [newItemText, setNewItemText] = useState<string>("");
@@ -44,9 +43,9 @@ function Dropdown({ initialItems = [""], onSelect }: DropdownProps) {
 
       {/* Dropdown menu */}
       {isOpen && (
-        <div className="absolute top-full left-0 bg-white border border-gray-300 z-50 min-w-[160px]">
+        <div className="absolute">
           {/* Input at the top to type new name */}
-          <form onSubmit={handleAddItem} className="flex p-[5px] border-b border-gray-300">
+          <form onSubmit={handleAddItem} className="flex p-[5px]">
             <input 
               type="text" 
               value={newItemText} 
@@ -54,7 +53,7 @@ function Dropdown({ initialItems = [""], onSelect }: DropdownProps) {
               placeholder="Type new name..." 
               className="flex-1 px-1 text-sm outline-none"
             />
-            <button type="submit" className="px-2 py-1 text-sm bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded ml-1 cursor-pointer">Add</button>
+            <button type="submit" className="cursor-pointer bg-gray-500 text-white pl-2 pr-2">Add</button>
           </form>
 
           {/* List of names */}
