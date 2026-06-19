@@ -9,6 +9,8 @@ finish-args:
   - --device=dri
   - --share=ipc
   - --share=network
+  - --filesystem=xdg-documents/scs-rclient:create
+  - --filesystem=xdg-config/rclone:ro
 modules:
   - name: scs-rclient
     buildsystem: simple
