@@ -59,7 +59,7 @@ function Dropdown({ onSelect }: DropdownProps) {
           onKeyDown={handleKeyDown}
           autoFocus
           placeholder={selectedItem || "select"}
-          className="text-5xl text-gray-300 lowercase cursor-text bg-transparent border-none outline-none w-full"
+          className="text-5xl text-gray-300 cursor-text bg-transparent border-none outline-none w-full"
         />
       ) : (
         <button 

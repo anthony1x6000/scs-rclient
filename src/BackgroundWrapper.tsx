@@ -56,6 +56,7 @@ function BackgroundWrapper({ children }: BackgroundWrapperProps) {
   );
 
   const [activeImage, setActiveImage] = useState<string>("");
+  const [activeImageUrl, setActiveImageUrl] = useState<string>("");
 
   // 1. Listen for window resize events to update current width & height
   useEffect(() => {
@@ -90,12 +91,14 @@ function BackgroundWrapper({ children }: BackgroundWrapperProps) {
           }
           return objectUrl;
         });
+        setActiveImageUrl(nextRawUrl);
       })
       .catch((error) => {
         console.error("Failed to prefetch image:", error);
         // Fallback directly to the raw URL path if fetch fails
         if (isMounted) {
           setActiveImage(nextRawUrl);
+          setActiveImageUrl(nextRawUrl);
         }
       });
 
@@ -115,13 +118,19 @@ function BackgroundWrapper({ children }: BackgroundWrapperProps) {
     };
   }, []);
 
+  const activeImgObj = images.find(img => img.url === activeImageUrl);
+  const opacity = activeImgObj && "opacity" in activeImgObj ? activeImgObj.opacity : 1.0;
+
   return (
-    <div className="relative min-h-screen text-slate-900">
+    <div className="relative min-h-screen text-slate-200">
+      {/* Master Background Color Layer */}
+      <div className="fixed inset-0 -z-30 bg-black" />
+
       {/* Master Background Image Layer */}
       {activeImage && (
         <div 
           className="fixed inset-0 -z-20 bg-cover bg-center bg-no-repeat contrast-[1.1] sepia-[0.15]"
-          style={{ backgroundImage: `url('${activeImage}')` }} 
+          style={{ backgroundImage: `url('${activeImage}')`, opacity }} 
         />
       )}
 
