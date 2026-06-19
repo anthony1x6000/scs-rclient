@@ -2,36 +2,43 @@
   {
     "width": 640,
     "height": 480,
-    "url": "http://tboake.com/gallery/pearson_complete/DSCN0985_resize.JPG"
+    "url": "http://tboake.com/gallery/pearson_complete/DSCN0985_resize.JPG",
+    "opacity": 0.6
   },
   {
     "width": 640,
     "height": 480,
-    "url": "http://tboake.com/gallery/pearson_complete/DSCN0868_resize.JPG"
+    "url": "http://tboake.com/gallery/pearson_complete/DSCN0868_resize.JPG",
+    "opacity": 0.6
   },
   {
     "width": 1920,
     "height": 1080,
-    "url": "https://upload.wikimedia.org/wikipedia/commons/2/20/Pearson_International.JPG"
+    "url": "https://upload.wikimedia.org/wikipedia/commons/2/20/Pearson_International.JPG",
+    "opacity": 0.8
   },
   {
     "width": 1920,
     "height": 1080,
-    "url": "https://upload.wikimedia.org/wikipedia/commons/5/54/Pearson_International_walkway.JPG"
+    "url": "https://upload.wikimedia.org/wikipedia/commons/5/54/Pearson_International_walkway.JPG",
+    "opacity": 0.8
   },
   {
     "width": 640,
     "height": 480,
-    "url": "https://ia800604.us.archive.org/BookReader/BookReaderImages.php?zip=/31/items/loud-paper-vol.-4-iss.-3/Loud%20Paper_Vol.4%20Iss.3_jp2.zip&file=Loud%20Paper_Vol.4%20Iss.3_jp2/Loud%20Paper_Vol.4%20Iss.3_0012.jp2&id=loud-paper-vol.-4-iss.-3&scale=2&rotate=0"
+    "url": "https://ia800604.us.archive.org/BookReader/BookReaderImages.php?zip=/31/items/loud-paper-vol.-4-iss.-3/Loud%20Paper_Vol.4%20Iss.3_jp2.zip&file=Loud%20Paper_Vol.4%20Iss.3_jp2/Loud%20Paper_Vol.4%20Iss.3_0012.jp2&id=loud-paper-vol.-4-iss.-3&scale=2&rotate=0",
+    "opacity": 0.5
   },
   {
     "width": 1024,
     "height": 768,
-    "url": "https://ia800604.us.archive.org/BookReader/BookReaderImages.php?zip=/31/items/loud-paper-vol.-4-iss.-3/Loud%20Paper_Vol.4%20Iss.3_jp2.zip&file=Loud%20Paper_Vol.4%20Iss.3_jp2/Loud%20Paper_Vol.4%20Iss.3_0010.jp2&id=loud-paper-vol.-4-iss.-3&scale=2&rotate=0"
+    "url": "https://ia800604.us.archive.org/BookReader/BookReaderImages.php?zip=/31/items/loud-paper-vol.-4-iss.-3/Loud%20Paper_Vol.4%20Iss.3_jp2.zip&file=Loud%20Paper_Vol.4%20Iss.3_jp2/Loud%20Paper_Vol.4%20Iss.3_0010.jp2&id=loud-paper-vol.-4-iss.-3&scale=2&rotate=0",
+    "opacity": 0.5
   },
   {
     "width": 640,
     "height": 480,
-    "url": "https://ia800604.us.archive.org/BookReader/BookReaderImages.php?zip=/31/items/loud-paper-vol.-4-iss.-3/Loud%20Paper_Vol.4%20Iss.3_jp2.zip&file=Loud%20Paper_Vol.4%20Iss.3_jp2/Loud%20Paper_Vol.4%20Iss.3_0013.jp2&id=loud-paper-vol.-4-iss.-3&scale=2&rotate=0"
+    "url": "https://ia800604.us.archive.org/BookReader/BookReaderImages.php?zip=/31/items/loud-paper-vol.-4-iss.-3/Loud%20Paper_Vol.4%20Iss.3_jp2.zip&file=Loud%20Paper_Vol.4%20Iss.3_jp2/Loud%20Paper_Vol.4%20Iss.3_0013.jp2&id=loud-paper-vol.-4-iss.-3&scale=2&rotate=0",
+    "opacity": 0.5
   }
 ]
