@@ -35,7 +35,7 @@ function BaseWebDAVURL() {
       value={url} 
       onChange={(e) => handleChange(e.target.value)} 
       placeholder="Paste WebDAV URL..." 
-      className="w-[50%] ml-2 px-2 py-1 text-xs border inline-block"
+      className="w-[50%] ml-2 px-2 py-1 text-xs border inline-block outline-none"
     />
   );
 }
