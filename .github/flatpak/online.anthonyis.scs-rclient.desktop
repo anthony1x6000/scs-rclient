@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=scs-rclient
+Exec=scs-rclient
+Icon=online.anthonyis.scs-rclient
+Categories=Utility;
+Terminal=false

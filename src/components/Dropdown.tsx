@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { load } from "@tauri-apps/plugin-store";
 
 interface DropdownProps {
   onSelect?: (item: string) => void;
@@ -10,11 +11,43 @@ function Dropdown({ onSelect }: DropdownProps) {
   const [isOpen, setIsOpen] = useState<boolean>(false);
   const [searchText, setSearchText] = useState<string>("");
 
+  useEffect(() => {
+    async function loadStoredSettings() {
+      try {
+        const store = await load("settings.json", { autoSave: true, defaults: {} });
+        const savedItems = await store.get<{ value: string[] }>("subdirectories");
+        const savedSelected = await store.get<{ value: string }>("selected_subdirectory");
+        
+        if (savedItems && Array.isArray(savedItems.value)) {
+          setItems(savedItems.value);
+        }
+        if (savedSelected && typeof savedSelected.value === "string") {
+          setSelectedItem(savedSelected.value);
+          if (onSelect) onSelect(savedSelected.value);
+        }
+      } catch (e) {
+        console.error("Failed to load subdirectories settings:", e);
+      }
+    }
+    loadStoredSettings();
+  }, []);
+
+  const saveSettings = async (updatedItems: string[], updatedSelected: string) => {
+    try {
+      const store = await load("settings.json", { autoSave: true, defaults: {} });
+      await store.set("subdirectories", { value: updatedItems });
+      await store.set("selected_subdirectory", { value: updatedSelected });
+    } catch (e) {
+      console.error("Failed to save subdirectories settings:", e);
+    }
+  };
+
   const handleSelectItem = (item: string) => {
     setSelectedItem(item);
     if (onSelect) onSelect(item);
     setIsOpen(false);
     setSearchText("");
+    saveSettings(items, item);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -22,13 +55,16 @@ function Dropdown({ onSelect }: DropdownProps) {
       e.preventDefault();
       const trimmed = searchText.trim();
       if (trimmed) {
+        let updatedItems = items;
         if (!items.includes(trimmed)) {
-          setItems((prev) => [...prev, trimmed]);
+          updatedItems = [...items, trimmed];
+          setItems(updatedItems);
         }
         setSelectedItem(trimmed);
         if (onSelect) onSelect(trimmed);
         setSearchText("");
         setIsOpen(false);
+        saveSettings(updatedItems, trimmed);
       }
     } else if (e.key === "Escape") {
       setIsOpen(false);
