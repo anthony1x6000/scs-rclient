@@ -1,14 +1,16 @@
-import Dropdown from "./Dropdown";
+import Dropdown from "./components/Dropdown";
 import BackgroundWrapper from "./BackgroundWrapper";
+
 
 function App() {
   return (
     <BackgroundWrapper>
-      <div style={{ padding: "20px" }}>
-        <h1>Hello World</h1>
-        <div style={{ marginTop: "20px" }}>
-          <Dropdown />
-        </div>
+      <div className="p-[2%]">
+        <Dropdown />
+      </div>
+
+      <div className="bottom-0 absolute p-[2%]">
+        Edit 
       </div>
     </BackgroundWrapper>
   );
