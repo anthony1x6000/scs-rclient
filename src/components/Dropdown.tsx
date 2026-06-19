@@ -36,14 +36,14 @@ function Dropdown({ onSelect }: DropdownProps) {
       <button 
         type="button" 
         onClick={() => setIsOpen((prev) => !prev)}
-        className="text-5xl text-gray-300 uppercase cursor-pointer"
+        className="text-5xl text-gray-300 lowercase cursor-pointer"
       >
         {selectedItem || "Select"}
       </button>
 
       {/* Dropdown menu */}
       {isOpen && (
-        <div className="absolute">
+        <div className="absolute bottom-full left-0">
           {/* Input at the top to type new name */}
           <form onSubmit={handleAddItem} className="flex p-[5px]">
             <input 
