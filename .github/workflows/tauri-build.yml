@@ -58,12 +58,65 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build Tauri App
+      - name: Build Standard Tauri App (Linux/Windows)
         run: pnpm tauri build
+
+      - name: Rename Standard Windows Installers (Windows only)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | Rename-Item -NewName { $_.Name -replace "-setup.exe$", "-standard-setup.exe" }
+          Get-ChildItem -Path src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | Rename-Item -NewName { $_.Name -replace ".msi$", "-standard.msi" }
+
+      - name: Build Tauri App with Embedded WebView2 (Windows only)
+        if: matrix.platform == 'windows-latest'
+        run: pnpm tauri build --config '{"bundle": {"windows": {"webviewInstallMode": {"type": "offlineInstaller"}}}}'
+
+      - name: Rename Embedded WebView2 Installers (Windows only)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*-standard-setup.exe" } | Rename-Item -NewName { $_.Name -replace "-setup.exe$", "-webview-inside-setup.exe" }
+          Get-ChildItem -Path src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*-standard.msi" } | Rename-Item -NewName { $_.Name -replace ".msi$", "-webview-inside.msi" }
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact-name }}
           path: ${{ matrix.artifact-path }}
+          if-no-files-found: error
+
+  flatpak:
+    name: Build Flatpak
+    runs-on: ubuntu-latest
+    needs: build
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-46
+      options: --privileged
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download Linux build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tauri-build-linux
+          path: src-tauri/target/release
+
+      - name: Make binary executable
+        run: chmod +x src-tauri/target/release/scs-rclient
+
+      - name: Build Flatpak Bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: scs-rclient.flatpak
+          manifest-path: .github/flatpak/online.anthonyis.scs-rclient.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          run-tests: false
+
+      - name: Upload Flatpak Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-build-flatpak
+          path: scs-rclient.flatpak
           if-no-files-found: error
