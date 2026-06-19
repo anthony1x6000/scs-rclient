@@ -4,9 +4,11 @@ import Dropdown from "./components/Dropdown";
 import BackgroundWrapper from "./BackgroundWrapper";
 import BaseWebDAVURL from "./components/BaseWebDAVUrl";
 import CredentialsForm from "./components/CredentialsForm";
+import SettingsView from "./components/SettingsView";
 
 function App() {
   const [mountDir, setMountDir] = useState<string>("");
+  const [showSettings, setShowSettings] = useState<boolean>(false);
 
   useEffect(() => {
     // Fetch and set mount directory
@@ -33,8 +35,21 @@ function App() {
           )}
         </div>
         <div className="flex items-center gap-1 w-full">
-          <CredentialsForm />
-          <BaseWebDAVURL />
+          {!showSettings ? (
+            <>
+              <CredentialsForm />
+              <BaseWebDAVURL />
+              <button
+                type="button"
+                onClick={() => setShowSettings(true)}
+                className="ml-2 px-3 py-1 text-xs border border-white/20 hover:border-white/40 focus:border-white/60 bg-transparent text-white outline-none cursor-pointer hover:bg-white/5 active:scale-95 transition-all text-nowrap"
+              >
+                Settings
+              </button>
+            </>
+          ) : (
+            <SettingsView onClose={() => setShowSettings(false)} />
+          )}
         </div>
       </div>
     </BackgroundWrapper>
