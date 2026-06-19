@@ -37,6 +37,7 @@ function Dropdown({ initialItems = [""], onSelect }: DropdownProps) {
       <button 
         type="button" 
         onClick={() => setIsOpen((prev) => !prev)}
+        className="text-5xl text-gray-300"
       >
         {selectedItem || "Select"}
       </button>
