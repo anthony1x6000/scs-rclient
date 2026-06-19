@@ -1,16 +1,19 @@
 import { useState, useEffect } from "react";
 import { load } from "@tauri-apps/plugin-store";
+import TextInput from "./TextInput";
 
 function BaseWebDAVURL() {
-  const [url, setUrl] = useState<string>("");
+  const [url, setUrl] = useState<string>("VITE_WEBDAV_BASE_URL_PLACEHOLDER");
 
   useEffect(() => {
     async function loadStoredUrl() {
       try {
         const store = await load("settings.json", { autoSave: true, defaults: {} });
         const saved = await store.get<{ value: string }>("webdav_url");
-        if (saved) {
+        if (saved && saved.value) {
           setUrl(saved.value);
+        } else {
+          setUrl("VITE_WEBDAV_BASE_URL_PLACEHOLDER");
         }
       } catch (e) {
         console.error("Failed to load WebDAV URL:", e);
@@ -30,12 +33,13 @@ function BaseWebDAVURL() {
   };
 
   return (
-    <input 
+    <TextInput 
       type="text" 
       value={url} 
       onChange={(e) => handleChange(e.target.value)} 
       placeholder="Paste WebDAV URL..." 
-      className="w-[50%] ml-2 px-2 py-1 text-xs border inline-block outline-none lowercase"
+      lowercase
+      className="w-[50%]"
     />
   );
 }

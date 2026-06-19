@@ -17,6 +17,26 @@ fn get_mount_dir(app: tauri::AppHandle) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn save_credentials(username: String, secret: String) -> Result<(), String> {
+    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| e.to_string())?;
+    entry.set_password(&secret).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_credentials(username: String) -> Result<String, String> {
+    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| e.to_string())?;
+    entry.get_password().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_credentials(username: String) -> Result<(), String> {
+    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| e.to_string())?;
+    let _ = entry.delete_credential();
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -35,7 +55,13 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet, get_mount_dir])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            get_mount_dir,
+            save_credentials,
+            get_credentials,
+            delete_credentials
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
