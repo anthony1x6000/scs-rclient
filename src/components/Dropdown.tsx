@@ -32,54 +32,39 @@ function Dropdown({ initialItems = [""], onSelect }: DropdownProps) {
   };
 
   return (
-    <div style={{ position: "relative", display: "inline-block" }}>
+    <div className="relative inline-block">
       {/* Dropdown trigger */}
       <button 
         type="button" 
         onClick={() => setIsOpen((prev) => !prev)}
-        className="text-5xl text-gray-300"
+        className="text-5xl text-gray-300 uppercase cursor-pointer"
       >
         {selectedItem || "Select"}
       </button>
 
       {/* Dropdown menu */}
       {isOpen && (
-        <div style={{
-          position: "absolute",
-          top: "100%",
-          left: 0,
-          background: "white",
-          border: "1px solid #ccc",
-          zIndex: 1000,
-          minWidth: "160px"
-        }}>
+        <div className="absolute top-full left-0 bg-white border border-gray-300 z-50 min-w-[160px]">
           {/* Input at the top to type new name */}
-          <form onSubmit={handleAddItem} style={{ display: "flex", padding: "5px", borderBottom: "1px solid #ccc" }}>
+          <form onSubmit={handleAddItem} className="flex p-[5px] border-b border-gray-300">
             <input 
               type="text" 
               value={newItemText} 
               onChange={(e) => setNewItemText(e.target.value)} 
               placeholder="Type new name..." 
-              style={{ flex: 1 }}
+              className="flex-1 px-1 text-sm outline-none"
             />
-            <button type="submit">Add</button>
+            <button type="submit" className="px-2 py-1 text-sm bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded ml-1 cursor-pointer">Add</button>
           </form>
 
           {/* List of names */}
-          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+          <ul className="list-none p-0 m-0">
             {items.map((item) => (
               <li key={item}>
                 <button 
                   type="button" 
                   onClick={() => handleSelectItem(item)}
-                  style={{
-                    width: "100%",
-                    textAlign: "left",
-                    background: "none",
-                    border: "none",
-                    padding: "5px 10px",
-                    cursor: "pointer"
-                  }}
+                  className="w-full text-left bg-transparent border-none py-[5px] px-[10px] cursor-pointer hover:bg-gray-100 text-sm"
                 >
                   {item}
                 </button>
