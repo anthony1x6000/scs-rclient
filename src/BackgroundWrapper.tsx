@@ -21,36 +21,30 @@ async function fetchImage(url: string): Promise<string> {
 /**
  * Resolves the best matching width x height category based on viewport size
  */
-function getBestMatchingCategory(width: number, height: number): string {
+/**
+ * Resolves the list of eligible images based on viewport size
+ */
+function getEligibleImages(width: number, height: number) {
   // Filter for images that are large enough to cover the viewport
   const eligible = images.filter(img => width <= img.width && height <= img.height);
   
-  let bestMatch;
   if (eligible.length > 0) {
-    // Find the smallest eligible image by area (to avoid loading too-large images)
-    const minArea = Math.min(...eligible.map(img => img.width * img.height));
-    bestMatch = eligible.find(img => img.width * img.height === minArea);
+    return eligible;
   } else {
-    // Fallback: If viewport is larger than all images, use the largest image by area
+    // Fallback: If viewport is larger than all images, use the largest image(s) by area
     const maxArea = Math.max(...images.map(img => img.width * img.height));
-    bestMatch = images.find(img => img.width * img.height === maxArea);
+    return images.filter(img => img.width * img.height === maxArea);
   }
-  
-  return bestMatch ? `${bestMatch.width}x${bestMatch.height}` : "1920x1080";
 }
 
 /**
- * Selects a random image path from the matched category
+ * Selects a random image path from the comma-separated eligible image URLs
  */
-function getRandomImage(category: string): string {
-  const [wStr, hStr] = category.split("x");
-  const targetW = Number(wStr);
-  const targetH = Number(hStr);
-
-  const list = images.filter(img => img.width === targetW && img.height === targetH);
-  if (list.length === 0) return "";
+function getRandomImageFromKeys(keysStr: string): string {
+  const list = keysStr.split(",");
+  if (list.length === 0 || !list[0]) return "";
   const randomIndex = Math.floor(Math.random() * list.length);
-  return list[randomIndex].url;
+  return list[randomIndex];
 }
 
 function BackgroundWrapper({ children }: BackgroundWrapperProps) {
@@ -61,7 +55,6 @@ function BackgroundWrapper({ children }: BackgroundWrapperProps) {
     typeof window !== "undefined" ? window.innerHeight : 768
   );
 
-  const [activeCategory, setActiveCategory] = useState<string>("");
   const [activeImage, setActiveImage] = useState<string>("");
 
   // 1. Listen for window resize events to update current width & height
@@ -77,14 +70,12 @@ function BackgroundWrapper({ children }: BackgroundWrapperProps) {
     return () => window.removeEventListener("resize", handleResize);
   }, []);
 
-  // 2. Select, fetch, and update image when width/height category changes
-  const currentCategory = getBestMatchingCategory(windowWidth, windowHeight);
+  // 2. Select, fetch, and update image when eligible image pool changes
+  const eligibleImages = getEligibleImages(windowWidth, windowHeight);
+  const eligibleKeys = eligibleImages.map(img => img.url).sort().join(",");
 
   useEffect(() => {
-    // Only load a new image if the resolved category changes
-    if (currentCategory === activeCategory && activeImage) return;
-
-    const nextRawUrl = getRandomImage(currentCategory);
+    const nextRawUrl = getRandomImageFromKeys(eligibleKeys);
     if (!nextRawUrl) return;
 
     let isMounted = true;
@@ -99,21 +90,19 @@ function BackgroundWrapper({ children }: BackgroundWrapperProps) {
           }
           return objectUrl;
         });
-        setActiveCategory(currentCategory);
       })
       .catch((error) => {
         console.error("Failed to prefetch image:", error);
         // Fallback directly to the raw URL path if fetch fails
         if (isMounted) {
           setActiveImage(nextRawUrl);
-          setActiveCategory(currentCategory);
         }
       });
 
     return () => {
       isMounted = false;
     };
-  }, [currentCategory]);
+  }, [eligibleKeys]);
 
 
   // 3. Clean up active blob URLs to prevent memory leaks when wrapper unmounts
@@ -140,7 +129,7 @@ function BackgroundWrapper({ children }: BackgroundWrapperProps) {
       <div 
         className="fixed inset-0 -z-10 mix-blend-multiply pointer-events-none" 
         style={{
-          filter: `url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'><filter id='noiseFilter'><feTurbulence type='fractalNoise' baseFrequency='0.99' numOctaves='4' result='noise'/><feComponentTransfer in='noise' result='sharpNoise'><feFuncR type='linear' slope='3' intercept='-1'/><feFuncG type='linear' slope='3' intercept='-1'/><feFuncB type='linear' slope='3' intercept='-1'/></feComponentTransfer><feColorMatrix type='matrix' values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0'/></filter></svg>#noiseFilter")`
+          filter: `url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'><filter id='noiseFilter'><feTurbulence type='fractalNoise' baseFrequency='0.49' numOctaves='5' result='noise'/><feComponentTransfer in='noise' result='sharpNoise'><feFuncR type='linear' slope='3' intercept='-1'/><feFuncG type='linear' slope='3' intercept='-1'/><feFuncB type='linear' slope='3' intercept='-1'/></feComponentTransfer><feColorMatrix type='matrix' values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0'/></filter></svg>#noiseFilter")`
         }}
       />
 
@@ -151,4 +140,4 @@ function BackgroundWrapper({ children }: BackgroundWrapperProps) {
 }
 
 export default BackgroundWrapper;
-
+
