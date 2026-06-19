@@ -4,3 +4,13 @@ html,
 body {
   background-color: black;
 }
+
+@theme {
+  --font-sans: "Roboto", sans-serif;
+}
+
+@layer base {
+  body {
+    @apply font-light;
+  }
+}
