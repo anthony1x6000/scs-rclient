@@ -5,10 +5,14 @@ import BackgroundWrapper from "./BackgroundWrapper";
 import BaseWebDAVURL from "./components/BaseWebDAVUrl";
 import CredentialsForm from "./components/CredentialsForm";
 import SettingsView from "./components/SettingsView";
+import { RcloneActions } from "./components/RcloneActions";
+import RcloneConsole from "./components/RcloneConsole";
 
 function App() {
   const [mountDir, setMountDir] = useState<string>("");
   const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [logs, setLogs] = useState<string>("");
+  const [isRunning, setIsRunning] = useState<boolean>(false);
 
   useEffect(() => {
     // Fetch and set mount directory
@@ -19,28 +23,21 @@ function App() {
 
   return (
     <BackgroundWrapper>
-      <div className="p-2">
-        <ul className="grid grid-cols-2 gap-2 list-none [&_li]:bg-gray-800/25 [&_li]:border [&_li]:border-white/50 [&_li]:p-3 [&_li]:text-center">
-          <li>Put --dry-run (copy local to remote)</li>
-          <li>Get --dry-run (copy remote to local)</li>
-          <li>Put (copy local to remote)</li>
-          <li>Get (copy remote to local)</li>
-          <li>List files in remote (ls)</li>
-          <li>List directories in remote (lsd)</li>
-          <li>Check difference (check)</li>
-        </ul>
-      </div>
+      <RcloneActions 
+        onLog={setLogs} 
+        isRunning={isRunning} 
+        setIsRunning={setIsRunning} 
+      />
       
-      <textarea className="w-screen h-fit min-h-0 p-2">
-      </textarea>
+      <RcloneConsole logs={logs} />
 
       <div className="bottom-0 absolute p-2 w-[100%] text-white flex flex-col gap-4">
         <div className="p-2 font-['Roboto'] font-light">
           <div className="text-nowrap">
-          <Dropdown />
-          <div className="inline italic">
-            a subdirectory of your WebDAV drive
-          </div>
+            <Dropdown />
+            <div className="inline italic">
+              a subdirectory of your WebDAV drive
+            </div>
           </div>
           {mountDir && (
             <div className="text-[10px] text-gray-400 font-mono mt-1 opacity-70">
@@ -71,3 +68,4 @@ function App() {
 }
 
 export default App;
+
