@@ -19,9 +19,18 @@ function App() {
 
   return (
     <BackgroundWrapper>
+      <div className="p-2">
+        <ul className="grid grid-cols-2 gap-2 list-none [&_li]:bg-gray-800/25 [&_li]:border [&_li]:border-white/50 [&_li]:p-3 [&_li]:text-center">
+          <li>Push</li>
+          <li>Pull</li>
+        </ul>
+      </div>
+      
+      <textarea className="w-screen h-fit min-h-0 p-2">
+      </textarea>
 
-      <div className="bottom-0 absolute p-[2%] w-[100%] text-white flex flex-col gap-4">
-        <div className="p-[2%] font-['Roboto'] font-light">
+      <div className="bottom-0 absolute p-2 w-[100%] text-white flex flex-col gap-4">
+        <div className="p-2 font-['Roboto'] font-light">
           <div className="text-nowrap">
           <Dropdown />
           <div className="inline italic">
