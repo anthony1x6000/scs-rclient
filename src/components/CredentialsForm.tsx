@@ -35,9 +35,32 @@ function CredentialsForm() {
   const validateCredentials = async (userVal: string, passVal: string) => {
     setStatus('testing');
     try {
-      console.log("Testing credentials with rclone...");
+      // 1. Resolve the test URL dynamically from the store using the selected subdirectory
+      const store = await load("settings.json", { autoSave: true, defaults: {} });
+      const savedBase = await store.get<{ value: string }>("webdav_url");
+      const savedSub = await store.get<{ value: string }>("selected_subdirectory");
       
-      // 1. Obscure the password because rclone's backend expects obscured password values
+      const baseUrl = savedBase?.value || import.meta.env.VITE_WEBDAV_BASE_URL || "";
+      const selectedSubdir = savedSub?.value !== undefined ? savedSub.value : "";
+      
+      let cleanBaseUrl = baseUrl.trim();
+      while (cleanBaseUrl.endsWith("/")) {
+        cleanBaseUrl = cleanBaseUrl.slice(0, -1);
+      }
+
+      let cleanSub = selectedSubdir.trim();
+      while (cleanSub.startsWith("/")) {
+        cleanSub = cleanSub.slice(1);
+      }
+      while (cleanSub.endsWith("/")) {
+        cleanSub = cleanSub.slice(0, -1);
+      }
+
+      const fullTestUrl = cleanSub ? `${cleanBaseUrl}/${cleanSub}` : cleanBaseUrl;
+
+      console.log("Testing credentials with rclone...", fullTestUrl);
+      
+      // 2. Obscure the password because rclone's backend expects obscured password values
       const obscureCommand = Command.create("rclone", ["obscure", passVal]);
       const obscureResult = await obscureCommand.execute();
       if (obscureResult.code !== 0) {
@@ -45,23 +68,9 @@ function CredentialsForm() {
       }
       const obscuredPassword = obscureResult.stdout.trim();
 
-      // 2. Resolve the test URL dynamically from the store
-      const store = await load("settings.json", { autoSave: true, defaults: {} });
-      const savedBase = await store.get<{ value: string }>("webdav_url");
-      const savedSub = await store.get<{ value: string }>("test_subdirectory");
-      
-      const baseUrl = savedBase?.value || import.meta.env.VITE_WEBDAV_BASE_URL || "";
-      const testSub = savedSub?.value !== undefined ? savedSub.value : "";
-      
-      let fullTestUrl = baseUrl;
-      if (!fullTestUrl.endsWith("/")) {
-        fullTestUrl += "/";
-      }
-      fullTestUrl += testSub;
-
-      // 3. Perform test rclone ls command with obscured password
+      // 3. Perform test rclone lsf command with obscured password
       const command = Command.create("rclone", [
-        "ls",
+        "lsf",
         ":webdav:",
         `--webdav-url=${fullTestUrl}`,
         `--webdav-user=${userVal}`,
