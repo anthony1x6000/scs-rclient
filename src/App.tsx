@@ -21,8 +21,13 @@ function App() {
     <BackgroundWrapper>
       <div className="p-2">
         <ul className="grid grid-cols-2 gap-2 list-none [&_li]:bg-gray-800/25 [&_li]:border [&_li]:border-white/50 [&_li]:p-3 [&_li]:text-center">
-          <li>Push</li>
-          <li>Pull</li>
+          <li>Put --dry-run (copy local to remote)</li>
+          <li>Get --dry-run (copy remote to local)</li>
+          <li>Put (copy local to remote)</li>
+          <li>Get (copy remote to local)</li>
+          <li>List files in remote (ls)</li>
+          <li>List directories in remote (lsd)</li>
+          <li>Check difference (check)</li>
         </ul>
       </div>
       
