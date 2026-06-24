@@ -5,7 +5,7 @@ import { Command } from "@tauri-apps/plugin-shell";
  * In development (pnpm tauri dev), it executes the system-installed 'rclone' executable (which must be in the developer's PATH).
  * In production (pnpm tauri build), it executes the bundled sidecar 'binaries/rclone'.
  */
-export function createRcloneCommand(args: string[]): Command<any> {
+export function createRcloneCommand(args: string[]): Command<string> {
   if (import.meta.env.DEV) {
     // Uses the system-installed rclone executable from the system's PATH
     return Command.create("rclone", args);
