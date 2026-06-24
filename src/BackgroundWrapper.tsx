@@ -44,7 +44,7 @@ function getRandomImageFromKeys(keysStr: string): string {
   const list = keysStr.split(",");
   if (list.length === 0 || !list[0]) return "";
   const randomIndex = Math.floor(Math.random() * list.length);
-  return list[randomIndex];
+  return list[randomIndex] ?? "";
 }
 
 function BackgroundWrapper({ children }: BackgroundWrapperProps) {

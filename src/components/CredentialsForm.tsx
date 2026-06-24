@@ -39,7 +39,7 @@ function CredentialsForm() {
       const savedBase = await store.get<{ value: string }>("webdav_url");
       const savedSub = await store.get<{ value: string }>("selected_subdirectory");
       
-      const baseUrl = savedBase?.value || import.meta.env.VITE_WEBDAV_BASE_URL || "";
+      const baseUrl = savedBase?.value || (import.meta.env["VITE_WEBDAV_BASE_URL"] as string | undefined) || "";
       const selectedSubdir = savedSub?.value !== undefined ? savedSub.value : "";
       
       const fullTestUrl = resolveRemoteUrl(baseUrl, selectedSubdir);
