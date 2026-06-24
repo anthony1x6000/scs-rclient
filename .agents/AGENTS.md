@@ -54,3 +54,9 @@ Tauri v2 requires explicit capabilities to invoke external system commands:
 - **`shell:allow-spawn`** is required for streaming background executions like `spawn()` (used for command log output in `RcloneActions.tsx`).
 - **`shell:allow-kill`** is required to terminate/kill spawned background executions (used for process cancellation in `RcloneActions.tsx`).
 All permissions must be configured for the `rclone` binary in [default.json](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/src-tauri/capabilities/default.json).
+
+---
+
+## 6. Git Commits Rule
+
+- **Do NOT commit on behalf of the user, ever.** The agent must write, modify, and verify code, but must never run `git commit`, `git add`, or stage files. The user is responsible for reviewing and committing all changes manually.
