@@ -1,12 +1,39 @@
 import { Command } from "@tauri-apps/plugin-shell";
 
+let useSystemRclone = import.meta.env.DEV;
+
+/**
+ * Detects if the packaged sidecar binary is valid and executable.
+ * If execution fails (e.g. due to dummy 0-byte file in local builds),
+ * falls back to using the system-installed 'rclone' binary.
+ */
+export async function detectRclone(): Promise<void> {
+  if (import.meta.env.DEV) {
+    useSystemRclone = true;
+    return;
+  }
+  try {
+    const testCmd = Command.sidecar("binaries/rclone", ["--version"]);
+    const res = await testCmd.execute();
+    if (res.code !== 0) {
+      useSystemRclone = true;
+    }
+  } catch (e) {
+    console.warn("Packaged rclone sidecar is invalid or unexecutable. Falling back to system rclone.", e);
+    useSystemRclone = true;
+  }
+}
+
+// Trigger detection immediately on module load
+detectRclone().catch(console.error);
+
 /**
  * Creates a Tauri Command for running rclone.
- * In development (pnpm tauri dev), it executes the system-installed 'rclone' executable (which must be in the developer's PATH).
- * In production (pnpm tauri build), it executes the bundled sidecar 'binaries/rclone'.
+ * If the sidecar is invalid or we are in development, it executes the system-installed 'rclone'.
+ * Otherwise, it executes the packaged sidecar 'binaries/rclone'.
  */
 export function createRcloneCommand(args: string[]): Command<string> {
-  if (import.meta.env.DEV) {
+  if (useSystemRclone) {
     // Uses the system-installed rclone executable from the system's PATH
     return Command.create("rclone", args);
   } else {
