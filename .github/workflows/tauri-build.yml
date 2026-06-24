@@ -233,7 +233,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-linux
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-46
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
       options: --privileged
     steps:
       - name: Checkout repository
