@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import { createRcloneCommand } from "../utils/rclone";
+import { Child, TerminatedPayload } from "@tauri-apps/plugin-shell";
 
 interface RcloneActionsProps {
   onLog: (text: string | ((prev: string) => string)) => void;
@@ -11,7 +12,7 @@ interface RcloneActionsProps {
 
 export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsProps) {
   const [mountDir, setMountDir] = useState<string>("");
-  const activeChildRef = useRef<any>(null);
+  const activeChildRef = useRef<Child | null>(null);
 
   useEffect(() => {
     invoke<string>("get_mount_dir")
@@ -180,7 +181,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
         onLog((prev) => prev + data);
       });
 
-      rcloneCmd.on("close", (data: any) => {
+      rcloneCmd.on("close", (data: TerminatedPayload) => {
         onLog((prev) => prev + `\nCommand finished with exit code ${data.code}.\n`);
         activeChildRef.current = null;
         setIsRunning(false);
