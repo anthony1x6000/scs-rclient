@@ -180,7 +180,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
         onLog((prev) => prev + data);
       });
 
-      rcloneCmd.on("close", (data) => {
+      rcloneCmd.on("close", (data: any) => {
         onLog((prev) => prev + `\nCommand finished with exit code ${data.code}.\n`);
         activeChildRef.current = null;
         setIsRunning(false);
