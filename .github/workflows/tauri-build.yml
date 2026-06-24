@@ -65,7 +65,8 @@ jobs:
           - platform: ubuntu-latest
             artifact-name: tauri-build-linux
             artifact-path: |
-              src-tauri/target/release/bundle/
+              src-tauri/target/release/bundle/deb/
+              src-tauri/target/release/bundle/appimage/
               src-tauri/target/release/scs-rclient
               src-tauri/target/release/rclone-x86_64-unknown-linux-gnu
             virustotal-files: |
@@ -74,11 +75,15 @@ jobs:
           - platform: windows-latest
             artifact-name: tauri-build-windows
             artifact-path: |
-              src-tauri/target/release/bundle/
-              src-tauri/target/release/scs-rclient.exe
+              src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
+              src-tauri/target/release/bundle/nsis/scs-rclient-win-7-portable.exe
+              src-tauri/target/release/bundle/msi/scs-rclient-win-10.msi
+              src-tauri/target/release/bundle/msi/scs-rclient-win-7.msi
             virustotal-files: |
-              src-tauri/target/release/bundle/nsis/*.exe
-              src-tauri/target/release/bundle/msi/*.msi
+              src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
+              src-tauri/target/release/bundle/nsis/scs-rclient-win-7-portable.exe
+              src-tauri/target/release/bundle/msi/scs-rclient-win-10.msi
+              src-tauri/target/release/bundle/msi/scs-rclient-win-7.msi
 
     runs-on: ${{ matrix.platform }}
 
@@ -139,23 +144,36 @@ jobs:
       - name: Build Standard Tauri App (Linux/Windows)
         run: pnpm tauri build
 
-      - name: Rename Standard Windows Installers (Windows only)
+      - name: Rename Standard Windows Artifacts (Windows only)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          Get-ChildItem -Path src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | Rename-Item -NewName { $_.Name -replace "-setup.exe$", "-standard-setup.exe" }
-          Get-ChildItem -Path src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | Rename-Item -NewName { $_.Name -replace ".msi$", "-standard.msi" }
+          $exeFile = Get-ChildItem -Path src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1
+          if ($exeFile) {
+            Rename-Item -Path $exeFile.FullName -NewName "scs-rclient-win-10-portable.exe"
+          }
+          $msiFile = Get-ChildItem -Path src-tauri/target/release/bundle/msi/*.msi | Select-Object -First 1
+          if ($msiFile) {
+            Rename-Item -Path $msiFile.FullName -NewName "scs-rclient-win-10.msi"
+          }
 
       - name: Build Tauri App with Embedded WebView2 (Windows only)
         if: matrix.platform == 'windows-latest'
-        run: pnpm tauri build --config '{"bundle": {"windows": {"webviewInstallMode": {"type": "offlineInstaller"}}}}'
+        run: |
+          pnpm tauri build --config '{"bundle": {"windows": {"webviewInstallMode": {"type": "offlineInstaller"}}}}'
 
-      - name: Rename Embedded WebView2 Installers (Windows only)
+      - name: Rename Embedded WebView2 Artifacts (Windows only)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          Get-ChildItem -Path src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*-standard-setup.exe" } | Rename-Item -NewName { $_.Name -replace "-setup.exe$", "-webview-inside-setup.exe" }
-          Get-ChildItem -Path src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*-standard.msi" } | Rename-Item -NewName { $_.Name -replace ".msi$", "-webview-inside.msi" }
+          $exeFile = Get-ChildItem -Path src-tauri/target/release/bundle/nsis/*.exe | Where-Object { $_.Name -notlike "*win-10*" } | Select-Object -First 1
+          if ($exeFile) {
+            Rename-Item -Path $exeFile.FullName -NewName "scs-rclient-win-7-portable.exe"
+          }
+          $msiFile = Get-ChildItem -Path src-tauri/target/release/bundle/msi/*.msi | Where-Object { $_.Name -notlike "*win-10*" } | Select-Object -First 1
+          if ($msiFile) {
+            Rename-Item -Path $msiFile.FullName -NewName "scs-rclient-win-7.msi"
+          }
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
