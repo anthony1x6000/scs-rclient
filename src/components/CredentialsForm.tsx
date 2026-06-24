@@ -45,15 +45,21 @@ function CredentialsForm() {
       const fullTestUrl = resolveRemoteUrl(baseUrl, selectedSubdir);
       console.log("Testing credentials with rclone...", fullTestUrl);
       
-      const obscuredPassword = await obscurePassword(passVal);
+      const obscuredPassword = passVal ? await obscurePassword(passVal) : "";
 
-      const command = createRcloneCommand([
+      const args = [
         "lsf",
         ":webdav:",
-        `--webdav-url=${fullTestUrl}`,
-        `--webdav-user=${userVal}`,
-        `--webdav-pass=${obscuredPassword}`
-      ]);
+        `--webdav-url=${fullTestUrl}`
+      ];
+      if (userVal) {
+        args.push(`--webdav-user=${userVal}`);
+      }
+      if (obscuredPassword) {
+        args.push(`--webdav-pass=${obscuredPassword}`);
+      }
+
+      const command = createRcloneCommand(args);
       const result = await command.execute();
       if (result.code === 0) {
         console.log("Rclone authentication test succeeded! Output:\n", result.stdout);
