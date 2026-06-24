@@ -21,9 +21,6 @@ jobs:
           update_release_body: true
           github_token: ${{ secrets.GITHUB_TOKEN }}
           files: |
-            .deb$
-            .AppImage$
             .exe$
-            .msi$
             .flatpak$
           request_rate: 2
