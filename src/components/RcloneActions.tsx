@@ -38,8 +38,8 @@ function buildActionArgs(
   action: 'put' | 'get' | 'put-dry' | 'get-dry' | 'ls' | 'lsd' | 'check',
   localPath: string,
   remoteUrl: string,
-  username: string,
-  obscuredPassword: string
+  username?: string,
+  obscuredPassword?: string
 ): string[] {
   let args: string[] = [];
   switch (action) {
@@ -66,11 +66,13 @@ function buildActionArgs(
       break;
   }
   args.push("-v");
-  args.push(
-    `--webdav-url=${remoteUrl}`,
-    `--webdav-user=${username}`,
-    `--webdav-pass=${obscuredPassword}`
-  );
+  args.push(`--webdav-url=${remoteUrl}`);
+  if (username) {
+    args.push(`--webdav-user=${username}`);
+  }
+  if (obscuredPassword) {
+    args.push(`--webdav-pass=${obscuredPassword}`);
+  }
   return args;
 }
 
@@ -123,8 +125,8 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
 
     try {
       const settings = await loadSettings();
-      if (!settings.baseUrl || !settings.username) {
-        onLog("Error: WebDAV URL and Username must be configured.\n");
+      if (!settings.baseUrl) {
+        onLog("Error: WebDAV URL must be configured.\n");
         setIsRunning(false);
         return;
       }
@@ -135,26 +137,29 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
         return;
       }
 
-      // Retrieve password securely from the OS keyring
-      onLog("Retrieving password from secure keyring...\n");
       let password = "";
-      try {
-        password = await invoke<string>("get_credentials", { username: settings.username });
-      } catch (e) {
-        onLog((prev) => prev + `Error retrieving credentials: ${e}\n`);
-        setIsRunning(false);
-        return;
-      }
-
-      if (!password) {
-        onLog("Error: Password not found. Please log in first.\n");
-        setIsRunning(false);
-        return;
+      if (settings.username) {
+        // Retrieve password securely from the OS keyring
+        onLog("Retrieving password from secure keyring...\n");
+        try {
+          password = await invoke<string>("get_credentials", { username: settings.username });
+        } catch (e) {
+          onLog((prev) => prev + `Note: Could not retrieve credentials from keyring: ${e}. Proceeding without password.\n`);
+        }
+      } else {
+        onLog("No username configured. Proceeding without credentials.\n");
       }
 
       // Obscure password because rclone expects obscured passwords for on-the-fly config
-      onLog("Obscuring password...\n");
-      const obscuredPassword = await obscurePassword(password);
+      let obscuredPassword = "";
+      if (password) {
+        onLog("Obscuring password...\n");
+        try {
+          obscuredPassword = await obscurePassword(password);
+        } catch (e) {
+          onLog((prev) => prev + `Warning: Failed to obscure password: ${e}. Proceeding without password.\n`);
+        }
+      }
 
       const remoteUrl = resolveRemoteUrl(settings.baseUrl, settings.selectedSubdir);
       const localPath = resolveLocalPath(mountDir, settings.selectedSubdir);
@@ -168,7 +173,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
           `Running command...\n`
       );
 
-      const args = buildActionArgs(action, localPath, remoteUrl, settings.username, obscuredPassword);
+      const args = buildActionArgs(action, localPath, remoteUrl, settings.username || undefined, obscuredPassword || undefined);
       const displayArgs = maskPasswordInArgs(args);
       onLog((prev) => prev + `rclone ${displayArgs.join(" ")}\n\n`);
 
