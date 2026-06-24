@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Command } from "@tauri-apps/plugin-shell";
 import { load } from "@tauri-apps/plugin-store";
+import { createRcloneCommand } from "../utils/rclone";
 
 interface RcloneActionsProps {
   onLog: (text: string | ((prev: string) => string)) => void;
@@ -85,7 +85,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
 
       // Obscure password because rclone expects obscured passwords for on-the-fly config
       onLog("Obscuring password...\n");
-      const obscureCommand = Command.create("rclone", ["obscure", password]);
+      const obscureCommand = createRcloneCommand(["obscure", password]);
       const obscureResult = await obscureCommand.execute();
       if (obscureResult.code !== 0) {
         onLog((prev) => prev + `Failed to obscure password: ${obscureResult.stderr}\n`);
@@ -169,7 +169,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
       });
       onLog((prev) => prev + `rclone ${displayArgs.join(" ")}\n\n`);
 
-      const rcloneCmd = Command.create("rclone", args);
+      const rcloneCmd = createRcloneCommand(args);
 
       // Listen for stdout / stderr real-time streams
       rcloneCmd.stdout.on("data", (data: string) => {
