@@ -37,8 +37,6 @@ To avoid managing global config files on the user's OS, we execute commands usin
 - **check:** `rclone check <local_path> :webdav: --webdav-url=...`
 - **Simulation:** Append `--dry-run` to copy commands.
 
----
-
 ## 4. Credentials Test Logging Requirement
 
 When validating user connection credentials (inside `src/components/CredentialsForm.tsx`), ensure the complete WebDAV URL path is logged to the debug console:
@@ -46,3 +44,12 @@ When validating user connection credentials (inside `src/components/CredentialsF
 console.log("Testing credentials with rclone...", fullTestUrl);
 ```
 Ensure `fullTestUrl` is fully resolved before executing this log statement.
+
+---
+
+## 5. Tauri Capability Permissions
+
+Tauri v2 requires explicit capabilities to invoke external system commands:
+- **`shell:allow-execute`** is required for synchronous/blocking checks like `execute()` (used for password obscuring and test calls in `CredentialsForm.tsx`).
+- **`shell:allow-spawn`** is required for streaming background executions like `spawn()` (used for command log output in `RcloneActions.tsx`).
+Both permissions must be configured for the `rclone` binary in [default.json](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/src-tauri/capabilities/default.json).
