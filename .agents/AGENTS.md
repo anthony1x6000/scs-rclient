@@ -52,4 +52,5 @@ Ensure `fullTestUrl` is fully resolved before executing this log statement.
 Tauri v2 requires explicit capabilities to invoke external system commands:
 - **`shell:allow-execute`** is required for synchronous/blocking checks like `execute()` (used for password obscuring and test calls in `CredentialsForm.tsx`).
 - **`shell:allow-spawn`** is required for streaming background executions like `spawn()` (used for command log output in `RcloneActions.tsx`).
-Both permissions must be configured for the `rclone` binary in [default.json](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/src-tauri/capabilities/default.json).
+- **`shell:allow-kill`** is required to terminate/kill spawned background executions (used for process cancellation in `RcloneActions.tsx`).
+All permissions must be configured for the `rclone` binary in [default.json](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/src-tauri/capabilities/default.json).

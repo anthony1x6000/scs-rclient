@@ -27,6 +27,16 @@
           "args": true
         }
       ]
+    },
+    {
+      "identifier": "shell:allow-kill",
+      "allow": [
+        {
+          "name": "rclone",
+          "cmd": "rclone",
+          "args": true
+        }
+      ]
     }
   ]
 }

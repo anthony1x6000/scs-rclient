@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Command } from "@tauri-apps/plugin-shell";
 import { load } from "@tauri-apps/plugin-store";
@@ -11,12 +11,33 @@ interface RcloneActionsProps {
 
 export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsProps) {
   const [mountDir, setMountDir] = useState<string>("");
+  const activeChildRef = useRef<any>(null);
 
   useEffect(() => {
     invoke<string>("get_mount_dir")
       .then(setMountDir)
       .catch(console.error);
+
+    return () => {
+      if (activeChildRef.current) {
+        activeChildRef.current.kill().catch(console.error);
+      }
+    };
   }, []);
+
+  const cancelCommand = async () => {
+    if (activeChildRef.current) {
+      onLog((prev) => prev + "\nCanceling active operation...\n");
+      try {
+        await activeChildRef.current.kill();
+        onLog((prev) => prev + "Operation canceled by user.\n");
+      } catch (e) {
+        onLog((prev) => prev + `Failed to cancel operation: ${e}\n`);
+      }
+      activeChildRef.current = null;
+      setIsRunning(false);
+    }
+  };
 
   const runRclone = async (action: 'put' | 'get' | 'put-dry' | 'get-dry' | 'ls' | 'lsd' | 'check') => {
     if (isRunning) return;
@@ -129,6 +150,9 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
           break;
       }
 
+      // Add verbose flag with every run of the command to see the status
+      args.push("-v");
+
       // Append credentials and endpoint configuration parameters dynamically
       args.push(
         `--webdav-url=${remoteUrl}`,
@@ -158,15 +182,18 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
 
       rcloneCmd.on("close", (data) => {
         onLog((prev) => prev + `\nCommand finished with exit code ${data.code}.\n`);
+        activeChildRef.current = null;
         setIsRunning(false);
       });
 
       rcloneCmd.on("error", (error: string) => {
         onLog((prev) => prev + `\nCommand error: ${error}\n`);
+        activeChildRef.current = null;
         setIsRunning(false);
       });
 
-      await rcloneCmd.spawn();
+      const child = await rcloneCmd.spawn();
+      activeChildRef.current = child;
     } catch (e) {
       onLog((prev) => prev + `System Error: ${e}\n`);
       setIsRunning(false);
@@ -219,6 +246,17 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
           Check difference (check)
         </li>
       </ul>
+      {isRunning && (
+        <div className="mt-2">
+          <button
+            type="button"
+            onClick={cancelCommand}
+            className="w-full bg-red-950/25 border border-red-500/50 hover:bg-red-900/20 text-red-400 p-3 text-center cursor-pointer transition-all active:scale-[0.99] select-none text-xs uppercase font-light tracking-wide"
+          >
+            Cancel active operation
+          </button>
+        </div>
+      )}
     </div>
   );
 }
