@@ -23,13 +23,15 @@ function App() {
 
   return (
     <BackgroundWrapper>
-      <RcloneActions 
-        onLog={setLogs} 
-        isRunning={isRunning} 
-        setIsRunning={setIsRunning} 
-      />
-      
-      <RcloneConsole logs={logs} />
+      <div className="flex flex-col h-screen pb-44 box-border">
+        <RcloneActions 
+          onLog={setLogs} 
+          isRunning={isRunning} 
+          setIsRunning={setIsRunning} 
+        />
+        
+        <RcloneConsole logs={logs} />
+      </div>
 
       <div className="bottom-0 absolute p-2 w-[100%] text-white flex flex-col gap-4">
         <div className="p-2 font-['Roboto'] font-light">
