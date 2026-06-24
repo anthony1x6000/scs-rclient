@@ -243,11 +243,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: tauri-build-linux
-          path: src-tauri/target/release
-
-      - name: Move dist directory to root
-        run: |
-          mv src-tauri/target/release/dist dist
+          path: .
 
       - name: Download cargo-sources.json
         uses: actions/download-artifact@v7
