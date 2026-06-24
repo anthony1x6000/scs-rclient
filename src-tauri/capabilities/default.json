@@ -15,6 +15,11 @@
           "name": "rclone",
           "cmd": "rclone",
           "args": true
+        },
+        {
+          "name": "binaries/rclone",
+          "sidecar": true,
+          "args": true
         }
       ]
     },
@@ -25,6 +30,11 @@
           "name": "rclone",
           "cmd": "rclone",
           "args": true
+        },
+        {
+          "name": "binaries/rclone",
+          "sidecar": true,
+          "args": true
         }
       ]
     },
@@ -34,6 +44,11 @@
         {
           "name": "rclone",
           "cmd": "rclone",
+          "args": true
+        },
+        {
+          "name": "binaries/rclone",
+          "sidecar": true,
           "args": true
         }
       ]

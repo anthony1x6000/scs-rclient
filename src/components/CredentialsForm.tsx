@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
-import { Command } from "@tauri-apps/plugin-shell";
+import { createRcloneCommand } from "../utils/rclone";
 import TextInput from "./TextInput";
 
 function CredentialsForm() {
@@ -61,7 +61,7 @@ function CredentialsForm() {
       console.log("Testing credentials with rclone...", fullTestUrl);
       
       // 2. Obscure the password because rclone's backend expects obscured password values
-      const obscureCommand = Command.create("rclone", ["obscure", passVal]);
+      const obscureCommand = createRcloneCommand(["obscure", passVal]);
       const obscureResult = await obscureCommand.execute();
       if (obscureResult.code !== 0) {
         throw new Error(`Failed to obscure password: ${obscureResult.stderr}`);
@@ -69,7 +69,7 @@ function CredentialsForm() {
       const obscuredPassword = obscureResult.stdout.trim();
 
       // 3. Perform test rclone lsf command with obscured password
-      const command = Command.create("rclone", [
+      const command = createRcloneCommand([
         "lsf",
         ":webdav:",
         `--webdav-url=${fullTestUrl}`,
