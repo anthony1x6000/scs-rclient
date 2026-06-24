@@ -17,6 +17,16 @@
           "args": true
         }
       ]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "rclone",
+          "cmd": "rclone",
+          "args": true
+        }
+      ]
     }
   ]
 }

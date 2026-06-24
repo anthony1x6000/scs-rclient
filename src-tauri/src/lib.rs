@@ -19,20 +19,40 @@ fn get_mount_dir(app: tauri::AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn save_credentials(username: String, secret: String) -> Result<(), String> {
-    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| e.to_string())?;
-    entry.set_password(&secret).map_err(|e| e.to_string())?;
+    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| {
+        let err_msg = format!("Keyring initialization failed: {}", e);
+        eprintln!("{}", err_msg);
+        err_msg
+    })?;
+    entry.set_password(&secret).map_err(|e| {
+        let err_msg = format!("Failed to save credentials in keyring: {}", e);
+        eprintln!("{}", err_msg);
+        err_msg
+    })?;
     Ok(())
 }
 
 #[tauri::command]
 fn get_credentials(username: String) -> Result<String, String> {
-    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| e.to_string())?;
-    entry.get_password().map_err(|e| e.to_string())
+    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| {
+        let err_msg = format!("Keyring initialization failed: {}", e);
+        eprintln!("{}", err_msg);
+        err_msg
+    })?;
+    entry.get_password().map_err(|e| {
+        let err_msg = format!("Failed to get credentials from keyring: {}", e);
+        eprintln!("{}", err_msg);
+        err_msg
+    })
 }
 
 #[tauri::command]
 fn delete_credentials(username: String) -> Result<(), String> {
-    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| e.to_string())?;
+    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| {
+        let err_msg = format!("Keyring initialization failed: {}", e);
+        eprintln!("{}", err_msg);
+        err_msg
+    })?;
     let _ = entry.delete_credential();
     Ok(())
 }

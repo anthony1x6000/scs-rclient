@@ -100,8 +100,20 @@ function CredentialsForm() {
       // Trigger the rclone validation process
       await validateCredentials(username, password);
     } catch (e) {
-      console.error("Error during credentials save/test:", e);
+      console.log("Error during credentials save/test (keyring save failed):", e);
       setStatus('error');
+    }
+  };
+
+  const handleBlur = async () => {
+    if (username.trim() && password.trim()) {
+      try {
+        const store = await load("settings.json", { autoSave: true, defaults: {} });
+        await store.set("saved_username", { value: username });
+        await invoke("save_credentials", { username, secret: password });
+      } catch (e) {
+        console.log("Failed to auto-save credentials on blur (keyring save failed):", e);
+      }
     }
   };
 
@@ -113,7 +125,14 @@ function CredentialsForm() {
         if (savedUser && savedUser.value) {
           const userVal = savedUser.value;
           setUsername(userVal);
-          const savedPass = await invoke<string>("get_credentials", { username: userVal });
+          
+          let savedPass = "";
+          try {
+            savedPass = await invoke<string>("get_credentials", { username: userVal });
+          } catch (keyringError) {
+            console.log("No saved credentials in secure storage for user:", userVal);
+          }
+
           if (savedPass) {
             setPassword(savedPass);
             // Run the validation check automatically on startup/reload
@@ -121,7 +140,7 @@ function CredentialsForm() {
           }
         }
       } catch (e) {
-        console.error("Failed to load saved credentials:", e);
+        console.log("Failed to load saved credentials:", e);
       }
     }
     loadSavedAndTest();
@@ -134,6 +153,7 @@ function CredentialsForm() {
         value={username} 
         onChange={(e) => handleUsernameChange(e.target.value)} 
         onKeyDown={handleKeyDown}
+        onBlur={handleBlur}
         placeholder="Username..." 
         status={status}
         className="w-[20%]"
@@ -146,6 +166,7 @@ function CredentialsForm() {
           setStatus('idle');
         }} 
         onKeyDown={handleKeyDown}
+        onBlur={handleBlur}
         placeholder="Password..." 
         status={status}
         className="w-[20%]"
