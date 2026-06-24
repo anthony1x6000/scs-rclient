@@ -19,7 +19,7 @@ export function RcloneConsole({ logs }: RcloneConsoleProps) {
       readOnly
       value={logs}
       placeholder="Click a command above to run and view output..."
-      className="w-screen h-fit min-h-0 p-2"
+      className="w-screen flex-1 min-h-0 p-2"
     />
   );
 }
