@@ -2,6 +2,8 @@ id: online.anthonyis.scs-rclient
 runtime: org.gnome.Platform
 runtime-version: '46'
 sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
 command: scs-rclient
 finish-args:
   - --socket=x11
@@ -14,7 +16,14 @@ finish-args:
 modules:
   - name: scs-rclient
     buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/scs-rclient/cargo
+        CARGO_NET_OFFLINE: 'true'
     build-commands:
+      - install -Dm0644 cargo/config .cargo/config.toml
+      - cargo build --offline --release --manifest-path src-tauri/Cargo.toml
       - install -Dm755 src-tauri/target/release/scs-rclient /app/bin/scs-rclient
       - install -Dm755 src-tauri/target/release/rclone-x86_64-unknown-linux-gnu /app/bin/rclone-x86_64-unknown-linux-gnu
       - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/online.anthonyis.scs-rclient.png
@@ -22,3 +31,4 @@ modules:
     sources:
       - type: dir
         path: ../../
+      - cargo-sources.json
