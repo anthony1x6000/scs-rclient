@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
-import { createRcloneCommand } from "../utils/rclone";
+import { createRcloneCommand, resolveRemoteUrl, obscurePassword } from "../utils/rclone";
 import TextInput from "./TextInput";
 
 function CredentialsForm() {
@@ -35,7 +35,6 @@ function CredentialsForm() {
   const validateCredentials = async (userVal: string, passVal: string) => {
     setStatus('testing');
     try {
-      // 1. Resolve the test URL dynamically from the store using the selected subdirectory
       const store = await load("settings.json", { autoSave: true, defaults: {} });
       const savedBase = await store.get<{ value: string }>("webdav_url");
       const savedSub = await store.get<{ value: string }>("selected_subdirectory");
@@ -43,32 +42,11 @@ function CredentialsForm() {
       const baseUrl = savedBase?.value || import.meta.env.VITE_WEBDAV_BASE_URL || "";
       const selectedSubdir = savedSub?.value !== undefined ? savedSub.value : "";
       
-      let cleanBaseUrl = baseUrl.trim();
-      while (cleanBaseUrl.endsWith("/")) {
-        cleanBaseUrl = cleanBaseUrl.slice(0, -1);
-      }
-
-      let cleanSub = selectedSubdir.trim();
-      while (cleanSub.startsWith("/")) {
-        cleanSub = cleanSub.slice(1);
-      }
-      while (cleanSub.endsWith("/")) {
-        cleanSub = cleanSub.slice(0, -1);
-      }
-
-      const fullTestUrl = cleanSub ? `${cleanBaseUrl}/${cleanSub}` : cleanBaseUrl;
-
+      const fullTestUrl = resolveRemoteUrl(baseUrl, selectedSubdir);
       console.log("Testing credentials with rclone...", fullTestUrl);
       
-      // 2. Obscure the password because rclone's backend expects obscured password values
-      const obscureCommand = createRcloneCommand(["obscure", passVal]);
-      const obscureResult = await obscureCommand.execute();
-      if (obscureResult.code !== 0) {
-        throw new Error(`Failed to obscure password: ${obscureResult.stderr}`);
-      }
-      const obscuredPassword = obscureResult.stdout.trim();
+      const obscuredPassword = await obscurePassword(passVal);
 
-      // 3. Perform test rclone lsf command with obscured password
       const command = createRcloneCommand([
         "lsf",
         ":webdav:",
