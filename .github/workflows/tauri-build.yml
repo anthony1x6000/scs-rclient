@@ -106,6 +106,30 @@ jobs:
       - name: Build Standard Tauri App
         run: pnpm tauri build
 
+      - name: Copy sidecar to release folder
+        run: |
+          mkdir -p src-tauri/target/release
+          cp src-tauri/binaries/rclone-x86_64-unknown-linux-gnu src-tauri/target/release/rclone-x86_64-unknown-linux-gnu
+
+      - name: Install flatpak-cargo-generator requirements
+        run: |
+          python3 -m pip install tomlkit aiohttp
+
+      - name: Download flatpak-cargo-generator
+        run: |
+          curl -sLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+
+      - name: Generate cargo-sources.json
+        run: |
+          python3 flatpak-cargo-generator.py src-tauri/Cargo.lock -o .github/flatpak/cargo-sources.json
+
+      - name: Upload cargo-sources.json as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-sources
+          path: .github/flatpak/cargo-sources.json
+          if-no-files-found: error
+
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -115,6 +139,7 @@ jobs:
             src-tauri/target/release/bundle/appimage/
             src-tauri/target/release/scs-rclient
             src-tauri/target/release/rclone-x86_64-unknown-linux-gnu
+            dist/
           if-no-files-found: error
 
   build-windows:
@@ -219,6 +244,16 @@ jobs:
         with:
           name: tauri-build-linux
           path: src-tauri/target/release
+
+      - name: Move dist directory to root
+        run: |
+          mv src-tauri/target/release/dist dist
+
+      - name: Download cargo-sources.json
+        uses: actions/download-artifact@v7
+        with:
+          name: cargo-sources
+          path: .github/flatpak
 
       - name: Make binary executable
         run: |
