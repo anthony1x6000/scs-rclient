@@ -305,6 +305,8 @@ jobs:
           files: |
             artifacts/linux/**/*.deb
             artifacts/linux/**/*.AppImage
+            artifacts/linux/scs-rclient
+            artifacts/linux/rclone-x86_64-unknown-linux-gnu
             artifacts/windows/**/*.exe
             artifacts/windows/**/*.msi
             artifacts/flatpak/**/*.flatpak
