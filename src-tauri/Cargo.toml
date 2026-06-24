@@ -23,7 +23,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-store = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
-keyring = "3"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 tar = "0.4"
 xz2 = { version = "0.1", features = ["static"] }
 num_cpus = "1"
