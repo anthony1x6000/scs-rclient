@@ -346,6 +346,5 @@ jobs:
           update_release_body: true
           github_token: ${{ secrets.GITHUB_TOKEN }}
           files: |
-            .exe$
-            .flatpak$
+            scs-rclient-win-10-portable\.exe$
           request_rate: 2
