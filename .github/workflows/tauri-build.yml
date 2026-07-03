@@ -6,6 +6,9 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+  release:
+    types:
+      - published
 
 jobs:
   verify-rclone:
@@ -267,4 +270,57 @@ jobs:
           path: scs-rclient.flatpak
           if-no-files-found: error
 
+  publish-release:
+    name: Publish Release Assets
+    if: github.event_name == 'release'
+    needs: [build-linux, build-windows, flatpak]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
+      - name: Download Linux Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-linux
+          path: linux-assets
+
+      - name: Download Windows Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-windows
+          path: windows-assets
+
+      - name: Download Flatpak Artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-flatpak
+          path: flatpak-asset
+
+      - name: Upload Assets to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          find linux-assets windows-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" \) -exec gh release upload ${{ github.event.release.tag_name }} {} --clobber \+
+
+  virustotal:
+    name: VirusTotal Release Asset Scan
+    if: github.event_name == 'release'
+    needs: [publish-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Scan Release Assets via VirusTotal
+        uses: crazy-max/ghaction-virustotal@v5.0.0
+        continue-on-error: true
+        with:
+          vt_api_key: ${{ secrets.VT_KEY }}
+          update_release_body: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            .exe$
+            .flatpak$
+          request_rate: 2
