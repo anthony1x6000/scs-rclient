@@ -153,6 +153,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Check for package changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            packages:
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
@@ -226,6 +235,29 @@ jobs:
             src-tauri/target/release/bundle/msi/scs-rclient-win-10.msi
             src-tauri/target/release/bundle/msi/scs-rclient-win-7.msi
           if-no-files-found: error
+
+      - name: Verify Win10 Portable Binary Presence
+        if: steps.filter.outputs.packages == 'true'
+        shell: pwsh
+        run: |
+          $filePath = "src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe"
+          if (Test-Path $filePath) {
+            $size = (Get-Item $filePath).Length
+            Write-Host "SUCCESS: $filePath exists ($size bytes) and is accessible."
+          } else {
+            Write-Error "ERROR: $filePath is missing! It may have been cleaned up by subsequent build steps."
+            exit 1
+          }
+
+      - name: Scan Win10 Portable Binary via VirusTotal
+        if: steps.filter.outputs.packages == 'true'
+        uses: crazy-max/ghaction-virustotal@v5.0.0
+        continue-on-error: true
+        with:
+          vt_api_key: ${{ secrets.VT_KEY }}
+          files: |
+            src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
+          request_rate: 2
 
   flatpak:
     name: Build Flatpak
