@@ -15,7 +15,7 @@ export const config: Options.Testrunner = {
         ? path.join(process.cwd(), '..', 'src-tauri', 'target', 'release', 'scs-rclient.exe')
         : path.join(process.cwd(), '..', 'src-tauri', 'target', 'release', 'scs-rclient'),
     }
-  }],
+  }] as any,
   services: [
     [
       'tauri',
