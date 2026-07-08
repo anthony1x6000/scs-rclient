@@ -253,7 +253,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: portable-windows-zip
-          path: src-tauri/target/release/bundle/nsis/portable-windows.zip
+          path: |
+            src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
+            src-tauri/target/release/bundle/nsis/scs-rclient-win-7-portable.exe
           if-no-files-found: error
 
       - name: Verify Win10 Portable Binary Presence
