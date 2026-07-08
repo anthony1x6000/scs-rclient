@@ -53,13 +53,14 @@ export function ensureRcloneDetected(): Promise<void> {
  * If the sidecar is invalid or we are in development, it executes the system-installed 'rclone'.
  * Otherwise, it executes the packaged sidecar 'binaries/rclone'.
  */
-export function createRcloneCommand(args: string[]): Command<string> {
+export function createRcloneCommand(args: string[], env?: Record<string, string>): Command<string> {
+  const options = env ? { env } : undefined;
   if (useSystemRclone) {
     // Uses the system-installed rclone executable from the system's PATH
-    return Command.create("rclone", args);
+    return Command.create("rclone", args, options);
   } else {
     // Uses the packaged sidecar binary (rclone-x86_64-pc-windows-msvc.exe or rclone-x86_64-unknown-linux-gnu)
-    return Command.sidecar("binaries/rclone", args);
+    return Command.sidecar("binaries/rclone", args, options);
   }
 }
 

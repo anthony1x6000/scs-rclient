@@ -38,8 +38,7 @@ function buildActionArgs(
   action: 'put' | 'get' | 'put-dry' | 'get-dry' | 'ls' | 'lsd' | 'check',
   localPath: string,
   remoteUrl: string,
-  username?: string,
-  obscuredPassword?: string
+  username?: string
 ): string[] {
   let args: string[] = [];
   switch (action) {
@@ -70,22 +69,7 @@ function buildActionArgs(
   if (username) {
     args.push(`--webdav-user=${username}`);
   }
-  if (obscuredPassword) {
-    args.push(`--webdav-pass=${obscuredPassword}`);
-  }
   return args;
-}
-
-/**
- * Masks the obscured password argument in the args list to prevent logging it.
- */
-function maskPasswordInArgs(args: string[]): string[] {
-  return args.map((arg) => {
-    if (arg.startsWith("--webdav-pass=")) {
-      return "--webdav-pass=********";
-    }
-    return arg;
-  });
 }
 
 export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsProps) {
@@ -173,11 +157,11 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
           `Running command...\n`
       );
 
-      const args = buildActionArgs(action, localPath, remoteUrl, settings.username || undefined, obscuredPassword || undefined);
-      const displayArgs = maskPasswordInArgs(args);
-      onLog((prev) => prev + `rclone ${displayArgs.join(" ")}\n\n`);
+      const args = buildActionArgs(action, localPath, remoteUrl, settings.username || undefined);
+      onLog((prev) => prev + `rclone ${args.join(" ")}\n\n`);
 
-      const rcloneCmd = createRcloneCommand(args);
+      const env = obscuredPassword ? { RCLONE_WEBDAV_PASS: obscuredPassword } : undefined;
+      const rcloneCmd = createRcloneCommand(args, env);
 
       // Listen for stdout / stderr real-time streams
       rcloneCmd.stdout.on("data", (data: string) => {

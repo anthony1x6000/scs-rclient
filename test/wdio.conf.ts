@@ -12,8 +12,8 @@ export const config: Options.Testrunner = {
     browserName: 'wry',
     'tauri:options': {
       application: process.platform === 'win32' 
-        ? path.join(__dirname, '..', 'src-tauri', 'target', 'release', 'scs-rclient.exe')
-        : path.join(__dirname, '..', 'src-tauri', 'target', 'release', 'scs-rclient'),
+        ? path.join(process.cwd(), '..', 'src-tauri', 'target', 'release', 'scs-rclient.exe')
+        : path.join(process.cwd(), '..', 'src-tauri', 'target', 'release', 'scs-rclient'),
     }
   }],
   services: [
@@ -21,8 +21,8 @@ export const config: Options.Testrunner = {
       'tauri',
       {
         appBinaryPath: process.platform === 'win32' 
-          ? path.join(__dirname, '..', 'src-tauri', 'target', 'release', 'scs-rclient.exe')
-          : path.join(__dirname, '..', 'src-tauri', 'target', 'release', 'scs-rclient'),
+          ? path.join(process.cwd(), '..', 'src-tauri', 'target', 'release', 'scs-rclient.exe')
+          : path.join(process.cwd(), '..', 'src-tauri', 'target', 'release', 'scs-rclient'),
         // Use tauri-driver so we don't have to embed Rust test plugins into the app
         driverProvider: 'tauri-driver',
       },
