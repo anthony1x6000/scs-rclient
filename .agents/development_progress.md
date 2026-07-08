@@ -33,3 +33,10 @@ This document tracks recent changes, bug fixes, and workflow improvements made t
   * Configured **WebdriverIO** with `tauri-driver` natively (`wdio.conf.ts` and `test/specs/sidecar.e2e.ts`) to extract application logs from the compiled release binaries to ensure the sidecar works correctly outside of the development environment.
   * Added `test`, `test:watch`, and `test:e2e` scripts to `package.json` that inherently block local execution by forcing a `process.env.GITHUB_ACTIONS === 'true'` check.
   * Updated `.github/workflows/tauri-build.yml` to execute these tests directly during compilation across all matrix OS platforms (using `xvfb-run` on Linux and `msedgedriver` on Windows).
+
+## 7. Isolated Testing Environment Scope Fix
+* **Issue**: The `vitest` command running in GitHub Actions threw `ERR_MODULE_NOT_FOUND` because `vitest.config.ts` was located in the root. When resolving from the root, `vitest` failed to find `vitest/config` since all testing dependencies were previously isolated into `test/package.json`.
+* **Fix**: Migrated `vitest.config.ts`, `vitest.setup.ts`, and `wdio.conf.ts` completely into the `test/` directory. Updated their internal paths so they accurately traverse `../` back to the root `vite.config` and the `src-tauri` sidecars, fully insulating the testing configuration within `test/node_modules`.
+
+## 8. Devtools Retention
+* **Rule**: Ensure the `"devtools"` feature is always retained in the `tauri` dependency within `src-tauri/Cargo.toml`. Although generally considered bloat for strict production releases, it is explicitly requested to be allowed for debugging purposes in this application.
