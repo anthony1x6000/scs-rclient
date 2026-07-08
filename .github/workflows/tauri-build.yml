@@ -225,6 +225,12 @@ jobs:
             Rename-Item -Path $msiFile.FullName -NewName "scs-rclient-win-7.msi"
           }
 
+      - name: Create Portable Windows Zip
+        shell: pwsh
+        run: |
+          cd src-tauri/target/release/bundle/nsis
+          Compress-Archive -Path "scs-rclient-win-10-portable.exe", "scs-rclient-win-7-portable.exe" -DestinationPath "portable-windows.zip"
+
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -232,6 +238,7 @@ jobs:
           path: |
             src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
             src-tauri/target/release/bundle/nsis/scs-rclient-win-7-portable.exe
+            src-tauri/target/release/bundle/nsis/portable-windows.zip
             src-tauri/target/release/bundle/msi/scs-rclient-win-10.msi
             src-tauri/target/release/bundle/msi/scs-rclient-win-7.msi
           if-no-files-found: error
