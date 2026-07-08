@@ -25,3 +25,11 @@ This document tracks recent changes, bug fixes, and workflow improvements made t
 ## 5. Linux Build dependency installation optimization
 * **Issue**: The `Install Linux dependencies` step hung for ~40 minutes because the `needrestart` daemon on Ubuntu attempted to open interactive prompts for service restarts without a TTY.
 * **Fix**: Configured `apt-get` commands in the `build-linux` job to run non-interactively using `NEEDRESTART_MODE=a` and `DEBIAN_FRONTEND=noninteractive`.
+
+## 6. Tauri API Mocking & E2E Testing Pipeline
+* **Issue**: Testing sidecar detection logic in development is unreliable on Windows because `tauri dev` creates 0-byte dummy binaries which Windows refuses to execute, throwing `%1 is not a valid Win32 application. (os error 193)`. We needed robust automated testing to verify execution.
+* **Fix**: 
+  * Integrated **Vitest** for frontend mocking (`test/rclone.test.ts`), verifying the IPC API properly prioritizes the sidecar using `@tauri-apps/api/mocks`.
+  * Configured **WebdriverIO** with `tauri-driver` natively (`wdio.conf.ts` and `test/specs/sidecar.e2e.ts`) to extract application logs from the compiled release binaries to ensure the sidecar works correctly outside of the development environment.
+  * Added `test`, `test:watch`, and `test:e2e` scripts to `package.json` that inherently block local execution by forcing a `process.env.GITHUB_ACTIONS === 'true'` check.
+  * Updated `.github/workflows/tauri-build.yml` to execute these tests directly during compilation across all matrix OS platforms (using `xvfb-run` on Linux and `msedgedriver` on Windows).
