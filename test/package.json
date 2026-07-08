@@ -11,6 +11,8 @@
     "@wdio/mocha-framework": "^8.0.0",
     "@wdio/spec-reporter": "^8.0.0",
     "@wdio/tauri-service": "^1.2.0",
+    "@wdio/types": "^8.0.0",
+    "@types/node": "^22.0.0",
     "@vitejs/plugin-react": "^4.7.0",
     "vite": "^7.3.5",
     "jsdom": "^26.0.0",
