@@ -23,6 +23,10 @@
   },
   "bundle": {
     "active": true,
+    "publisher": "Anthony",
+    "shortDescription": "SCS Rclone Client",
+    "copyright": "see license",
+    "category": "Utility",
     "targets": [
       "nsis",
       "msi",

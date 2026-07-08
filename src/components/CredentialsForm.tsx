@@ -55,11 +55,9 @@ function CredentialsForm() {
       if (userVal) {
         args.push(`--webdav-user=${userVal}`);
       }
-      if (obscuredPassword) {
-        args.push(`--webdav-pass=${obscuredPassword}`);
-      }
 
-      const command = createRcloneCommand(args);
+      const env = obscuredPassword ? { RCLONE_WEBDAV_PASS: obscuredPassword } : undefined;
+      const command = createRcloneCommand(args, env);
       const result = await command.execute();
       if (result.code === 0) {
         console.log("Rclone authentication test succeeded! Output:\n", result.stdout);
