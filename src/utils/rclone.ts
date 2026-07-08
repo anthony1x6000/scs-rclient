@@ -1,6 +1,6 @@
 import { Command } from "@tauri-apps/plugin-shell";
 
-let useSystemRclone = import.meta.env.DEV;
+let useSystemRclone = true;
 
 /**
  * Detects if the packaged sidecar binary is valid and executable.
@@ -8,20 +8,33 @@ let useSystemRclone = import.meta.env.DEV;
  * falls back to using the system-installed 'rclone' binary.
  */
 export async function detectRclone(): Promise<void> {
-  if (import.meta.env.DEV) {
-    useSystemRclone = true;
-    return;
-  }
   try {
     const testCmd = Command.sidecar("binaries/rclone", ["--version"]);
     const res = await testCmd.execute();
-    if (res.code !== 0) {
-      useSystemRclone = true;
+    if (res.code === 0) {
+      useSystemRclone = false;
+      console.log("Using packaged rclone sidecar.");
+      return;
     }
-  } catch (e) {
-    console.warn("Packaged rclone sidecar is invalid or unexecutable. Falling back to system rclone.", e);
-    useSystemRclone = true;
+  } catch (e: any) {
+    console.warn("Packaged rclone sidecar is invalid or unexecutable. Falling back to system rclone.", e?.message || e);
   }
+
+  try {
+    const testSysCmd = Command.create("rclone", ["--version"]);
+    const res = await testSysCmd.execute();
+    if (res.code === 0) {
+      useSystemRclone = true;
+      console.log("Using system-installed rclone.");
+      return;
+    } else {
+      console.error("System-level rclone returned a non-zero exit code:", res.code);
+    }
+  } catch (e: any) {
+    console.error("System-level rclone is not available or is invalid on this system:", e?.message || e);
+  }
+
+  useSystemRclone = true;
 }
 
 // Trigger detection immediately on module load
