@@ -498,7 +498,7 @@ jobs:
 
   test-macos:
     name: Test macOS Application
-    needs: verify-rclone
+    needs: [verify-rclone, build-macos]
     runs-on: macos-15
     steps:
       - name: Checkout repository
