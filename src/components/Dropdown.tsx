@@ -116,7 +116,7 @@ function Dropdown({ onSelect }: DropdownProps) {
           type="button" 
           onClick={() => {
             setIsOpen(true);
-            setSearchText(selectedItem);
+            setSearchText("");
           }}
           className="text-5xl text-gray-300 lowercase cursor-pointer"
         >

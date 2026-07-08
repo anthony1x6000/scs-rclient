@@ -20,6 +20,7 @@ When building or updating client features:
 - Do not clutter `src/App.tsx` with business logic.
 - Place all functional control operations inside dedicated components under `src/components/` (e.g. `RcloneActions` for executing system command tasks).
 - Avoid modifying the layout of component containers inside `App.tsx` directly unless requested, keeping UI style definitions separate from logic execution.
+- Ensure to implement SRP and max depth 3.
 
 ---
 
