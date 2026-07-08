@@ -1,5 +1,5 @@
 import { defineConfig, mergeConfig } from 'vitest/config';
-import viteConfig from './vite.config';
+import viteConfig from '../vite.config';
 
 export default defineConfig(async (env) => {
   const resolvedViteConfig = await (typeof viteConfig === 'function' ? viteConfig(env) : viteConfig);
