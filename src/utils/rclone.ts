@@ -37,9 +37,17 @@ export async function detectRclone(): Promise<void> {
   useSystemRclone = true;
 }
 
-// Trigger detection immediately on module load
-detectRclone().catch(console.error);
+let detectPromise: Promise<void> | null = null;
 
+/**
+ * Ensures that the rclone detection runs exactly once.
+ */
+export function ensureRcloneDetected(): Promise<void> {
+  if (!detectPromise) {
+    detectPromise = detectRclone().catch(console.error) as Promise<void>;
+  }
+  return detectPromise;
+}
 /**
  * Creates a Tauri Command for running rclone.
  * If the sidecar is invalid or we are in development, it executes the system-installed 'rclone'.
