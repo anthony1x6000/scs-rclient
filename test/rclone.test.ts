@@ -10,18 +10,12 @@ describe("rclone sidecar detection", () => {
   it("should prioritize the sidecar if it executes successfully", async () => {
     // Mock the IPC to simulate the sidecar returning a success exit code
     mockIPC(async (cmd, args) => {
-      if (args.message?.cmd === 'execute') {
-        const eventCallbackId = `_${args.message.onEventFn}`;
-        const eventEmitter = (window as any)[eventCallbackId];
-
-        // Simulate sidecar executing successfully
-        eventEmitter({
-          event: 'Terminated',
-          payload: {
-            code: 0,
-            signal: null,
-          },
-        });
+      if (cmd === 'plugin:shell|execute') {
+        return {
+          code: 0,
+          stdout: "rclone v1.65.2",
+          stderr: ""
+        };
       }
     });
 

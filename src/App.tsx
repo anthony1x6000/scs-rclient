@@ -7,6 +7,7 @@ import CredentialsForm from "./components/CredentialsForm";
 import SettingsView from "./components/SettingsView";
 import { RcloneActions } from "./components/RcloneActions";
 import RcloneConsole from "./components/RcloneConsole";
+import { ensureRcloneDetected } from "./utils/rclone";
 
 function App() {
   const [mountDir, setMountDir] = useState<string>("");
@@ -15,6 +16,9 @@ function App() {
   const [isRunning, setIsRunning] = useState<boolean>(false);
 
   useEffect(() => {
+    // Detect rclone sidecar on mount
+    ensureRcloneDetected();
+
     // Fetch and set mount directory
     invoke<string>("get_mount_dir")
       .then(setMountDir)
