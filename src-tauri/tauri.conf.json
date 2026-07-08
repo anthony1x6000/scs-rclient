@@ -27,7 +27,8 @@
       "nsis",
       "msi",
       "deb",
-      "appimage"
+      "appimage",
+      "dmg"
     ],
     "externalBin": [
       "binaries/rclone"

@@ -10,6 +10,10 @@ on:
     types:
       - published
 
+env:
+  RCLONE_VERSION: 1.74.3
+  RCLONE_SIGNING_KEY: FBF737ECE9F8AB18604BD2AC93935E02FF3B54FA
+
 jobs:
   verify-rclone:
     name: Verify Rclone Signatures
@@ -28,14 +32,15 @@ jobs:
 
       - name: Confirm Nick Craig-Wood's Signing Key
         run: |
-          # Verify Nick's signing key (fingerprint: FBF737ECE9F8AB18604BD2AC93935E02FF3B54FA) is imported
-          gpg --list-keys FBF737ECE9F8AB18604BD2AC93935E02FF3B54FA
+          # Verify Nick's signing key (fingerprint: ${{ env.RCLONE_SIGNING_KEY }}) is imported
+          gpg --list-keys ${{ env.RCLONE_SIGNING_KEY }}
 
-      - name: Download Rclone v1.74.3 and Checksums
+      - name: Download Rclone v${{ env.RCLONE_VERSION }} and Checksums
         run: |
-          curl -O -L https://downloads.rclone.org/v1.74.3/SHA256SUMS
-          curl -O -L https://downloads.rclone.org/v1.74.3/rclone-v1.74.3-linux-amd64.zip
-          curl -O -L https://downloads.rclone.org/v1.74.3/rclone-v1.74.3-windows-amd64.zip
+          curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/SHA256SUMS
+          curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip
+          curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip
+          curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip
 
       - name: Verify Checksums File Signature
         run: |
@@ -48,8 +53,9 @@ jobs:
       - name: Prepare Verified Binaries
         run: |
           mkdir verified-binaries
-          mv rclone-v1.74.3-linux-amd64.zip verified-binaries/
-          mv rclone-v1.74.3-windows-amd64.zip verified-binaries/
+          mv rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip verified-binaries/
+          mv rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip verified-binaries/
+          mv rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip verified-binaries/
 
       - name: Upload Verified Binaries Artifact
         uses: actions/upload-artifact@v7
@@ -98,9 +104,9 @@ jobs:
 
       - name: Extract Linux Sidecar
         run: |
-          unzip verified-binaries/rclone-v1.74.3-linux-amd64.zip
+          unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip
           mkdir -p src-tauri/binaries
-          cp rclone-v1.74.3-linux-amd64/rclone src-tauri/binaries/rclone-x86_64-unknown-linux-gnu
+          cp rclone-v${{ env.RCLONE_VERSION }}-linux-amd64/rclone src-tauri/binaries/rclone-x86_64-unknown-linux-gnu
           chmod +x src-tauri/binaries/rclone-x86_64-unknown-linux-gnu
 
       - name: Install dependencies
@@ -118,13 +124,13 @@ jobs:
         run: |
           python3 -m pip install tomlkit aiohttp
 
-      - name: Download flatpak-cargo-generator
+      - name: Clone flatpak-builder-tools
         run: |
-          curl -sLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+          git clone --depth 1 https://github.com/flatpak/flatpak-builder-tools.git
 
       - name: Generate cargo-sources.json
         run: |
-          python3 flatpak-cargo-generator.py src-tauri/Cargo.lock -o .github/flatpak/cargo-sources.json
+          python3 flatpak-builder-tools/cargo/flatpak-cargo-generator.py src-tauri/Cargo.lock -o .github/flatpak/cargo-sources.json
 
       - name: Upload cargo-sources.json as artifact
         uses: actions/upload-artifact@v7
@@ -190,9 +196,9 @@ jobs:
       - name: Extract Windows Sidecar
         shell: pwsh
         run: |
-          Expand-Archive -Path verified-binaries/rclone-v1.74.3-windows-amd64.zip -DestinationPath .
+          Expand-Archive -Path verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip -DestinationPath .
           New-Item -ItemType Directory -Force -Path src-tauri/binaries
-          Copy-Item -Path rclone-v1.74.3-windows-amd64/rclone.exe -Destination src-tauri/binaries/rclone-x86_64-pc-windows-msvc.exe
+          Copy-Item -Path rclone-v${{ env.RCLONE_VERSION }}-windows-amd64/rclone.exe -Destination src-tauri/binaries/rclone-x86_64-pc-windows-msvc.exe
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -316,10 +322,64 @@ jobs:
           path: scs-rclient.flatpak
           if-no-files-found: error
 
+  build-macos:
+    name: Build macOS Application
+    needs: verify-rclone
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: 'pnpm'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Download verified rclone binaries
+        uses: actions/download-artifact@v7
+        with:
+          name: verified-rclone
+          path: verified-binaries
+
+      - name: Extract macOS Sidecar
+        run: |
+          unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip
+          mkdir -p src-tauri/binaries
+          cp rclone-v${{ env.RCLONE_VERSION }}-osx-arm64/rclone src-tauri/binaries/rclone-aarch64-apple-darwin
+          chmod +x src-tauri/binaries/rclone-aarch64-apple-darwin
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Standard Tauri App
+        run: pnpm tauri build
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: tauri-build-macos
+          path: |
+            src-tauri/target/release/bundle/dmg/
+          if-no-files-found: error
+
   publish-release:
     name: Publish Release Assets
     if: github.event_name == 'release'
-    needs: [build-linux, build-windows, flatpak]
+    needs: [build-linux, build-windows, flatpak, build-macos]
     runs-on: ubuntu-slim
     permissions:
       contents: write
@@ -345,11 +405,17 @@ jobs:
           name: tauri-build-flatpak
           path: flatpak-asset
 
+      - name: Download macOS Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-macos
+          path: macos-assets
+
       - name: Upload Assets to Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          find linux-assets windows-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
+          find linux-assets windows-assets flatpak-asset macos-assets -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.dmg" -o -name "*.zip" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
 
       - name: Append Checksums to Release Description
         env:
@@ -367,7 +433,7 @@ jobs:
           echo "| --- | --- |" >> release_body.txt
           
           # Compute hashes and write markdown rows
-          find linux-assets windows-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" \) | while read -r file; do
+          find linux-assets windows-assets flatpak-asset macos-assets -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.dmg" -o -name "*.zip" \) | while read -r file; do
             filename=$(basename "$file")
             hash=$(sha256sum "$file" | awk '{print $1}')
             echo "| \`$filename\` | \`$hash\` |" >> release_body.txt
