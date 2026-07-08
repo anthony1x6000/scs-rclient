@@ -3,5 +3,5 @@ packages:
 
 allowBuilds:
   edgedriver: true
+  esbuild: set this to true or false
   geckodriver: true
-
