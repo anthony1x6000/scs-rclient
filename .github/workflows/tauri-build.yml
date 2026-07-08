@@ -378,7 +378,7 @@ jobs:
 
   test-linux:
     name: Test Linux Application
-    needs: verify-rclone
+    needs: [verify-rclone, build-linux]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -408,24 +408,19 @@ jobs:
           sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
           sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2 webkit2gtk-driver xvfb
 
-      - name: Download verified rclone binaries
+      - name: Download Linux build artifact
         uses: actions/download-artifact@v7
         with:
-          name: verified-rclone
-          path: verified-binaries
+          name: tauri-build-linux
+          path: .
 
-      - name: Extract Linux Sidecar
+      - name: Make binaries executable
         run: |
-          unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip
-          mkdir -p src-tauri/binaries
-          cp rclone-v${{ env.RCLONE_VERSION }}-linux-amd64/rclone src-tauri/binaries/rclone-x86_64-unknown-linux-gnu
-          chmod +x src-tauri/binaries/rclone-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/target/release/scs-rclient
+          chmod +x src-tauri/target/release/rclone-x86_64-unknown-linux-gnu
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: Build Standard Tauri App
-        run: pnpm tauri build
 
       - name: Install Testing Dependencies
         run: pnpm -C test install
@@ -441,20 +436,11 @@ jobs:
 
   test-windows:
     name: Test Windows Application
-    needs: verify-rclone
+    needs: [verify-rclone, build-windows]
     runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-
-      - name: Check for package changes
-        uses: dorny/paths-filter@v4
-        id: filter
-        with:
-          filters: |
-            packages:
-              - 'package.json'
-              - 'pnpm-lock.yaml'
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
@@ -475,24 +461,20 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
-      - name: Download verified rclone binaries
+      - name: Download Windows build artifact
         uses: actions/download-artifact@v7
         with:
-          name: verified-rclone
-          path: verified-binaries
+          name: tauri-build-windows
+          path: .
 
-      - name: Extract Windows Sidecar
+      - name: Reconstruct Release Binary
         shell: pwsh
         run: |
-          Expand-Archive -Path verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip -DestinationPath .
-          New-Item -ItemType Directory -Force -Path src-tauri/binaries
-          Copy-Item -Path rclone-v${{ env.RCLONE_VERSION }}-windows-amd64/rclone.exe -Destination src-tauri/binaries/rclone-x86_64-pc-windows-msvc.exe
+          New-Item -ItemType Directory -Force -Path src-tauri/target/release
+          Copy-Item -Path src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe -Destination src-tauri/target/release/scs-rclient.exe
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: Build Standard Tauri App
-        run: pnpm tauri build
 
       - name: Install Testing Dependencies
         run: pnpm -C test install
@@ -533,32 +515,8 @@ jobs:
           node-version: lts/*
           cache: 'pnpm'
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
-
-      - name: Download verified rclone binaries
-        uses: actions/download-artifact@v7
-        with:
-          name: verified-rclone
-          path: verified-binaries
-
-      - name: Extract macOS Sidecar
-        run: |
-          unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip
-          mkdir -p src-tauri/binaries
-          cp rclone-v${{ env.RCLONE_VERSION }}-osx-arm64/rclone src-tauri/binaries/rclone-aarch64-apple-darwin
-          chmod +x src-tauri/binaries/rclone-aarch64-apple-darwin
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: Build Standard Tauri App
-        run: pnpm tauri build
 
       - name: Install Testing Dependencies
         run: pnpm -C test install
