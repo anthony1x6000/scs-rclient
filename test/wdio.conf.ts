@@ -28,7 +28,7 @@ export const config: Options.Testrunner = {
       },
     ],
   ],
-  logLevel: 'info',
+  logLevel: 'trace',
   bail: 0,
   waitforTimeout: 10000,
   connectionRetryTimeout: 120000,
