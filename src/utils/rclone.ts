@@ -14,10 +14,12 @@ export async function detectRclone(): Promise<void> {
     if (res.code === 0) {
       useSystemRclone = false;
       console.log("Using packaged rclone sidecar.");
+      (window as any).__TEST_SIDECAR_STATUS__ = "packaged";
       return;
     }
   } catch (e: any) {
     console.warn("Packaged rclone sidecar is invalid or unexecutable. Falling back to system rclone.", e?.message || e);
+    (window as any).__TEST_SIDECAR_ERROR__ = e?.message || e;
   }
 
   try {
@@ -26,6 +28,7 @@ export async function detectRclone(): Promise<void> {
     if (res.code === 0) {
       useSystemRclone = true;
       console.log("Using system-installed rclone.");
+      (window as any).__TEST_SIDECAR_STATUS__ = "system";
       return;
     } else {
       console.error("System-level rclone returned a non-zero exit code:", res.code);
