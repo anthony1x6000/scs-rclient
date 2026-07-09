@@ -12,7 +12,7 @@ describe('Tauri Application Sidecar Detection', () => {
     const errorMsg = await browser.execute(() => (window as any).__TEST_SIDECAR_ERROR__);
     
     // Check if there were any 'os error 193' errors during detection
-    expect(errorMsg).not.toContain('os error 193');
+    expect(errorMsg || '').not.toContain('os error 193');
     
     // Check if the packaged sidecar is being used
     expect(status).toBe('packaged');
