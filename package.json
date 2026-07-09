@@ -9,8 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "pnpm -C test run test",
-    "test:watch": "pnpm -C test run test:watch",
-    "test:e2e": "pnpm -C test run test:e2e"
+    "test:watch": "pnpm -C test run test:watch"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
