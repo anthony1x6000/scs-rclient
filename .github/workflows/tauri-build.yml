@@ -425,7 +425,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install Testing Dependencies
-        run: pnpm -C test install
+        run: pnpm -C test install --no-frozen-lockfile
 
       - name: Run Vitest API Mocks
         run: pnpm test
@@ -479,7 +479,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install Testing Dependencies
-        run: pnpm -C test install
+        run: pnpm -C test install --no-frozen-lockfile
 
       - name: Run Vitest API Mocks
         run: pnpm test
@@ -521,7 +521,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install Testing Dependencies
-        run: pnpm -C test install
+        run: pnpm -C test install --no-frozen-lockfile
 
       - name: Run Vitest API Mocks
         run: pnpm test
