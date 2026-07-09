@@ -5,21 +5,16 @@ describe('Tauri Application Sidecar Detection', () => {
     // Wait for the React application to render and run the detection logic
     await browser.pause(2000);
 
-    // Retrieve the logs from the Webview's console
-    // WebdriverIO allows fetching browser logs through getLogs
-    const logs = await browser.getLogs('browser');
+    // Retrieve the detection status exposed to the window object
+    // Since WebdriverIO v9 no longer supports getLogs('browser') in W3C mode,
+    // we use a global variable set by the detection logic.
+    const status = await browser.execute(() => (window as any).__TEST_SIDECAR_STATUS__);
+    const errorMsg = await browser.execute(() => (window as any).__TEST_SIDECAR_ERROR__);
     
-    // Check if any log contains the expected success message
-    const sidecarLog = logs.find((log) => 
-      log.message.includes('Using packaged rclone sidecar.')
-    );
+    // Check if there were any 'os error 193' errors during detection
+    expect(errorMsg).not.toContain('os error 193');
     
-    // Also check if there were any 'os error 193' errors
-    const errorLog = logs.find((log) => 
-      log.message.includes('os error 193')
-    );
-
-    expect(errorLog).toBeUndefined();
-    expect(sidecarLog).toBeDefined();
+    // Check if the packaged sidecar is being used
+    expect(status).toBe('packaged');
   });
 });
