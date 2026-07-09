@@ -473,7 +473,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path src-tauri/target/release
-          Copy-Item -Path src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe -Destination src-tauri/target/release/scs-rclient.exe
+          Copy-Item -Path nsis/scs-rclient-win-10-portable.exe -Destination src-tauri/target/release/scs-rclient.exe
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
