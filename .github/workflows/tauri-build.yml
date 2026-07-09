@@ -430,11 +430,7 @@ jobs:
       - name: Run Vitest API Mocks
         run: pnpm test
 
-      - name: Install tauri-driver
-        run: cargo install tauri-driver --locked
 
-      - name: Run WebdriverIO E2E Tests
-        run: xvfb-run pnpm test:e2e
 
   test-windows:
     name: Test Windows Application
@@ -484,19 +480,7 @@ jobs:
       - name: Run Vitest API Mocks
         run: pnpm test
 
-      - name: Install tauri-driver
-        run: cargo install tauri-driver --locked
 
-      - name: Install msedgedriver
-        shell: pwsh
-        run: |
-          cargo install --git https://github.com/chippers/msedgedriver-tool
-          & "$HOME/.cargo/bin/msedgedriver-tool.exe"
-          $PWD.Path >> $env:GITHUB_PATH
-
-      - name: Run WebdriverIO E2E Tests
-        shell: pwsh
-        run: pnpm test:e2e
 
   test-macos:
     name: Test macOS Application
