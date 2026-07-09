@@ -27,8 +27,8 @@ importers:
         specifier: 9.27.1
         version: 9.27.1
       '@wdio/tauri-service':
-        specifier: 1.2.0
-        version: 1.2.0(expect-webdriverio@5.7.0)(tsx@4.23.0)(webdriverio@9.27.1)
+        specifier: 1.1.0
+        version: 1.1.0(expect-webdriverio@5.7.0)(tsx@4.23.0)(webdriverio@9.27.1)
       '@wdio/types':
         specifier: 9.27.1
         version: 9.27.1
@@ -840,10 +840,6 @@ packages:
     resolution: {integrity: sha512-q6BOAd7Yg8lQJJWW/z1a4ratTttMIy39MfbAIgw8PKrXB6Oc+x95KXkuIcCGDINTk+X92Lbjxefiww4jiPam8A==}
     engines: {node: ^18.12.0 || ^20.9.0 || >=22.11.0}
 
-  '@wdio/native-types@2.4.0':
-    resolution: {integrity: sha512-GjgPskOoTvl17Jwj8aAU3A31gpklL5M1KfbrwYffbQT16CTpJTD8A4PdoS2ZjGoCWcyLBR1CWdJI3W8T0JBLjw==}
-    engines: {node: ^18.12.0 || ^20.9.0 || >=22.11.0}
-
   '@wdio/native-utils@2.4.0':
     resolution: {integrity: sha512-wbox9Hm7Pv98E1krs6/YqbV3a7gDcBK70a/BhZbFYXmVQvtqU8o8AvQerg5aUvYVyi/bQejG0IH9yBfE8LIivQ==}
     engines: {node: ^18.12.0 || ^20.9.0 || >=22.11.0}
@@ -875,8 +871,8 @@ packages:
     resolution: {integrity: sha512-q9UMJJbCcP+nCOojIvOIcsXnerhHICmWu94guRMRYPbW2IsG/5VM/uhzwru8SU/1WRXLtKgTjkuXXsjzjVpf2w==}
     engines: {node: '>=18.20.0'}
 
-  '@wdio/tauri-service@1.2.0':
-    resolution: {integrity: sha512-/PEmbDKra6Lsodes5x1Sg5H98bG4hObYZWMyrlbv0e5fL0KVMQMxDP798jWWIqT6+iOPsIlkLirRJKfXXGVtsQ==}
+  '@wdio/tauri-service@1.1.0':
+    resolution: {integrity: sha512-nIIs/9udGNj8KChYRB/7jTT/uRoCIb9TQxvvGWfYaaQaFg+ruZ37tX4A8O1dcpX9DWYAJCn12MTSNsRXxGi+8g==}
     engines: {node: ^18.12.0 || ^20.9.0 || >=22.11.0}
     peerDependencies:
       webdriverio: ^9.0.0
@@ -3418,8 +3414,6 @@ snapshots:
 
   '@wdio/native-types@2.3.1': {}
 
-  '@wdio/native-types@2.4.0': {}
-
   '@wdio/native-utils@2.4.0(tsx@4.23.0)':
     dependencies:
       '@wdio/logger': 9.18.0
@@ -3477,13 +3471,13 @@ snapshots:
       easy-table: 1.2.0
       pretty-ms: 9.3.0
 
-  '@wdio/tauri-service@1.2.0(expect-webdriverio@5.7.0)(tsx@4.23.0)(webdriverio@9.27.1)':
+  '@wdio/tauri-service@1.1.0(expect-webdriverio@5.7.0)(tsx@4.23.0)(webdriverio@9.27.1)':
     dependencies:
       '@wdio/globals': 9.27.1(expect-webdriverio@5.7.0)(webdriverio@9.27.1)
       '@wdio/logger': 9.18.0
       '@wdio/native-core': 1.0.0(tsx@4.23.0)
       '@wdio/native-spy': 1.1.0
-      '@wdio/native-types': 2.4.0
+      '@wdio/native-types': 2.3.1
       '@wdio/native-utils': 2.4.0(tsx@4.23.0)
       '@wdio/spec-reporter': 9.27.1
       '@wdio/types': 9.27.1
