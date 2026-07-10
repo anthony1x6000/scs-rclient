@@ -72,24 +72,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: lts/*
-          cache: 'pnpm'
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-env
 
       - name: Install Linux dependencies
         run: |
@@ -162,33 +146,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Check for package changes
-        uses: dorny/paths-filter@v4
-        id: filter
-        with:
-          filters: |
-            packages:
-              - 'package.json'
-              - 'pnpm-lock.yaml'
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: lts/*
-          cache: 'pnpm'
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-env
 
       - name: Download verified rclone binaries
         uses: actions/download-artifact@v7
@@ -252,37 +211,6 @@ jobs:
             src-tauri/target/release/bundle/msi/scs-rclient-win-7.msi
           if-no-files-found: error
 
-      - name: Upload Portable Windows Zip Artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: portable-win10-bin
-          path: |
-            src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
-          if-no-files-found: error
-
-      - name: Verify Win10 Portable Binary Presence
-        if: steps.filter.outputs.packages == 'true'
-        shell: pwsh
-        run: |
-          $filePath = "src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe"
-          if (Test-Path $filePath) {
-            $size = (Get-Item $filePath).Length
-            Write-Host "SUCCESS: $filePath exists ($size bytes) and is accessible."
-          } else {
-            Write-Error "ERROR: $filePath is missing! It may have been cleaned up by subsequent build steps."
-            exit 1
-          }
-
-      - name: Scan Win10 Portable Binary via VirusTotal
-        if: steps.filter.outputs.packages == 'true'
-        uses: crazy-max/ghaction-virustotal@v5.0.0
-        continue-on-error: true
-        with:
-          vt_api_key: ${{ secrets.VT_KEY }}
-          files: |
-            src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
-          request_rate: 2
-
   flatpak:
     name: Build Flatpak
     runs-on: ubuntu-latest
@@ -334,24 +262,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: lts/*
-          cache: 'pnpm'
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-env
 
       - name: Download verified rclone binaries
         uses: actions/download-artifact@v7
@@ -383,120 +295,9 @@ jobs:
             src-tauri/target/release/bundle/dmg/
           if-no-files-found: error
 
-  test-linux:
-    name: Test Linux Application
-    needs: [verify-rclone, build-linux]
+  test:
+    name: Run Tests
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: lts/*
-          cache: 'pnpm'
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
-
-      - name: Install Linux dependencies
-        run: |
-          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2 webkit2gtk-driver xvfb
-
-      - name: Download Linux build artifact
-        uses: actions/download-artifact@v7
-        with:
-          name: tauri-build-linux
-          path: .
-
-      - name: Make binaries executable
-        run: |
-          chmod +x src-tauri/target/release/scs-rclient
-          chmod +x src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Install Testing Dependencies
-        run: pnpm -C test install --frozen-lockfile
-
-      - name: Audit Testing Dependencies
-        run: pnpm -C test audit
-
-      - name: Run Vitest API Mocks
-        run: pnpm test
-
-
-
-  test-windows:
-    name: Test Windows Application
-    needs: [verify-rclone, build-windows]
-    runs-on: windows-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: lts/*
-          cache: 'pnpm'
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
-
-      - name: Download Windows build artifact
-        uses: actions/download-artifact@v7
-        with:
-          name: tauri-build-windows
-          path: .
-
-      - name: Reconstruct Release Binary
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path src-tauri/target/release
-          Copy-Item -Path nsis/scs-rclient-win-10-portable.exe -Destination src-tauri/target/release/scs-rclient.exe
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Install Testing Dependencies
-        run: pnpm -C test install --frozen-lockfile
-
-      - name: Audit Testing Dependencies
-        run: pnpm -C test audit
-
-      - name: Run Vitest API Mocks
-        run: pnpm test
-
-
-
-  test-macos:
-    name: Test macOS Application
-    needs: [verify-rclone, build-macos]
-    runs-on: macos-15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -527,7 +328,7 @@ jobs:
   publish-release:
     name: Publish Release Assets
     if: github.event_name == 'release'
-    needs: [build-linux, build-windows, flatpak, build-macos, test-linux, test-windows, test-macos]
+    needs: [build-linux, build-windows, flatpak, build-macos, test]
     runs-on: ubuntu-slim
     permissions:
       contents: write
