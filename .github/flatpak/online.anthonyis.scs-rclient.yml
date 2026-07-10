@@ -25,7 +25,7 @@ modules:
       - install -Dm0644 cargo/config .cargo/config.toml
       - cargo build --offline --release --manifest-path src-tauri/Cargo.toml
       - install -Dm755 src-tauri/target/release/scs-rclient /app/bin/scs-rclient
-      - install -Dm755 src-tauri/target/release/rclone-x86_64-unknown-linux-gnu /app/bin/rclone-x86_64-unknown-linux-gnu
+      - install -Dm755 src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu /app/bin/rclone-sidecar-x86_64-unknown-linux-gnu
       - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/online.anthonyis.scs-rclient.png
       - install -Dm644 .github/flatpak/online.anthonyis.scs-rclient.desktop /app/share/applications/online.anthonyis.scs-rclient.desktop
     sources:
