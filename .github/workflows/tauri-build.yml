@@ -112,6 +112,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Audit NPM Dependencies
+        run: pnpm audit --prod
+
       - name: Build Standard Tauri App
         run: pnpm tauri build
 
@@ -202,6 +205,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Audit NPM Dependencies
+        run: pnpm audit --prod
 
       - name: Build Standard Tauri App
         run: pnpm tauri build
@@ -367,6 +373,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Audit NPM Dependencies
+        run: pnpm audit --prod
+
       - name: Build Standard Tauri App
         run: pnpm tauri build
 
@@ -425,7 +434,10 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install Testing Dependencies
-        run: pnpm -C test install --no-frozen-lockfile
+        run: pnpm -C test install --frozen-lockfile
+
+      - name: Audit Testing Dependencies
+        run: pnpm -C test audit
 
       - name: Run Vitest API Mocks
         run: pnpm test
@@ -475,7 +487,10 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install Testing Dependencies
-        run: pnpm -C test install --no-frozen-lockfile
+        run: pnpm -C test install --frozen-lockfile
+
+      - name: Audit Testing Dependencies
+        run: pnpm -C test audit
 
       - name: Run Vitest API Mocks
         run: pnpm test
@@ -505,7 +520,10 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install Testing Dependencies
-        run: pnpm -C test install --no-frozen-lockfile
+        run: pnpm -C test install --frozen-lockfile
+
+      - name: Audit Testing Dependencies
+        run: pnpm -C test audit
 
       - name: Run Vitest API Mocks
         run: pnpm test
