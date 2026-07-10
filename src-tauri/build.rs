@@ -10,8 +10,8 @@ fn main() {
 
     // List of sidecar binaries that Tauri expects based on tauri.conf.json configuration
     let targets = vec![
-        "rclone-x86_64-pc-windows-msvc.exe",
-        "rclone-x86_64-unknown-linux-gnu",
+        "rclone-sidecar-x86_64-pc-windows-msvc.exe",
+        "rclone-sidecar-x86_64-unknown-linux-gnu",
     ];
 
     for target in targets {

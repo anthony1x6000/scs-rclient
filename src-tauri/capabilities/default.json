@@ -16,7 +16,7 @@
           "args": true
         },
         {
-          "name": "binaries/rclone",
+          "name": "binaries/rclone-sidecar",
           "sidecar": true,
           "args": true
         }
@@ -31,7 +31,7 @@
           "args": true
         },
         {
-          "name": "binaries/rclone",
+          "name": "binaries/rclone-sidecar",
           "sidecar": true,
           "args": true
         }
@@ -46,7 +46,7 @@
           "args": true
         },
         {
-          "name": "binaries/rclone",
+          "name": "binaries/rclone-sidecar",
           "sidecar": true,
           "args": true
         }

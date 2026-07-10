@@ -9,7 +9,7 @@ let useSystemRclone = true;
  */
 export async function detectRclone(): Promise<void> {
   try {
-    const testCmd = Command.sidecar("binaries/rclone", ["--version"]);
+    const testCmd = Command.sidecar("binaries/rclone-sidecar", ["--version"]);
     const res = await testCmd.execute();
     if (res.code === 0) {
       useSystemRclone = false;
@@ -62,8 +62,8 @@ export function createRcloneCommand(args: string[], env?: Record<string, string>
     // Uses the system-installed rclone executable from the system's PATH
     return Command.create("rclone", args, options);
   } else {
-    // Uses the packaged sidecar binary (rclone-x86_64-pc-windows-msvc.exe or rclone-x86_64-unknown-linux-gnu)
-    return Command.sidecar("binaries/rclone", args, options);
+    // Uses the packaged sidecar binary (rclone-sidecar-x86_64-pc-windows-msvc.exe or rclone-sidecar-x86_64-unknown-linux-gnu)
+    return Command.sidecar("binaries/rclone-sidecar", args, options);
   }
 }
 
