@@ -35,7 +35,7 @@
       "dmg"
     ],
     "externalBin": [
-      "binaries/rclone"
+      "binaries/rclone-sidecar"
     ],
     "icon": [
       "icons/32x32.png",

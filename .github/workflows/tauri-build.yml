@@ -106,8 +106,8 @@ jobs:
         run: |
           unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip
           mkdir -p src-tauri/binaries
-          cp rclone-v${{ env.RCLONE_VERSION }}-linux-amd64/rclone src-tauri/binaries/rclone-x86_64-unknown-linux-gnu
-          chmod +x src-tauri/binaries/rclone-x86_64-unknown-linux-gnu
+          cp rclone-v${{ env.RCLONE_VERSION }}-linux-amd64/rclone src-tauri/binaries/rclone-sidecar-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/binaries/rclone-sidecar-x86_64-unknown-linux-gnu
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -118,7 +118,7 @@ jobs:
       - name: Copy sidecar to release folder
         run: |
           mkdir -p src-tauri/target/release
-          cp src-tauri/binaries/rclone-x86_64-unknown-linux-gnu src-tauri/target/release/rclone-x86_64-unknown-linux-gnu
+          cp src-tauri/binaries/rclone-sidecar-x86_64-unknown-linux-gnu src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu
 
       - name: Install flatpak-cargo-generator requirements
         run: |
@@ -147,7 +147,7 @@ jobs:
             src-tauri/target/release/bundle/deb/
             src-tauri/target/release/bundle/appimage/
             src-tauri/target/release/scs-rclient
-            src-tauri/target/release/rclone-x86_64-unknown-linux-gnu
+            src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu
             dist/
           if-no-files-found: error
 
@@ -198,7 +198,7 @@ jobs:
         run: |
           Expand-Archive -Path verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip -DestinationPath .
           New-Item -ItemType Directory -Force -Path src-tauri/binaries
-          Copy-Item -Path rclone-v${{ env.RCLONE_VERSION }}-windows-amd64/rclone.exe -Destination src-tauri/binaries/rclone-x86_64-pc-windows-msvc.exe
+          Copy-Item -Path rclone-v${{ env.RCLONE_VERSION }}-windows-amd64/rclone.exe -Destination src-tauri/binaries/rclone-sidecar-x86_64-pc-windows-msvc.exe
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -307,7 +307,7 @@ jobs:
       - name: Make binary executable
         run: |
           chmod +x src-tauri/target/release/scs-rclient
-          chmod +x src-tauri/target/release/rclone-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu
 
       - name: Build Flatpak Bundle
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
@@ -361,8 +361,8 @@ jobs:
         run: |
           unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip
           mkdir -p src-tauri/binaries
-          cp rclone-v${{ env.RCLONE_VERSION }}-osx-arm64/rclone src-tauri/binaries/rclone-aarch64-apple-darwin
-          chmod +x src-tauri/binaries/rclone-aarch64-apple-darwin
+          cp rclone-v${{ env.RCLONE_VERSION }}-osx-arm64/rclone src-tauri/binaries/rclone-sidecar-aarch64-apple-darwin
+          chmod +x src-tauri/binaries/rclone-sidecar-aarch64-apple-darwin
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -419,7 +419,7 @@ jobs:
       - name: Make binaries executable
         run: |
           chmod +x src-tauri/target/release/scs-rclient
-          chmod +x src-tauri/target/release/rclone-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
