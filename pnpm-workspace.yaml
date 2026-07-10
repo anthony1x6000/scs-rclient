@@ -2,14 +2,11 @@ packages:
   - '.'
 
 allowBuilds:
-  edgedriver: true
   esbuild: true
-  geckodriver: true
 minimumReleaseAge: 10080
 minimumReleaseAgeStrict: true
 trustPolicy: no-downgrade
 trustPolicyIgnoreAfter: 10080
 trustPolicyExclude:
   - semver
-  - chokidar
 blockExoticSubdeps: true
