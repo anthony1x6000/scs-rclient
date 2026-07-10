@@ -6,7 +6,6 @@ allowBuilds:
 minimumReleaseAge: 10080
 minimumReleaseAgeStrict: true
 trustPolicy: no-downgrade
-trustPolicyIgnoreAfter: 10080
 trustPolicyExclude:
   - semver
 blockExoticSubdeps: true
