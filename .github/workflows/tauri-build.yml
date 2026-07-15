@@ -40,7 +40,6 @@ jobs:
           curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/SHA256SUMS
           curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip
           curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip
-          curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip
 
       - name: Verify Checksums File Signature
         run: |
@@ -55,9 +54,9 @@ jobs:
           mkdir verified-binaries
           mv rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip verified-binaries/
           mv rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip verified-binaries/
-          mv rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip verified-binaries/
 
       - name: Upload Verified Binaries Artifact
+
         uses: actions/upload-artifact@v7
         with:
           name: verified-rclone
@@ -254,47 +253,6 @@ jobs:
           path: scs-rclient.flatpak
           if-no-files-found: error
 
-  build-macos:
-    name: Build macOS Application
-    needs: verify-rclone
-    runs-on: macos-15
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Setup Build Environment
-        uses: ./.github/actions/setup-build-env
-
-      - name: Download verified rclone binaries
-        uses: actions/download-artifact@v7
-        with:
-          name: verified-rclone
-          path: verified-binaries
-
-      - name: Extract macOS Sidecar
-        run: |
-          unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip
-          mkdir -p src-tauri/binaries
-          cp rclone-v${{ env.RCLONE_VERSION }}-osx-arm64/rclone src-tauri/binaries/rclone-sidecar-aarch64-apple-darwin
-          chmod +x src-tauri/binaries/rclone-sidecar-aarch64-apple-darwin
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Audit NPM Dependencies
-        run: pnpm audit --prod
-
-      - name: Build Standard Tauri App
-        run: pnpm tauri build
-
-      - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: tauri-build-macos
-          path: |
-            src-tauri/target/release/bundle/dmg/
-          if-no-files-found: error
-
   test:
     name: Run Tests
     runs-on: ubuntu-latest
@@ -328,7 +286,7 @@ jobs:
   publish-release:
     name: Publish Release Assets
     if: github.event_name == 'release'
-    needs: [build-linux, build-windows, flatpak, build-macos, test]
+    needs: [build-linux, build-windows, flatpak, test]
     runs-on: ubuntu-slim
     permissions:
       contents: write
@@ -354,17 +312,11 @@ jobs:
           name: tauri-build-flatpak
           path: flatpak-asset
 
-      - name: Download macOS Artifacts
-        uses: actions/download-artifact@v7
-        with:
-          name: tauri-build-macos
-          path: macos-assets
-
       - name: Upload Assets to Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          find linux-assets windows-assets flatpak-asset macos-assets -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.dmg" -o -name "*.zip" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
+          find linux-assets windows-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.zip" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
 
       - name: Append Checksums to Release Description
         env:
@@ -382,7 +334,7 @@ jobs:
           echo "| --- | --- |" >> release_body.txt
           
           # Compute hashes and write markdown rows
-          find linux-assets windows-assets flatpak-asset macos-assets -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.dmg" -o -name "*.zip" \) | while read -r file; do
+          find linux-assets windows-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.zip" \) | while read -r file; do
             filename=$(basename "$file")
             hash=$(sha256sum "$file" | awk '{print $1}')
             echo "| \`$filename\` | \`$hash\` |" >> release_body.txt
@@ -390,6 +342,7 @@ jobs:
           
           # Update the release notes
           gh release edit ${{ github.event.release.tag_name }} --notes-file release_body.txt
+
 
   virustotal:
     name: VirusTotal Release Asset Scan
