@@ -31,8 +31,7 @@
       "nsis",
       "msi",
       "deb",
-      "appimage",
-      "dmg"
+      "appimage"
     ],
     "externalBin": [
       "binaries/rclone-sidecar"
