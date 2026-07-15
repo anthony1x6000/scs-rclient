@@ -3,7 +3,8 @@ name = "scs-rclient"
 version = "0.1.0"
 description = "gui wrapper for rclone"
 authors = ["Anthony"]
-edition = "2026"
+edition = "2021"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
