@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { detectRclone, createRcloneCommand, ensureRcloneDetected } from "../src/utils/rclone";
+import { detectRclone, createRcloneCommand, ensureRcloneDetected } from "./src/utils/rclone";
 
 describe("rclone sidecar detection", () => {
   beforeEach(() => {
