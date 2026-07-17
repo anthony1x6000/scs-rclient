@@ -41,6 +41,7 @@ jobs:
           curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip
           curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip
           curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip
+          curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-osx-amd64.zip
 
       - name: Verify Checksums File Signature
         run: |
@@ -56,6 +57,7 @@ jobs:
           mv rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip verified-binaries/
           mv rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip verified-binaries/
           mv rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip verified-binaries/
+          mv rclone-v${{ env.RCLONE_VERSION }}-osx-amd64.zip verified-binaries/
 
       - name: Upload Verified Binaries Artifact
         uses: actions/upload-artifact@v7
@@ -281,9 +283,12 @@ jobs:
       - name: Extract macOS Sidecar
         run: |
           unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip
+          unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-osx-amd64.zip
           mkdir -p src-tauri/binaries
           cp rclone-v${{ env.RCLONE_VERSION }}-osx-arm64/rclone src-tauri/binaries/rclone-sidecar-aarch64-apple-darwin
+          cp rclone-v${{ env.RCLONE_VERSION }}-osx-amd64/rclone src-tauri/binaries/rclone-sidecar-x86_64-apple-darwin
           chmod +x src-tauri/binaries/rclone-sidecar-aarch64-apple-darwin
+          chmod +x src-tauri/binaries/rclone-sidecar-x86_64-apple-darwin
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -291,15 +296,18 @@ jobs:
       - name: Audit NPM Dependencies
         run: pnpm audit --prod
 
+      - name: Add Rust Targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Build Standard Tauri App
-        run: pnpm tauri build
+        run: pnpm tauri build --target universal-apple-darwin
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v7
         with:
           name: tauri-build-macos
           path: |
-            src-tauri/target/release/bundle/dmg/
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/
           if-no-files-found: error
 
 
