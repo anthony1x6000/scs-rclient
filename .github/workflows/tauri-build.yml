@@ -200,15 +200,22 @@ jobs:
           cd src-tauri/target/release/bundle/nsis
           Compress-Archive -Path "scs-rclient-win-10-portable.exe" -DestinationPath "portable-win10-bin.zip"
 
-      - name: Upload Build Artifacts
+      - name: Upload Windows MSI Artifacts
         uses: actions/upload-artifact@v7
         with:
           name: tauri-build-windows
           path: |
-            src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
-            src-tauri/target/release/bundle/nsis/portable-win10-bin.zip
             src-tauri/target/release/bundle/msi/scs-rclient-win-10.msi
             src-tauri/target/release/bundle/msi/scs-rclient-win-7.msi
+          if-no-files-found: error
+
+      - name: Upload Windows 10 Portable Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tauri-build-windows-10-portable
+          path: |
+            src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
+            src-tauri/target/release/bundle/nsis/portable-win10-bin.zip
           if-no-files-found: error
 
   flatpak:
@@ -319,6 +326,12 @@ jobs:
           name: tauri-build-windows
           path: windows-assets
 
+      - name: Download Windows 10 Portable Artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-windows-10-portable
+          path: windows-portable-assets
+
       - name: Download Flatpak Artifact
         uses: actions/download-artifact@v7
         with:
@@ -335,7 +348,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          find linux-assets windows-assets flatpak-asset macos-assets -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.dmg" -o -name "*.zip" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
+          find linux-assets windows-assets windows-portable-assets flatpak-asset macos-assets -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.dmg" -o -name "*.zip" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
 
       - name: Append Checksums to Release Description
         env:
@@ -353,7 +366,7 @@ jobs:
           echo "| --- | --- |" >> release_body.txt
 
           # Compute hashes and write markdown rows
-          find linux-assets windows-assets flatpak-asset macos-assets -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.dmg" -o -name "*.zip" \) | while read -r file; do
+          find linux-assets windows-assets windows-portable-assets flatpak-asset macos-assets -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.dmg" -o -name "*.zip" \) | while read -r file; do
             filename=$(basename "$file")
             hash=$(sha256sum "$file" | awk '{print $1}')
             echo "| \`$filename\` | \`$hash\` |" >> release_body.txt
