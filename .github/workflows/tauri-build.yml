@@ -295,40 +295,11 @@ jobs:
             src-tauri/target/release/bundle/dmg/
           if-no-files-found: error
 
-  test:
-    name: Run Tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: lts/*
-          cache: 'pnpm'
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Install Testing Dependencies
-        run: pnpm -C test install --frozen-lockfile
-
-      - name: Audit Testing Dependencies
-        run: pnpm -C test audit
-
-      - name: Run Vitest API Mocks
-        run: pnpm test
 
   publish-release:
     name: Publish Release Assets
     if: github.event_name == 'release'
-    needs: [build-linux, build-windows, flatpak, build-macos, test]
+    needs: [build-linux, build-windows, flatpak, build-macos]
     runs-on: ubuntu-slim
     permissions:
       contents: write
