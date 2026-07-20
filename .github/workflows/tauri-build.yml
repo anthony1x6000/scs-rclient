@@ -95,7 +95,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Audit NPM Dependencies
-        run: pnpm audit --prod
+        run: pnpm audit --audit-level high
 
       - name: Build Standard Tauri App
         run: pnpm tauri build
@@ -164,7 +164,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Audit NPM Dependencies
-        run: pnpm audit --prod
+        run: pnpm audit --audit-level high
 
       - name: Build Standard Tauri App
         run: pnpm tauri build
@@ -243,11 +243,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Generate Default Tauri Icons
+      - name: Audit NPM Dependencies
+        run: pnpm audit --audit-level high
+
+      - name: Fetch Default Tauri Icons
         shell: pwsh
         run: |
-          pnpm exec create-tauri-app temp-tauri --manager npm --template vanilla -y
-          Copy-Item -Path temp-tauri/src-tauri/icons/* -Destination src-tauri/icons/ -Force
+          git clone --depth 1 https://github.com/tauri-apps/create-tauri-app.git
+          Copy-Item -Path create-tauri-app/templates/_base_/src-tauri/icons/* -Destination src-tauri/icons/ -Force
 
       - name: Build Portable Windows 10 Binary with Default Icons
         run: pnpm tauri build --no-bundle
