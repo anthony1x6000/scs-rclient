@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "pnpm audit --audit-level high",
     "dev": "vite",
+    "prebuild": "pnpm audit --audit-level high",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
