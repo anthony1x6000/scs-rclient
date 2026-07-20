@@ -179,9 +179,9 @@ jobs:
             Rename-Item -Path $msiFile.FullName -NewName "scs-rclient-win-10.msi"
           }
 
-      - name: Build Tauri App with Embedded WebView2
+      - name: Build Tauri App for Windows 7 with Embedded Bootstrapper
         run: |
-          node -e "const fs = require('fs'); const file = 'src-tauri/tauri.conf.json'; const config = JSON.parse(fs.readFileSync(file, 'utf8')); config.bundle.windows = config.bundle.windows || {}; config.bundle.windows.webviewInstallMode = { type: 'offlineInstaller' }; fs.writeFileSync(file, JSON.stringify(config, null, 2), 'utf8');"
+          node -e "const fs = require('fs'); const file = 'src-tauri/tauri.conf.json'; const config = JSON.parse(fs.readFileSync(file, 'utf8')); config.bundle.windows = config.bundle.windows || {}; config.bundle.windows.webviewInstallMode = { type: 'embedBootstrapper' }; fs.writeFileSync(file, JSON.stringify(config, null, 2), 'utf8');"
           pnpm tauri build
 
       - name: Rename Embedded WebView2 Artifacts
