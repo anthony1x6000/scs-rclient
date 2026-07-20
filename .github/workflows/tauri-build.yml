@@ -40,7 +40,6 @@ jobs:
           curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/SHA256SUMS
           curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip
           curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip
-          curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip
 
       - name: Verify Checksums File Signature
         run: |
@@ -55,7 +54,6 @@ jobs:
           mkdir verified-binaries
           mv rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip verified-binaries/
           mv rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip verified-binaries/
-          mv rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip verified-binaries/
 
       - name: Upload Verified Binaries Artifact
         uses: actions/upload-artifact@v7
@@ -97,7 +95,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Audit NPM Dependencies
-        run: pnpm audit --prod
+        run: pnpm audit --audit-level high
 
       - name: Build Standard Tauri App
         run: pnpm tauri build
@@ -166,7 +164,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Audit NPM Dependencies
-        run: pnpm audit --prod
+        run: pnpm audit --audit-level high
 
       - name: Build Standard Tauri App
         run: pnpm tauri build
@@ -181,9 +179,9 @@ jobs:
             Rename-Item -Path $msiFile.FullName -NewName "scs-rclient-win-10.msi"
           }
 
-      - name: Build Tauri App with Embedded WebView2
+      - name: Build Tauri App for Windows 7 with Embedded Bootstrapper
         run: |
-          node -e "const fs = require('fs'); const file = 'src-tauri/tauri.conf.json'; const config = JSON.parse(fs.readFileSync(file, 'utf8')); config.bundle.windows = config.bundle.windows || {}; config.bundle.windows.webviewInstallMode = { type: 'offlineInstaller' }; fs.writeFileSync(file, JSON.stringify(config, null, 2), 'utf8');"
+          node -e "const fs = require('fs'); const file = 'src-tauri/tauri.conf.json'; const config = JSON.parse(fs.readFileSync(file, 'utf8')); config.bundle.windows = config.bundle.windows || {}; config.bundle.windows.webviewInstallMode = { type: 'embedBootstrapper' }; fs.writeFileSync(file, JSON.stringify(config, null, 2), 'utf8');"
           pnpm tauri build
 
       - name: Rename Embedded WebView2 Artifacts
@@ -216,6 +214,59 @@ jobs:
           path: |
             src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
             src-tauri/target/release/bundle/nsis/portable-win10-bin.zip
+          if-no-files-found: error
+
+  build-no-icon-win:
+    name: Build Windows Application without icon
+    needs: verify-rclone
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Download verified rclone binaries
+        uses: actions/download-artifact@v7
+        with:
+          name: verified-rclone
+          path: verified-binaries
+
+      - name: Extract Windows Sidecar
+        shell: pwsh
+        run: |
+          Expand-Archive -Path verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip -DestinationPath .
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries
+          Copy-Item -Path rclone-v${{ env.RCLONE_VERSION }}-windows-amd64/rclone.exe -Destination src-tauri/binaries/rclone-sidecar-x86_64-pc-windows-msvc.exe
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit NPM Dependencies
+        run: pnpm audit --audit-level high
+
+      - name: Fetch Default Tauri Icons
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/tauri-apps/create-tauri-app.git
+          Copy-Item -Path create-tauri-app/templates/_base_/src-tauri/icons/* -Destination src-tauri/icons/ -Force
+
+      - name: Build Portable Windows 10 Binary with Default Icons
+        run: pnpm tauri build --no-bundle
+
+      - name: Rename Default Icon Portable Binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri/target/release/bundle/nsis
+          Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination src-tauri/target/release/bundle/nsis/scs-rclient-no-icon-win-10-portable.exe -Force
+
+      - name: Upload Windows 10 Portable No-Icon Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tauri-build-windows-no-icon
+          path: |
+            src-tauri/target/release/bundle/nsis/scs-rclient-no-icon-win-10-portable.exe
           if-no-files-found: error
 
   flatpak:
@@ -261,52 +312,10 @@ jobs:
           path: scs-rclient.flatpak
           if-no-files-found: error
 
-  build-macos:
-    name: Build macOS Application
-    needs: verify-rclone
-    runs-on: macos-15
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Setup Build Environment
-        uses: ./.github/actions/setup-build-env
-
-      - name: Download verified rclone binaries
-        uses: actions/download-artifact@v7
-        with:
-          name: verified-rclone
-          path: verified-binaries
-
-      - name: Extract macOS Sidecar
-        run: |
-          unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-osx-arm64.zip
-          mkdir -p src-tauri/binaries
-          cp rclone-v${{ env.RCLONE_VERSION }}-osx-arm64/rclone src-tauri/binaries/rclone-sidecar-aarch64-apple-darwin
-          chmod +x src-tauri/binaries/rclone-sidecar-aarch64-apple-darwin
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Audit NPM Dependencies
-        run: pnpm audit --prod
-
-      - name: Build Standard Tauri App
-        run: pnpm tauri build
-
-      - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: tauri-build-macos
-          path: |
-            src-tauri/target/release/bundle/dmg/
-          if-no-files-found: error
-
-
   publish-release:
     name: Publish Release Assets
     if: github.event_name == 'release'
-    needs: [build-linux, build-windows, flatpak, build-macos]
+    needs: [build-linux, build-windows, build-no-icon-win, flatpak]
     runs-on: ubuntu-slim
     permissions:
       contents: write
@@ -332,23 +341,23 @@ jobs:
           name: tauri-build-windows-10-portable
           path: windows-portable-assets
 
+      - name: Download Windows 10 No-Icon Artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-windows-no-icon
+          path: windows-no-icon-assets
+
       - name: Download Flatpak Artifact
         uses: actions/download-artifact@v7
         with:
           name: tauri-build-flatpak
           path: flatpak-asset
 
-      - name: Download macOS Artifacts
-        uses: actions/download-artifact@v7
-        with:
-          name: tauri-build-macos
-          path: macos-assets
-
       - name: Upload Assets to Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          find linux-assets windows-assets windows-portable-assets flatpak-asset macos-assets -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.dmg" -o -name "*.zip" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
+          find linux-assets windows-assets windows-portable-assets windows-no-icon-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.zip" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
 
       - name: Append Checksums to Release Description
         env:
@@ -366,7 +375,7 @@ jobs:
           echo "| --- | --- |" >> release_body.txt
 
           # Compute hashes and write markdown rows
-          find linux-assets windows-assets windows-portable-assets flatpak-asset macos-assets -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.dmg" -o -name "*.zip" \) | while read -r file; do
+          find linux-assets windows-assets windows-portable-assets windows-no-icon-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.zip" \) | while read -r file; do
             filename=$(basename "$file")
             hash=$(sha256sum "$file" | awk '{print $1}')
             echo "| \`$filename\` | \`$hash\` |" >> release_body.txt
@@ -392,4 +401,5 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           files: |
             scs-rclient-win-10-portable\.exe$
+            scs-rclient-no-icon-win-10-portable\.exe$
           request_rate: 2
