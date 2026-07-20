@@ -33,6 +33,11 @@
       "deb",
       "appimage"
     ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    },
     "externalBin": [
       "binaries/rclone-sidecar"
     ],
