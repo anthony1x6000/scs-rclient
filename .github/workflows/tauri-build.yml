@@ -192,12 +192,6 @@ jobs:
             Rename-Item -Path $msiFile.FullName -NewName "scs-rclient-win-7.msi"
           }
 
-      - name: Create Portable Windows Zip
-        shell: pwsh
-        run: |
-          cd src-tauri/target/release/bundle/nsis
-          Compress-Archive -Path "scs-rclient-win-10-portable.exe" -DestinationPath "portable-win10-bin.zip"
-
       - name: Upload Windows MSI Artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -211,9 +205,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: tauri-build-windows-10-portable
-          path: |
-            src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
-            src-tauri/target/release/bundle/nsis/portable-win10-bin.zip
+          path: src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
           if-no-files-found: error
 
   build-no-icon-win:
