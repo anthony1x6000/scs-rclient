@@ -45,5 +45,6 @@ This document tracks recent changes, bug fixes, and workflow improvements made t
 
 ## 9. macOS Support Removal & Dependency Audit Pipeline Fix
 * **macOS Target Decommissioning**: Completely removed macOS target platform support. Deleted the macOS compilation job (`build-macos`), validation steps, and artifact publishing actions from [.github/workflows/tauri-build.yml](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/.github/workflows/tauri-build.yml). Removed `"dmg"` target from [src-tauri/tauri.conf.json](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/src-tauri/tauri.conf.json).
+* **Dependency Audit Bottleneck Fix**: Removed blanket minor and patch package version ignore blocks from [.github/dependabot.yml](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/.github/dependabot.yml). This enables Dependabot to automatically open PRs for package security updates. Active `pnpm audit --prod` checks in CI builds are preserved to ensure compilation fails if production dependencies have unfixed security vulnerabilities.
 * **Testing & Win7 Portable Status**: Confirmed that WebdriverIO E2E tests and Windows 7 portable builds remain decommissioned and removed from the codebase and CI pipelines.
 
