@@ -42,3 +42,8 @@ This document tracks recent changes, bug fixes, and workflow improvements made t
 
 ## 8. Devtools Retention
 * **Rule**: Ensure the `"devtools"` feature is always retained in the `tauri` dependency within `src-tauri/Cargo.toml`. Although generally considered bloat for strict production releases, it is explicitly requested to be allowed for debugging purposes in this application.
+
+## 9. macOS Support Removal & Dependency Audit Pipeline Fix
+* **macOS Target Decommissioning**: Completely removed macOS target platform support. Deleted the macOS compilation job (`build-macos`), validation steps, and artifact publishing actions from [.github/workflows/tauri-build.yml](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/.github/workflows/tauri-build.yml). Removed `"dmg"` target from [src-tauri/tauri.conf.json](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/src-tauri/tauri.conf.json).
+* **Testing & Win7 Portable Status**: Confirmed that WebdriverIO E2E tests and Windows 7 portable builds remain decommissioned and removed from the codebase and CI pipelines.
+
