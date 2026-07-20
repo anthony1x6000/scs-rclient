@@ -192,20 +192,6 @@ jobs:
             Rename-Item -Path $msiFile.FullName -NewName "scs-rclient-win-7.msi"
           }
 
-      - name: Generate Default Tauri Icons
-        shell: pwsh
-        run: |
-          pnpm exec create-tauri-app temp-tauri --manager npm --template vanilla -y
-          Copy-Item -Path temp-tauri/src-tauri/icons/* -Destination src-tauri/icons/ -Force
-
-      - name: Build Portable Windows 10 Binary with Default Icons
-        run: pnpm tauri build --no-bundle
-
-      - name: Rename Default Icon Portable Binary
-        shell: pwsh
-        run: |
-          Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination src-tauri/target/release/bundle/nsis/scs-rclient-no-icon-win-10-portable.exe -Force
-
       - name: Create Portable Windows Zip
         shell: pwsh
         run: |
@@ -227,8 +213,57 @@ jobs:
           name: tauri-build-windows-10-portable
           path: |
             src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
-            src-tauri/target/release/bundle/nsis/scs-rclient-no-icon-win-10-portable.exe
             src-tauri/target/release/bundle/nsis/portable-win10-bin.zip
+          if-no-files-found: error
+
+  build-no-icon-win:
+    name: Build Windows Application without icon
+    needs: verify-rclone
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Download verified rclone binaries
+        uses: actions/download-artifact@v7
+        with:
+          name: verified-rclone
+          path: verified-binaries
+
+      - name: Extract Windows Sidecar
+        shell: pwsh
+        run: |
+          Expand-Archive -Path verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip -DestinationPath .
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries
+          Copy-Item -Path rclone-v${{ env.RCLONE_VERSION }}-windows-amd64/rclone.exe -Destination src-tauri/binaries/rclone-sidecar-x86_64-pc-windows-msvc.exe
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Default Tauri Icons
+        shell: pwsh
+        run: |
+          pnpm exec create-tauri-app temp-tauri --manager npm --template vanilla -y
+          Copy-Item -Path temp-tauri/src-tauri/icons/* -Destination src-tauri/icons/ -Force
+
+      - name: Build Portable Windows 10 Binary with Default Icons
+        run: pnpm tauri build --no-bundle
+
+      - name: Rename Default Icon Portable Binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri/target/release/bundle/nsis
+          Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination src-tauri/target/release/bundle/nsis/scs-rclient-no-icon-win-10-portable.exe -Force
+
+      - name: Upload Windows 10 Portable No-Icon Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tauri-build-windows-no-icon
+          path: |
+            src-tauri/target/release/bundle/nsis/scs-rclient-no-icon-win-10-portable.exe
           if-no-files-found: error
 
   flatpak:
@@ -277,7 +312,7 @@ jobs:
   publish-release:
     name: Publish Release Assets
     if: github.event_name == 'release'
-    needs: [build-linux, build-windows, flatpak]
+    needs: [build-linux, build-windows, build-no-icon-win, flatpak]
     runs-on: ubuntu-slim
     permissions:
       contents: write
@@ -303,6 +338,12 @@ jobs:
           name: tauri-build-windows-10-portable
           path: windows-portable-assets
 
+      - name: Download Windows 10 No-Icon Artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-windows-no-icon
+          path: windows-no-icon-assets
+
       - name: Download Flatpak Artifact
         uses: actions/download-artifact@v7
         with:
@@ -313,7 +354,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          find linux-assets windows-assets windows-portable-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.zip" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
+          find linux-assets windows-assets windows-portable-assets windows-no-icon-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.zip" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
 
       - name: Append Checksums to Release Description
         env:
@@ -331,7 +372,7 @@ jobs:
           echo "| --- | --- |" >> release_body.txt
 
           # Compute hashes and write markdown rows
-          find linux-assets windows-assets windows-portable-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.zip" \) | while read -r file; do
+          find linux-assets windows-assets windows-portable-assets windows-no-icon-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.zip" \) | while read -r file; do
             filename=$(basename "$file")
             hash=$(sha256sum "$file" | awk '{print $1}')
             echo "| \`$filename\` | \`$hash\` |" >> release_body.txt
