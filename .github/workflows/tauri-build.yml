@@ -246,11 +246,17 @@ jobs:
       - name: Audit NPM Dependencies
         run: pnpm audit --audit-level high
 
-      - name: Fetch Default Tauri Icons
+      - name: Fetch Historic Icons from Commit
         shell: pwsh
         run: |
-          git clone --depth 1 https://github.com/tauri-apps/create-tauri-app.git
-          Copy-Item -Path create-tauri-app/templates/_base_/src-tauri/icons/* -Destination src-tauri/icons/ -Force
+          git init temp-repo
+          cd temp-repo
+          git remote add origin https://github.com/anthony1x6000/scs-rclient.git
+          git fetch --depth 1 origin 4865bca7eedb37fd41793a011b2b6d90d405f1b5
+          git checkout FETCH_HEAD
+          cd ..
+          Copy-Item -Path temp-repo/src-tauri/icons/* -Destination src-tauri/icons/ -Force
+          Remove-Item -Path temp-repo -Recurse -Force
 
       - name: Build Portable Windows 10 Binary with Default Icons
         run: pnpm tauri build --no-bundle
