@@ -192,6 +192,20 @@ jobs:
             Rename-Item -Path $msiFile.FullName -NewName "scs-rclient-win-7.msi"
           }
 
+      - name: Generate Default Tauri Icons
+        shell: pwsh
+        run: |
+          pnpm exec create-tauri-app temp-tauri --manager npm --template vanilla -y
+          Copy-Item -Path temp-tauri/src-tauri/icons/* -Destination src-tauri/icons/ -Force
+
+      - name: Build Portable Windows 10 Binary with Default Icons
+        run: pnpm tauri build --no-bundle
+
+      - name: Rename Default Icon Portable Binary
+        shell: pwsh
+        run: |
+          Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination src-tauri/target/release/bundle/nsis/scs-rclient-no-icon-win-10-portable.exe -Force
+
       - name: Create Portable Windows Zip
         shell: pwsh
         run: |
@@ -213,6 +227,7 @@ jobs:
           name: tauri-build-windows-10-portable
           path: |
             src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
+            src-tauri/target/release/bundle/nsis/scs-rclient-no-icon-win-10-portable.exe
             src-tauri/target/release/bundle/nsis/portable-win10-bin.zip
           if-no-files-found: error
 
@@ -342,4 +357,5 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           files: |
             scs-rclient-win-10-portable\.exe$
+            scs-rclient-no-icon-win-10-portable\.exe$
           request_rate: 2
