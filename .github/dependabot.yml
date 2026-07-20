@@ -14,5 +14,6 @@ updates:
     open-pull-requests-limit: 0
     ignore:
       - dependency-name: "glib"
-        reason: "glib 0.20.0+ requires gtk-rs 0.20+ which is constrained by Tauri v2 GUI dependencies (gtk 0.18)"
+        reason: "GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429: glib 0.20+ requires GTK4 / gtk-rs 0.20+ constrained by Tauri v2 (see tauri-apps/tauri#12048, fix in v3 #12563)"
+
 
