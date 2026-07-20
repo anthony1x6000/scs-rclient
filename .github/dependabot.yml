@@ -12,3 +12,7 @@ updates:
       interval: "weekly"
       day: "tuesday"
     open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: "glib"
+        reason: "glib 0.20.0+ requires gtk-rs 0.20+ which is constrained by Tauri v2 GUI dependencies (gtk 0.18)"
+
