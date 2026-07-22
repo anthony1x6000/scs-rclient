@@ -32,7 +32,6 @@ jobs:
 
       - name: Confirm Nick Craig-Wood's Signing Key
         run: |
-          # Verify Nick's signing key (fingerprint: ${{ env.RCLONE_SIGNING_KEY }}) is imported
           gpg --list-keys ${{ env.RCLONE_SIGNING_KEY }}
 
       - name: Download Rclone v${{ env.RCLONE_VERSION }} and Checksums
@@ -76,7 +75,7 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2 webkit2gtk-driver xvfb
+          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2 webkit2gtk-driver xvfb rpm
 
       - name: Download verified rclone binaries
         uses: actions/download-artifact@v7
@@ -105,6 +104,13 @@ jobs:
           mkdir -p src-tauri/target/release
           cp src-tauri/binaries/rclone-sidecar-x86_64-unknown-linux-gnu src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu
 
+      - name: Organize Linux Release Assets
+        run: |
+          mkdir -p dist-linux
+          cp src-tauri/target/release/bundle/appimage/*.AppImage dist-linux/scs-rclient-linux.AppImage
+          cp src-tauri/target/release/bundle/deb/*.deb dist-linux/scs-rclient-linux.deb
+          cp src-tauri/target/release/bundle/rpm/*.rpm dist-linux/scs-rclient-linux.rpm
+
       - name: Install flatpak-cargo-generator requirements
         run: |
           python3 -m pip install tomlkit aiohttp
@@ -129,11 +135,11 @@ jobs:
         with:
           name: tauri-build-linux
           path: |
-            src-tauri/target/release/bundle/deb/
-            src-tauri/target/release/bundle/appimage/
+            dist-linux/scs-rclient-linux.AppImage
+            dist-linux/scs-rclient-linux.deb
+            dist-linux/scs-rclient-linux.rpm
             src-tauri/target/release/scs-rclient
             src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu
-            dist/
           if-no-files-found: error
 
   build-windows:
@@ -166,46 +172,33 @@ jobs:
       - name: Audit NPM Dependencies
         run: pnpm audit --audit-level high
 
-      - name: Build Standard Tauri App
-        run: pnpm tauri build
+      - name: Build Portable Windows App
+        run: pnpm tauri build --no-bundle
 
-      - name: Rename Standard Windows Artifacts
+      - name: Organize Portable Windows Binary
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path src-tauri/target/release/bundle/nsis
-          Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
-          $msiFile = Get-ChildItem -Path src-tauri/target/release/bundle/msi/*.msi | Select-Object -First 1
-          if ($msiFile) {
-            Rename-Item -Path $msiFile.FullName -NewName "scs-rclient-win-10.msi"
-          }
+          New-Item -ItemType Directory -Force -Path dist-win
+          Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination dist-win/scs-rclient-win-portable.exe
 
-      - name: Build Tauri App for Windows 7 with Embedded Bootstrapper
+      - name: Build NSIS Installer (currentUser)
         run: |
-          node -e "const fs = require('fs'); const file = 'src-tauri/tauri.conf.json'; const config = JSON.parse(fs.readFileSync(file, 'utf8')); config.bundle.windows = config.bundle.windows || {}; config.bundle.windows.webviewInstallMode = { type: 'embedBootstrapper' }; fs.writeFileSync(file, JSON.stringify(config, null, 2), 'utf8');"
-          pnpm tauri build
+          node -e "const fs = require('fs'); const file = 'src-tauri/tauri.conf.json'; const config = JSON.parse(fs.readFileSync(file, 'utf8')); config.bundle.windows = config.bundle.windows || {}; config.bundle.windows.webviewInstallMode = { type: 'downloadBootstrapper' }; config.bundle.windows.nsis = { installMode: 'currentUser' }; fs.writeFileSync(file, JSON.stringify(config, null, 2), 'utf8');"
+          pnpm tauri build --bundles nsis
 
-      - name: Rename Embedded WebView2 Artifacts
+      - name: Organize NSIS Installer Binary
         shell: pwsh
         run: |
-          $msiFile = Get-ChildItem -Path src-tauri/target/release/bundle/msi/*.msi | Where-Object { $_.Name -notlike "*win-10*" } | Select-Object -First 1
-          if ($msiFile) {
-            Rename-Item -Path $msiFile.FullName -NewName "scs-rclient-win-7.msi"
+          $nsisFile = Get-ChildItem -Path src-tauri/target/release/bundle/nsis/*setup.exe | Select-Object -First 1
+          if ($nsisFile) {
+            Copy-Item -Path $nsisFile.FullName -Destination dist-win/scs-rclient-win-installer.exe
           }
 
-      - name: Upload Windows MSI Artifacts
+      - name: Upload Windows Build Artifacts
         uses: actions/upload-artifact@v7
         with:
           name: tauri-build-windows
-          path: |
-            src-tauri/target/release/bundle/msi/scs-rclient-win-10.msi
-            src-tauri/target/release/bundle/msi/scs-rclient-win-7.msi
-          if-no-files-found: error
-
-      - name: Upload Windows 10 Portable Artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: tauri-build-windows-10-portable
-          path: src-tauri/target/release/bundle/nsis/scs-rclient-win-10-portable.exe
+          path: dist-win/
           if-no-files-found: error
 
   build-no-icon-win:
@@ -250,21 +243,20 @@ jobs:
           Copy-Item -Path temp-repo/src-tauri/icons/* -Destination src-tauri/icons/ -Force
           Remove-Item -Path temp-repo -Recurse -Force
 
-      - name: Build Portable Windows 10 Binary with Default Icons
+      - name: Build Portable Windows Binary with Default Icons
         run: pnpm tauri build --no-bundle
 
-      - name: Rename Default Icon Portable Binary
+      - name: Organize Default Icon Portable Binary
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path src-tauri/target/release/bundle/nsis
-          Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination src-tauri/target/release/bundle/nsis/scs-rclient-no-icon-win-10-portable.exe -Force
+          New-Item -ItemType Directory -Force -Path dist-win-noicon
+          Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination dist-win-noicon/scs-rclient-win-noicon.exe -Force
 
-      - name: Upload Windows 10 Portable No-Icon Artifact
+      - name: Upload Windows Portable No-Icon Artifact
         uses: actions/upload-artifact@v7
         with:
           name: tauri-build-windows-no-icon
-          path: |
-            src-tauri/target/release/bundle/nsis/scs-rclient-no-icon-win-10-portable.exe
+          path: dist-win-noicon/scs-rclient-win-noicon.exe
           if-no-files-found: error
 
   flatpak:
@@ -303,11 +295,15 @@ jobs:
           cache-key: flatpak-builder-${{ github.sha }}
           run-tests: false
 
+      - name: Rename Flatpak Artifact
+        run: |
+          mv scs-rclient.flatpak scs-rclient-linux.flatpak
+
       - name: Upload Flatpak Artifact
         uses: actions/upload-artifact@v7
         with:
           name: tauri-build-flatpak
-          path: scs-rclient.flatpak
+          path: scs-rclient-linux.flatpak
           if-no-files-found: error
 
   publish-release:
@@ -325,37 +321,31 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: tauri-build-linux
-          path: linux-assets
+          path: release-assets
 
       - name: Download Windows Artifacts
         uses: actions/download-artifact@v7
         with:
           name: tauri-build-windows
-          path: windows-assets
+          path: release-assets
 
-      - name: Download Windows 10 Portable Artifact
-        uses: actions/download-artifact@v7
-        with:
-          name: tauri-build-windows-10-portable
-          path: windows-portable-assets
-
-      - name: Download Windows 10 No-Icon Artifact
+      - name: Download Windows No-Icon Artifact
         uses: actions/download-artifact@v7
         with:
           name: tauri-build-windows-no-icon
-          path: windows-no-icon-assets
+          path: release-assets
 
       - name: Download Flatpak Artifact
         uses: actions/download-artifact@v7
         with:
           name: tauri-build-flatpak
-          path: flatpak-asset
+          path: release-assets
 
       - name: Upload Assets to Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          find linux-assets windows-assets windows-portable-assets windows-no-icon-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.zip" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
+          find release-assets -maxdepth 1 -type f \( -name "*.AppImage" -o -name "*.flatpak" -o -name "*.deb" -o -name "*.rpm" -o -name "*.exe" \) -exec gh release upload ${{ github.event.release.tag_name }} --clobber {} \+
 
       - name: Append Checksums to Release Description
         env:
@@ -373,7 +363,7 @@ jobs:
           echo "| --- | --- |" >> release_body.txt
 
           # Compute hashes and write markdown rows
-          find linux-assets windows-assets windows-portable-assets windows-no-icon-assets flatpak-asset -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.flatpak" -o -name "*.zip" \) | while read -r file; do
+          find release-assets -maxdepth 1 -type f \( -name "*.AppImage" -o -name "*.flatpak" -o -name "*.deb" -o -name "*.rpm" -o -name "*.exe" \) | while read -r file; do
             filename=$(basename "$file")
             hash=$(sha256sum "$file" | awk '{print $1}')
             echo "| \`$filename\` | \`$hash\` |" >> release_body.txt
@@ -398,6 +388,5 @@ jobs:
           update_release_body: true
           github_token: ${{ secrets.GITHUB_TOKEN }}
           files: |
-            scs-rclient-win-10-portable\.exe$
-            scs-rclient-no-icon-win-10-portable\.exe$
+            scs-rclient-win-portable\.exe$
           request_rate: 2
