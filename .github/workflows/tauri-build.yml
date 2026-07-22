@@ -62,7 +62,7 @@ jobs:
           if-no-files-found: error
 
   audit-glib:
-    name: Audit GLib Security (RUSTSEC-2024-0429 Guard)
+    name: Audit GLib Security (Exception) (RUSTSEC-2024-0429 Guard)
     runs-on: ubuntu-slim
     steps:
       - name: Checkout repository
@@ -77,9 +77,30 @@ jobs:
             echo "SUCCESS: No vulnerable GLib VariantStrIter API usage detected in codebase."
           fi
 
+  audit-pnpm:
+    name: Audit PNPM Security
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: 'pnpm'
+
+      - name: Audit NPM Dependencies
+        run: pnpm audit --audit-level high
+
   build-linux:
     name: Build Linux Application
-    needs: [verify-rclone, audit-glib]
+    needs: [verify-rclone, audit-glib, audit-pnpm]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -160,7 +181,7 @@ jobs:
 
   build-windows:
     name: Build Windows Application
-    needs: [verify-rclone, audit-glib]
+    needs: [verify-rclone, audit-glib, audit-pnpm]
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -219,7 +240,7 @@ jobs:
 
   build-no-icon-win:
     name: Build Windows Application without icon
-    needs: verify-rclone
+    needs: [verify-rclone, audit-glib, audit-pnpm]
     runs-on: windows-latest
     steps:
       - name: Checkout repository
