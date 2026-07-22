@@ -18,7 +18,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: blob: asset: https: http:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' ipc: http://ipc.localhost wss://ipc.localhost tauri: https: http:"
+      "csp": "default-src 'self'; img-src 'self' data: asset:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost wss://ipc.localhost tauri:"
     }
   },
   "bundle": {
@@ -31,16 +31,9 @@
       "nsis",
       "msi",
       "deb",
-      "appimage"
+      "appimage",
+      "dmg"
     ],
-    "windows": {
-      "webviewInstallMode": {
-        "type": "downloadBootstrapper"
-      },
-      "nsis": {
-        "installMode": "currentUser"
-      }
-    },
     "externalBin": [
       "binaries/rclone-sidecar"
     ],
