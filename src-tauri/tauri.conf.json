@@ -29,9 +29,9 @@
     "category": "Utility",
     "targets": [
       "nsis",
-      "msi",
       "deb",
-      "appimage"
+      "appimage",
+      "rpm"
     ],
     "windows": {
       "webviewInstallMode": {
