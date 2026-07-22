@@ -61,9 +61,25 @@ jobs:
           path: verified-binaries/
           if-no-files-found: error
 
+  audit-glib:
+    name: Audit GLib Security (RUSTSEC-2024-0429 Guard)
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Verify GLib API Usage
+        run: |
+          if grep -rn "VariantStrIter" src-tauri/; then
+            echo "ERROR: Vulnerable GLib API (VariantStrIter) detected in src-tauri! See RUSTSEC-2024-0429."
+            exit 1
+          else
+            echo "SUCCESS: No vulnerable GLib VariantStrIter API usage detected in codebase."
+          fi
+
   build-linux:
     name: Build Linux Application
-    needs: verify-rclone
+    needs: [verify-rclone, audit-glib]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -144,7 +160,7 @@ jobs:
 
   build-windows:
     name: Build Windows Application
-    needs: verify-rclone
+    needs: [verify-rclone, audit-glib]
     runs-on: windows-latest
     steps:
       - name: Checkout repository

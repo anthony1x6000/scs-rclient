@@ -15,5 +15,9 @@ updates:
     ignore:
       - dependency-name: "glib"
         reason: "GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429: glib 0.20+ requires GTK4 / gtk-rs 0.20+ constrained by Tauri v2 (see tauri-apps/tauri#12048, fix in v3 #12563)"
+      - dependency-name: "glib-sys"
+        reason: "GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429: glib 0.20+ requires GTK4 / gtk-rs 0.20+ constrained by Tauri v2"
+      - dependency-name: "glib-macros"
+        reason: "GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429: glib 0.20+ requires GTK4 / gtk-rs 0.20+ constrained by Tauri v2"
 
 
