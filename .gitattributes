@@ -1,0 +1,3 @@
+# Ensure consistent LF line endings for pnpm config and lockfile across OSes
+.pnpmfile.cjs text eol=lf
+pnpm-lock.yaml text eol=lf
