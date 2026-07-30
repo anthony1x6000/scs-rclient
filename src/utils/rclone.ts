@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { Command } from "@tauri-apps/plugin-shell";
 
 let useSystemRclone = true;
@@ -8,6 +9,23 @@ let useSystemRclone = true;
  * falls back to using the system-installed 'rclone' binary.
  */
 export async function detectRclone(): Promise<void> {
+  try {
+    const resolvedPath = await invoke<string>("resolve_rclone_binary");
+    if (resolvedPath && !resolvedPath.startsWith("rclone")) {
+      useSystemRclone = false;
+      console.log("Using packaged rclone sidecar path:", resolvedPath);
+      (window as any).__TEST_SIDECAR_STATUS__ = "packaged";
+      return;
+    } else if (resolvedPath === "rclone" || resolvedPath === "rclone.exe") {
+      useSystemRclone = true;
+      console.log("Using system-installed rclone.");
+      (window as any).__TEST_SIDECAR_STATUS__ = "system";
+      return;
+    }
+  } catch (e: any) {
+    console.warn("Rust resolve_rclone_binary check failed, checking via shell Command sidecar...", e?.message || e);
+  }
+
   try {
     const testCmd = Command.sidecar("binaries/rclone-sidecar", ["--version"]);
     const res = await testCmd.execute();
