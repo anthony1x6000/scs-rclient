@@ -93,10 +93,9 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: lts/*
-          cache: 'pnpm'
 
       - name: Audit NPM Dependencies
-        run: pnpm audit --audit-level high
+        run: pnpm audit
 
   build-linux:
     name: Build Linux Application
@@ -131,7 +130,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Audit NPM Dependencies
-        run: pnpm audit --audit-level high
+        run: pnpm audit
 
       - name: Build Standard Tauri App
         run: pnpm tauri build
@@ -207,7 +206,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Audit NPM Dependencies
-        run: pnpm audit --audit-level high
+        run: pnpm audit
 
       - name: Build Portable Windows App
         run: pnpm tauri build --no-bundle
@@ -266,7 +265,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Audit NPM Dependencies
-        run: pnpm audit --audit-level high
+        run: pnpm audit
 
       - name: Fetch Historic Icons from Commit
         shell: pwsh
