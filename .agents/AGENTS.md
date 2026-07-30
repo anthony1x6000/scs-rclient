@@ -30,6 +30,7 @@ To avoid managing global config files on the user's OS, we execute commands usin
 - Remote targeting uses `:webdav:` with dynamic inline parameters.
 - Prior to launching connection tasks, passwords are obscured using `rclone obscure <password>`.
 - Concatenations are resolved safely using normalizers to ensure robust slash routing on Linux/macOS/Windows paths.
+- **Terminal Execution**: All `rclone` operations map click events to launch in an **independent, cross-platform terminal window** (`cmd.exe` on Windows, `Terminal.app` on macOS, or Linux terminal emulators), using the validated embedded `rclone-sidecar` binary with fallback to system `rclone`.
 
 ### Commands reference:
 - **Put (Push):** `rclone copy <local_path> :webdav: --webdav-url=... --webdav-user=... --webdav-pass=...`
@@ -48,16 +49,19 @@ Ensure `fullTestUrl` is fully resolved before executing this log statement.
 
 ---
 
-## 5. Tauri Capability Permissions
+## 5. Tauri Capability Permissions & pnpm Overrides
 
 Tauri v2 requires explicit capabilities to invoke external system commands:
 - **`shell:allow-execute`** is required for synchronous/blocking checks like `execute()` (used for password obscuring and test calls in `CredentialsForm.tsx`).
-- **`shell:allow-spawn`** is required for streaming background executions like `spawn()` (used for command log output in `RcloneActions.tsx`).
-- **`shell:allow-kill`** is required to terminate/kill spawned background executions (used for process cancellation in `RcloneActions.tsx`).
+- **`shell:allow-spawn`** is required for streaming background executions like `spawn()`.
+- **`shell:allow-kill`** is required to terminate/kill spawned background executions.
 All permissions must be configured for the `rclone` binary in [default.json](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/src-tauri/capabilities/default.json).
+
+- **Dependency Overrides**: In `pnpm v11+`, transitive dependency overrides (such as `esbuild`) are defined in [.pnpmfile.cjs](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/.pnpmfile.cjs) via `hooks.readPackage`.
 
 ---
 
 ## 6. Git Commits Rule
 
 - **Do NOT commit on behalf of the user, ever.** The agent must write, modify, and verify code, but must never run `git commit`, `git add`, or stage files. The user is responsible for reviewing and committing all changes manually.
+

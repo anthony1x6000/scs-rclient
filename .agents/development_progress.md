@@ -48,3 +48,13 @@ This document tracks recent changes, bug fixes, and workflow improvements made t
 * **Dependency Audit Bottleneck Fix**: Removed blanket minor and patch package version ignore blocks from [.github/dependabot.yml](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/.github/dependabot.yml). This enables Dependabot to automatically open PRs for package security updates. Active `pnpm audit --prod` checks in CI builds are preserved to ensure compilation fails if production dependencies have unfixed security vulnerabilities.
 * **Testing & Win7 Portable Status**: Confirmed that WebdriverIO E2E tests and Windows 7 portable builds remain decommissioned and removed from the codebase and CI pipelines.
 
+## 10. Independent Cross-Platform Terminal Execution & Binary Resolution
+* **Feature**: `rclone` operations (`put`, `get`, `put-dry`, `get-dry`, `ls`, `lsd`, `check`, `sync`) now launch inside an independent, standalone terminal window rather than streaming output inside the app UI console.
+* **Binary Prioritization**: `resolve_rclone_binary` in [lib.rs](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/src-tauri/src/lib.rs) searches for executable embedded sidecar binaries starting with `rclone-sidecar` across resource, binary, and dev directories, validating execution via `--version`. If unavailable or invalid, it falls back to system `rclone`.
+* **Cross-Platform Spawning**: `run_rclone_in_terminal` handles OS-specific terminal spawning (`cmd.exe /k` on Windows, `Terminal.app` on macOS, and terminal emulators like `x-terminal-emulator`, `gnome-terminal`, `konsole`, `xterm` on Linux), keeping the terminal open upon command completion.
+
+## 11. Modern pnpm Dependency Resolution via `.pnpmfile.cjs`
+* **Issue**: `pnpm audit --audit-level high` was failing in `predev` / `prebuild` due to transitive vulnerabilities in `postcss` and `esbuild`. The `pnpm.overrides` field in `package.json` was deprecated and ignored in `pnpm v11+`.
+* **Fix**: Added [.pnpmfile.cjs](file:///mnt/c/Users/asteve18/OffDrive/GitHub/scs-rclient/.pnpmfile.cjs) to programmatically hook package resolution and enforce `esbuild` versioning (`^0.28.1`) across all sub-dependencies cleanly.
+
+
