@@ -1,8 +1,7 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
-import { createRcloneCommand, resolveRemoteUrl, resolveLocalPath, obscurePassword } from "../utils/rclone";
-import { Child, TerminatedPayload } from "@tauri-apps/plugin-shell";
+import { resolveRemoteUrl, resolveLocalPath, obscurePassword } from "../utils/rclone";
 
 export interface RcloneSettings {
   baseUrl: string;
@@ -77,32 +76,16 @@ export function useRcloneExecution(
   setIsRunning: (running: boolean) => void
 ) {
   const [mountDir, setMountDir] = useState<string>("");
-  const activeChildRef = useRef<Child | null>(null);
 
   useEffect(() => {
     invoke<string>("get_mount_dir")
       .then(setMountDir)
       .catch(console.error);
-
-    return () => {
-      if (activeChildRef.current) {
-        activeChildRef.current.kill().catch(console.error);
-      }
-    };
   }, []);
 
   const cancelCommand = async () => {
-    if (activeChildRef.current) {
-      onLog((prev) => prev + "\nCanceling active operation...\n");
-      try {
-        await activeChildRef.current.kill();
-        onLog((prev) => prev + "Operation canceled by user.\n");
-      } catch (e) {
-        onLog((prev) => prev + `Failed to cancel operation: ${e}\n`);
-      }
-      activeChildRef.current = null;
-      setIsRunning(false);
-    }
+    onLog((prev) => prev + "Note: Operation is running in an independent terminal window. Please manage or close the terminal window directly.\n");
+    setIsRunning(false);
   };
 
   const runRclone = async (action: RcloneActionType) => {
@@ -150,50 +133,31 @@ export function useRcloneExecution(
 
       const remoteUrl = resolveRemoteUrl(settings.baseUrl, settings.selectedSubdir);
       const localPath = resolveLocalPath(mountDir, settings.selectedSubdir);
+      const args = buildActionArgs(action, localPath, remoteUrl, settings.username || undefined);
 
       onLog(
         (prev) =>
           prev +
           `Target Subdirectory: ${settings.selectedSubdir}\n` +
           `Local Path: ${localPath}\n` +
-          `Remote URL: ${remoteUrl}\n\n` +
-          `Running command...\n`
+          `Remote URL: ${remoteUrl}\n` +
+          `Command: rclone ${args.join(" ")}\n\n` +
+          `Launching independent terminal instance...\n`
       );
 
-      const args = buildActionArgs(action, localPath, remoteUrl, settings.username || undefined);
-      onLog((prev) => prev + `rclone ${args.join(" ")}\n\n`);
-
-      const env = obscuredPassword ? { RCLONE_WEBDAV_PASS: obscuredPassword } : undefined;
-      const rcloneCmd = createRcloneCommand(args, env);
-
-      // Listen for stdout / stderr real-time streams
-      rcloneCmd.stdout.on("data", (data: string) => {
-        onLog((prev) => prev + data);
+      const resultMsg = await invoke<string>("run_rclone_in_terminal", {
+        args,
+        envPass: obscuredPassword || null,
       });
 
-      rcloneCmd.stderr.on("data", (data: string) => {
-        onLog((prev) => prev + data);
-      });
-
-      rcloneCmd.on("close", (data: TerminatedPayload) => {
-        onLog((prev) => prev + `\nCommand finished with exit code ${data.code}.\n`);
-        activeChildRef.current = null;
-        setIsRunning(false);
-      });
-
-      rcloneCmd.on("error", (error: string) => {
-        onLog((prev) => prev + `\nCommand error: ${error}\n`);
-        activeChildRef.current = null;
-        setIsRunning(false);
-      });
-
-      const child = await rcloneCmd.spawn();
-      activeChildRef.current = child;
+      onLog((prev) => prev + `${resultMsg}\nIndependent terminal instance launched successfully.\n\n`);
     } catch (e) {
       onLog((prev) => prev + `System Error: ${e}\n`);
+    } finally {
       setIsRunning(false);
     }
   };
 
   return { runRclone, cancelCommand };
 }
+
