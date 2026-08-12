@@ -48,6 +48,18 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
           Get (copy remote to local)
         </li>
         <li 
+          onClick={() => runRclone('put-checksum')} 
+          className="cursor-pointer"
+        >
+          Put --checksum (hash check local to remote)
+        </li>
+        <li 
+          onClick={() => runRclone('get-checksum')} 
+          className="cursor-pointer"
+        >
+          Get --checksum (hash check remote to local)
+        </li>
+        <li 
           onClick={() => runRclone('ls')} 
           className="cursor-pointer"
         >
