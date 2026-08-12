@@ -65,3 +65,5 @@ All permissions must be configured for the `rclone` binary in [default.json](fil
 
 - **Do NOT commit on behalf of the user, ever.** The agent must write, modify, and verify code, but must never run `git commit`, `git add`, or stage files. The user is responsible for reviewing and committing all changes manually.
 
+## 7. Build
+- Never build when there is any package vulnerability. 
