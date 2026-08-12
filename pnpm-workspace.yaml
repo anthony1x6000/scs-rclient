@@ -10,3 +10,6 @@ trustPolicyIgnoreAfter: 10080
 trustPolicyExclude:
   - semver
 blockExoticSubdeps: true
+minimumReleaseAgeExclude:
+  - nanoid@3.3.18
+  - postcss@8.5.26
