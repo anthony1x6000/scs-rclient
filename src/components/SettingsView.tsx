@@ -7,32 +7,34 @@ interface SettingsViewProps {
 }
 
 function SettingsView({ onClose }: SettingsViewProps) {
-  const [testSubdir, setTestSubdir] = useState<string>("");
+  const [targetSubdir, setTargetSubdir] = useState<string>("");
 
   useEffect(() => {
     async function loadSettings() {
       try {
         const store = await load("settings.json", { autoSave: true, defaults: {} });
-        const savedSubdir = await store.get<{ value: string }>("test_subdirectory");
+        const savedSubdir =
+          (await store.get<{ value: string }>("target_subdirectory")) ||
+          (await store.get<{ value: string }>("test_subdirectory"));
         if (savedSubdir && typeof savedSubdir.value === "string") {
-          setTestSubdir(savedSubdir.value);
+          setTargetSubdir(savedSubdir.value);
         } else {
-          setTestSubdir("");
+          setTargetSubdir("");
         }
       } catch (e) {
-        console.error("Failed to load test subdirectory setting:", e);
+        console.error("Failed to load target subdirectory setting:", e);
       }
     }
     loadSettings();
   }, []);
 
   const handleChange = async (newVal: string) => {
-    setTestSubdir(newVal);
+    setTargetSubdir(newVal);
     try {
       const store = await load("settings.json", { autoSave: true, defaults: {} });
-      await store.set("test_subdirectory", { value: newVal });
+      await store.set("target_subdirectory", { value: newVal });
     } catch (e) {
-      console.error("Failed to save test subdirectory setting:", e);
+      console.error("Failed to save target subdirectory setting:", e);
     }
   };
 
@@ -40,9 +42,9 @@ function SettingsView({ onClose }: SettingsViewProps) {
     <>
       <TextInput
         type="text"
-        value={testSubdir}
+        value={targetSubdir}
         onChange={(e) => handleChange(e.target.value)}
-        placeholder="Test Subdirectory..."
+        placeholder="Target Subdirectory..."
         className="w-[80%]"
       />
       <button
