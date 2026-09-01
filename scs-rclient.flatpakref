@@ -1,0 +1,13 @@
+[Flatpak Ref]
+Name=online.anthonyis.scs-rclient
+Branch=master
+Title=scs-rclient
+IsRuntime=false
+Url=https://anthony1x6000.github.io/scs-rclient/repo/
+SuggestRemoteName=scs-rclient
+RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
+Homepage=https://github.com/anthony1x6000/scs-rclient
+Comment=GUI wrapper for rclone
+Description=Flatpak packaging for scs-rclient desktop application
+Icon=https://raw.githubusercontent.com/anthony1x6000/scs-rclient/main/src-tauri/icons/128x128.png
+gpg-verify=false

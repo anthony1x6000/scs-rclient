@@ -1,0 +1,12 @@
+[core]
+repo_version=1
+mode=archive
+min-free-space-percent=0
+min-free-space-size=0MB
+indexed-deltas=true
+
+[flatpak]
+title=scs-rclient
+comment=GUI wrapper for rclone
+description=Automated Flatpak repository for scs-rclient desktop application hosted via GitHub Pages.
+homepage=https://github.com/anthony1x6000/scs-rclient

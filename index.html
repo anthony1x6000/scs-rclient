@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>scs-rclient Flatpak Repository</title>
+</head>
+<body>
+  <main>
+    <h1>scs-rclient Flatpak Repository</h1>
+    <p>Automated Flatpak repository hosting builds of the scs-rclient desktop application.</p>
+
+    <h2>1. Add Flathub runtime dependencies</h2>
+    <pre><code>flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo</code></pre>
+
+    <h2>2. Add the repository</h2>
+    <p>Add this repository to your local Flatpak installation:</p>
+    <pre><code>flatpak remote-add --if-not-exists --user scs-rclient https://anthony1x6000.github.io/scs-rclient/online.anthonyis.scs-rclient.flatpakrepo</code></pre>
+
+    <h2>3. Install scs-rclient</h2>
+    <p>Install the application from the repository:</p>
+    <pre><code>flatpak install --user scs-rclient online.anthonyis.scs-rclient</code></pre>
+
+    <h2>4. Automatic updates</h2>
+    <p>Once installed, update scs-rclient with your other Flatpak packages at any time:</p>
+    <pre><code>flatpak update</code></pre>
+
+    <h2>5. Run the application</h2>
+    <pre><code>flatpak run online.anthonyis.scs-rclient</code></pre>
+
+    <hr>
+    <p>Source code and build workflows available on <a href="https://github.com/anthony1x6000/scs-rclient">GitHub</a>.</p>
+  </main>
+</body>
+</html>
