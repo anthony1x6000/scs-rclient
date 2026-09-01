@@ -1,6 +1,6 @@
 version: 2
 updates:
-  - package-ecosystem: "pnpm"
+  - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
@@ -19,5 +19,3 @@ updates:
         reason: "GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429: glib 0.20+ requires GTK4 / gtk-rs 0.20+ constrained by Tauri v2"
       - dependency-name: "glib-macros"
         reason: "GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429: glib 0.20+ requires GTK4 / gtk-rs 0.20+ constrained by Tauri v2"
-
-
