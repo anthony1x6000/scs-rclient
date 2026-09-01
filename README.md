@@ -1,14 +1,14 @@
-# scs-rclient Flatpak (`online.anthonyis.scs-rclient`)
+# scs-rclient 
 
-GUI wrapper for rclone. Rclone is bundled directly to replace Dreamweaver WebDAV functionality.
+GUI wrapper for rclone. Rclone is bundled. 
 
-![scs-rclient Icon](icons/128x128@2x.png)
+To replace dreamweaver webdav functionality.
 
-Flatpak packaging and automated repository for `online.anthonyis.scs-rclient`.
+![scs-rclient Icon](src-tauri/icons/128x128@2x.png)
 
 ## Installation
 
-### Install from repo
+### Install from Flatpak repository
 
 With the Flatpak repository, you get automatic updates whenever a new version is released.
 
@@ -34,7 +34,7 @@ With the repo added, you can check for updates with:
 flatpak update
 ```
 
-### Install the .flatpak, no repo
+### Install the standalone .flatpak (no repository)
 
 ```bash
 flatpak install --user https://github.com/anthony1x6000/scs-rclient/releases/latest/download/scs-rclient-linux.flatpak
@@ -63,12 +63,8 @@ flatpak override --user --filesystem=~/Documents online.anthonyis.scs-rclient
 flatpak override --user --filesystem=host online.anthonyis.scs-rclient
 ```
 
-## Other platforms & packages
+## Other release packages
 
 Standalone release binaries are also available from [GitHub Releases](https://github.com/anthony1x6000/scs-rclient/releases/latest):
 - **Linux**: AppImage, DEB, RPM, Flatpak
 - **Windows**: Portable EXE, Installer EXE
-
-# AI use and credit
-- Google Antigravity was used to create and maintain this project.
-  - Scripts used are kept inside of [scripts/](https://github.com/anthony1x6000/scs-rclient/tree/gh-pages/scripts), so you can audit the code for yourself.

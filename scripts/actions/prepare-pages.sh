@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SITE_DIR="${1:-.}"
+SITE_DIR="${1:-_site}"
 
 mkdir -p "$SITE_DIR"
 if [ -f repo.tar.gz ]; then
@@ -10,6 +10,26 @@ if [ -f repo.tar.gz ]; then
 elif [ -d repo ] && [ "$SITE_DIR" != "." ]; then
   echo "=== Copying existing repo into $SITE_DIR/ ==="
   cp -a repo "$SITE_DIR/"
+fi
+
+mkdir -p "$SITE_DIR/scripts/actions" "$SITE_DIR/scripts/test" "$SITE_DIR/.github/flatpak"
+if [ -d scripts ]; then
+  cp -a scripts "$SITE_DIR/"
+fi
+if [ -f .github/flatpak/online.anthonyis.scs-rclient.yml ]; then
+  cp .github/flatpak/online.anthonyis.scs-rclient.yml "$SITE_DIR/online.anthonyis.scs-rclient.yml"
+  cp .github/flatpak/online.anthonyis.scs-rclient.yml "$SITE_DIR/.github/flatpak/online.anthonyis.scs-rclient.yml"
+fi
+if [ -f .github/flatpak/online.anthonyis.scs-rclient.desktop ]; then
+  cp .github/flatpak/online.anthonyis.scs-rclient.desktop "$SITE_DIR/online.anthonyis.scs-rclient.desktop"
+  cp .github/flatpak/online.anthonyis.scs-rclient.desktop "$SITE_DIR/.github/flatpak/online.anthonyis.scs-rclient.desktop"
+fi
+if [ -f .github/flatpak/online.anthonyis.scs-rclient.metainfo.xml ]; then
+  cp .github/flatpak/online.anthonyis.scs-rclient.metainfo.xml "$SITE_DIR/online.anthonyis.scs-rclient.metainfo.xml"
+  cp .github/flatpak/online.anthonyis.scs-rclient.metainfo.xml "$SITE_DIR/.github/flatpak/online.anthonyis.scs-rclient.metainfo.xml"
+fi
+if [ -f README.md ]; then
+  cp README.md "$SITE_DIR/README.md"
 fi
 
 echo "=== Dynamically pulling raw README.md and rendering via GitHub Markdown REST API ==="
@@ -54,7 +74,7 @@ if not ref:
         if ref == "HEAD":
             ref = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     except Exception:
-        ref = "gh-pages"
+        ref = "main"
 
 print(f"Target repository: {repo} (ref: {ref})")
 
@@ -160,6 +180,20 @@ for name in ["online.anthonyis.scs-rclient", repo_name]:
         f.write(flatpakrepo_content)
     with open(os.path.join(site_dir, f"{name}.flatpakref"), "w", encoding="utf-8") as f:
         f.write(flatpakref_content)
+
+# Copy icons if available
+icons_dest = os.path.join(site_dir, "icons")
+os.makedirs(icons_dest, exist_ok=True)
+if os.path.exists("src-tauri/icons"):
+    for icon_name in os.listdir("src-tauri/icons"):
+        src_icon = os.path.join("src-tauri/icons", icon_name)
+        if os.path.isfile(src_icon):
+            shutil.copy2(src_icon, os.path.join(icons_dest, icon_name))
+elif os.path.exists("icons"):
+    for icon_name in os.listdir("icons"):
+        src_icon = os.path.join("icons", icon_name)
+        if os.path.isfile(src_icon):
+            shutil.copy2(src_icon, os.path.join(icons_dest, icon_name))
 
 print(f"✓ Generated {output_html_file}, repository, and ref files")
 PYEOF

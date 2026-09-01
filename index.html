@@ -3,33 +3,50 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>scs-rclient Flatpak Repository</title>
+  <title>scs-rclient Flatpak Repository (scs-rclient)</title>
 </head>
 <body>
   <main>
-    <h1>scs-rclient Flatpak Repository</h1>
-    <p>Automated Flatpak repository hosting builds of the scs-rclient desktop application.</p>
+<h1 dir="auto">scs-rclient</h1>
+<p dir="auto">GUI wrapper for rclone. Rclone is bundled.</p>
+<p dir="auto">To replace dreamweaver webdav functionality.</p>
+<p dir="auto"><a target="_blank" rel="noopener noreferrer" href="src-tauri/icons/128x128@2x.png"><img src="src-tauri/icons/128x128@2x.png" alt="scs-rclient Icon" style="max-width: 100%;"></a></p>
+<h2 dir="auto">Installation</h2>
+<h3 dir="auto">Install from Flatpak repository</h3>
+<p dir="auto">With the Flatpak repository, you get automatic updates whenever a new version is released.</p>
+<p dir="auto">Ensure Flathub and the scs-rclient repository are added:</p>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate"><span class="pl-c"><span class="pl-c">#</span> Add Flathub for runtime dependencies</span>
+flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
-    <h2>1. Add Flathub runtime dependencies</h2>
-    <pre><code>flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo</code></pre>
+<span class="pl-c"><span class="pl-c">#</span> Add scs-rclient repository</span>
+flatpak remote-add --if-not-exists --user scs-rclient https://anthony1x6000.github.io/scs-rclient/online.anthonyis.scs-rclient.flatpakrepo</pre></div>
+<p dir="auto">Install:</p>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate">flatpak install --user scs-rclient online.anthonyis.scs-rclient</pre></div>
+<p dir="auto">With the repo added, you can check for updates with:</p>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate">flatpak update</pre></div>
+<h3 dir="auto">Install the standalone .flatpak (no repository)</h3>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate">flatpak install --user https://github.com/anthony1x6000/scs-rclient/releases/latest/download/scs-rclient-linux.flatpak</pre></div>
+<h2 dir="auto">Run the app</h2>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate">flatpak run online.anthonyis.scs-rclient</pre></div>
+<h2 dir="auto">Default permissions</h2>
+<ul dir="auto">
+<li><code class="notranslate">~/Documents/scs-rclient</code></li>
+<li><code class="notranslate">~/.config/rclone</code> (Read-only)</li>
+<li>Network access (<code class="notranslate">--share=network</code>)</li>
+<li>Display server access (X11 &amp; Wayland)</li>
+</ul>
+<p dir="auto">If you need access to other directories for file synchronization, use <a href="https://flathub.org/en/apps/com.github.tchx84.Flatseal" rel="nofollow">Flatseal</a> or use the CLI:</p>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate"><span class="pl-c"><span class="pl-c">#</span> Grant access to Documents folder</span>
+flatpak override --user --filesystem=<span class="pl-k">~</span>/Documents online.anthonyis.scs-rclient
 
-    <h2>2. Add the repository</h2>
-    <p>Add this repository to your local Flatpak installation:</p>
-    <pre><code>flatpak remote-add --if-not-exists --user scs-rclient https://anthony1x6000.github.io/scs-rclient/online.anthonyis.scs-rclient.flatpakrepo</code></pre>
-
-    <h2>3. Install scs-rclient</h2>
-    <p>Install the application from the repository:</p>
-    <pre><code>flatpak install --user scs-rclient online.anthonyis.scs-rclient</code></pre>
-
-    <h2>4. Automatic updates</h2>
-    <p>Once installed, update scs-rclient with your other Flatpak packages at any time:</p>
-    <pre><code>flatpak update</code></pre>
-
-    <h2>5. Run the application</h2>
-    <pre><code>flatpak run online.anthonyis.scs-rclient</code></pre>
-
-    <hr>
-    <p>Source code and build workflows available on <a href="https://github.com/anthony1x6000/scs-rclient">GitHub</a>.</p>
+<span class="pl-c"><span class="pl-c">#</span> Or grant access to entire home directory</span>
+flatpak override --user --filesystem=host online.anthonyis.scs-rclient</pre></div>
+<h2 dir="auto">Other release packages</h2>
+<p dir="auto">Standalone release binaries are also available from <a href="https://github.com/anthony1x6000/scs-rclient/releases/latest">GitHub Releases</a>:</p>
+<ul dir="auto">
+<li><strong>Linux</strong>: AppImage, DEB, RPM, Flatpak</li>
+<li><strong>Windows</strong>: Portable EXE, Installer EXE</li>
+</ul>
   </main>
 </body>
 </html>
