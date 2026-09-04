@@ -50,6 +50,7 @@ flatpak run online.anthonyis.scs-rclient
 
 - `~/Documents/scs-rclient`
 - `~/.config/rclone` (Read-only)
+- Secret Service / Keyring (`org.freedesktop.secrets`, `org.kde.kwalletd5/6`)
 - Network access (`--share=network`)
 - Display server access (X11 & Wayland)
 

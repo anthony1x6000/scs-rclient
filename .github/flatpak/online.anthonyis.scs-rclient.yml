@@ -11,6 +11,10 @@ finish-args:
   - --share=network
   - --filesystem=xdg-documents/scs-rclient:create
   - --filesystem=xdg-config/rclone:ro
+  - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.kde.kwalletd5
+  - --talk-name=org.kde.kwalletd6
+  - --talk-name=org.freedesktop.portal.Secret
   - --env=WEBKIT_DISABLE_DMABUF_RENDERER=1
 modules:
   - name: scs-rclient
