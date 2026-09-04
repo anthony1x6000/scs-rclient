@@ -80,16 +80,12 @@ function CredentialsForm() {
       const store = await load("settings.json", { autoSave: true, defaults: {} });
       await store.set("saved_username", { value: username });
 
-      try {
-        await invoke("save_credentials", { username, secret: password });
-      } catch (saveErr) {
-        console.warn("Failed to save credentials in secure storage:", saveErr);
-      }
+      await invoke("save_credentials", { username, secret: password });
 
       // Trigger the rclone validation process
       await validateCredentials(username, password);
     } catch (e) {
-      console.log("Error during credentials validation:", e);
+      console.log("Error during credentials save/test (keyring save failed):", e);
       setStatus('error');
     }
   };
@@ -101,7 +97,7 @@ function CredentialsForm() {
         await store.set("saved_username", { value: username });
         await invoke("save_credentials", { username, secret: password });
       } catch (e) {
-        console.log("Failed to auto-save credentials on blur:", e);
+        console.log("Failed to auto-save credentials on blur (keyring save failed):", e);
       }
     }
   };
