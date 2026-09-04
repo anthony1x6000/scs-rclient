@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import { createRcloneCommand, resolveRemoteUrl, resolveLocalPath, obscurePassword } from "../utils/rclone";
@@ -8,6 +8,7 @@ export interface RcloneSettings {
   baseUrl: string;
   username: string;
   selectedSubdir: string;
+  targetSubdir: string;
 }
 
 export type RcloneActionType = 'put' | 'get' | 'put-dry' | 'get-dry' | 'put-checksum' | 'get-checksum' | 'ls' | 'lsd' | 'check' | 'sync';
@@ -26,7 +27,8 @@ export async function loadSettings(): Promise<RcloneSettings> {
   return {
     baseUrl: savedBase?.value || "",
     username: savedUser?.value || "",
-    selectedSubdir: savedSub?.value || targetSub?.value || "",
+    selectedSubdir: savedSub?.value || "",
+    targetSubdir: targetSub?.value || "",
   };
 }
 
@@ -85,14 +87,9 @@ export function useRcloneExecution(
   isRunning: boolean,
   setIsRunning: (running: boolean) => void
 ) {
-  const [mountDir, setMountDir] = useState<string>("");
   const activeChildRef = useRef<Child | null>(null);
 
   useEffect(() => {
-    invoke<string>("get_mount_dir")
-      .then(setMountDir)
-      .catch(console.error);
-
     return () => {
       if (activeChildRef.current) {
         activeChildRef.current.kill().catch(console.error);
@@ -157,8 +154,12 @@ export function useRcloneExecution(
         }
       }
 
+      const resolvedMountDir = await invoke<string>("get_mount_dir", {
+        targetSubdir: settings.targetSubdir || undefined,
+      });
+
       const remoteUrl = resolveRemoteUrl(settings.baseUrl, settings.selectedSubdir);
-      const localPath = resolveLocalPath(mountDir, settings.selectedSubdir);
+      const localPath = resolveLocalPath(resolvedMountDir, settings.selectedSubdir);
 
       onLog(
         (prev) =>

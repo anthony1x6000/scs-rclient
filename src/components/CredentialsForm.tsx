@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
-import { createRcloneCommand, resolveRemoteUrl, obscurePassword } from "../utils/rclone";
+import { createRcloneCommand, resolveRemoteUrl, obscurePassword, ensureRcloneDetected } from "../utils/rclone";
 import TextInput from "./TextInput";
 
 function CredentialsForm() {
@@ -35,6 +35,7 @@ function CredentialsForm() {
   const validateCredentials = async (userVal: string, passVal: string) => {
     setStatus('testing');
     try {
+      await ensureRcloneDetected();
       const store = await load("settings.json", { autoSave: true, defaults: {} });
       const savedBase = await store.get<{ value: string }>("webdav_url");
       const savedSub =

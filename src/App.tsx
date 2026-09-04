@@ -8,38 +8,50 @@ import CredentialsForm from "./components/CredentialsForm";
 import SettingsView from "./components/SettingsView";
 import { RcloneActions } from "./components/RcloneActions";
 import RcloneConsole from "./components/RcloneConsole";
-import { ensureRcloneDetected, resolveLocalPath } from "./utils/rclone";
+import { ensureRcloneDetected } from "./utils/rclone";
 
 function App() {
-  const [baseMountDir, setBaseMountDir] = useState<string>("");
+  const [mountDir, setMountDir] = useState<string>("");
   const [targetSubdir, setTargetSubdir] = useState<string>("");
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [logs, setLogs] = useState<string>("");
   const [isRunning, setIsRunning] = useState<boolean>(false);
 
+  const updateMountDir = async (subdir?: string) => {
+    try {
+      const resolved = await invoke<string>("get_mount_dir", {
+        targetSubdir: subdir ? subdir : undefined,
+      });
+      setMountDir(resolved);
+    } catch (e) {
+      console.error("Failed to get mount dir:", e);
+    }
+  };
+
   useEffect(() => {
     // Detect rclone sidecar on mount
     ensureRcloneDetected();
 
-    // Fetch and set mount directory
-    invoke<string>("get_mount_dir")
-      .then(setBaseMountDir)
-      .catch(console.error);
-
-    // Fetch target subdirectory from settings store
+    // Fetch target subdirectory from settings store and resolve mount directory
     load("settings.json", { autoSave: true, defaults: {} })
       .then(async (store) => {
         const savedSubdir =
           (await store.get<{ value: string }>("target_subdirectory")) ||
           (await store.get<{ value: string }>("test_subdirectory"));
-        if (savedSubdir && typeof savedSubdir.value === "string") {
-          setTargetSubdir(savedSubdir.value);
-        }
+        const sub = savedSubdir && typeof savedSubdir.value === "string" ? savedSubdir.value : "";
+        setTargetSubdir(sub);
+        updateMountDir(sub);
       })
-      .catch(console.error);
+      .catch((e) => {
+        console.error(e);
+        updateMountDir();
+      });
   }, []);
 
-  const mountDir = baseMountDir ? resolveLocalPath(baseMountDir, targetSubdir) : "";
+  const handleTargetSubdirChange = (newSub: string) => {
+    setTargetSubdir(newSub);
+    updateMountDir(newSub);
+  };
 
   return (
     <BackgroundWrapper>
@@ -84,7 +96,7 @@ function App() {
             <SettingsView
               onClose={() => setShowSettings(false)}
               targetSubdir={targetSubdir}
-              onTargetSubdirChange={setTargetSubdir}
+              onTargetSubdirChange={handleTargetSubdirChange}
             />
           )}
         </div>
