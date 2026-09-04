@@ -1,6 +1,6 @@
 import { Command } from "@tauri-apps/plugin-shell";
 
-let useSystemRclone = true;
+let useSystemRclone = false;
 
 /**
  * Detects if the packaged sidecar binary is valid and executable.
@@ -8,7 +8,6 @@ let useSystemRclone = true;
  * falls back to using the system-installed 'rclone' binary.
  */
 export async function detectRclone(): Promise<void> {
-
   try {
     const testCmd = Command.sidecar("binaries/rclone-sidecar", ["--version"]);
     const res = await testCmd.execute();
@@ -19,7 +18,7 @@ export async function detectRclone(): Promise<void> {
       return;
     }
   } catch (e: any) {
-    console.warn("Packaged rclone sidecar is invalid or unexecutable. Falling back to system rclone.", e?.message || e);
+    console.warn("Packaged rclone sidecar is invalid or unexecutable. Checking system rclone fallback.", e?.message || e);
     (window as any).__TEST_SIDECAR_ERROR__ = e?.message || e;
   }
 
@@ -38,7 +37,7 @@ export async function detectRclone(): Promise<void> {
     console.error("System-level rclone is not available or is invalid on this system:", e?.message || e);
   }
 
-  useSystemRclone = true;
+  useSystemRclone = false;
 }
 
 let detectPromise: Promise<void> | null = null;
@@ -115,6 +114,7 @@ export function resolveLocalPath(mountDir: string, subdir: string): string {
  * Obscures the password using rclone's built-in obscure command.
  */
 export async function obscurePassword(password: string): Promise<string> {
+  await ensureRcloneDetected();
   const obscureCommand = createRcloneCommand(["obscure", password]);
   const result = await obscureCommand.execute();
   if (result.code !== 0) {

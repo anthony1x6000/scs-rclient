@@ -2,7 +2,30 @@ use tauri::Manager;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
-fn get_mount_dir(app: tauri::AppHandle) -> Result<String, String> {
+fn get_mount_dir(app: tauri::AppHandle, target_subdir: Option<String>) -> Result<String, String> {
+    if let Some(subdir) = target_subdir {
+        let trimmed = subdir.trim();
+        if !trimmed.is_empty() {
+            let path = std::path::Path::new(trimmed);
+            if path.is_absolute() {
+                return Ok(path.to_string_lossy().to_string());
+            }
+            if trimmed.starts_with("~/") || trimmed == "~" {
+                if let Ok(home) = app.path().home_dir() {
+                    let mut p = home;
+                    if trimmed.len() > 2 {
+                        p.push(&trimmed[2..]);
+                    }
+                    return Ok(p.to_string_lossy().to_string());
+                }
+            }
+            if let Ok(mut home) = app.path().home_dir() {
+                home.push(trimmed);
+                return Ok(home.to_string_lossy().to_string());
+            }
+        }
+    }
+
     app.path()
         .document_dir()
         .map(|mut path| {
