@@ -4,12 +4,18 @@ import TextInput from "./TextInput";
 
 interface SettingsViewProps {
   onClose: () => void;
+  targetSubdir?: string;
+  onTargetSubdirChange?: (subdir: string) => void;
 }
 
-function SettingsView({ onClose }: SettingsViewProps) {
-  const [targetSubdir, setTargetSubdir] = useState<string>("");
+function SettingsView({ onClose, targetSubdir: initialSubdir, onTargetSubdirChange }: SettingsViewProps) {
+  const [targetSubdir, setTargetSubdir] = useState<string>(initialSubdir ?? "");
 
   useEffect(() => {
+    if (initialSubdir !== undefined) {
+      setTargetSubdir(initialSubdir);
+      return;
+    }
     async function loadSettings() {
       try {
         const store = await load("settings.json", { autoSave: true, defaults: {} });
@@ -26,10 +32,13 @@ function SettingsView({ onClose }: SettingsViewProps) {
       }
     }
     loadSettings();
-  }, []);
+  }, [initialSubdir]);
 
   const handleChange = async (newVal: string) => {
     setTargetSubdir(newVal);
+    if (onTargetSubdirChange) {
+      onTargetSubdirChange(newVal);
+    }
     try {
       const store = await load("settings.json", { autoSave: true, defaults: {} });
       await store.set("target_subdirectory", { value: newVal });

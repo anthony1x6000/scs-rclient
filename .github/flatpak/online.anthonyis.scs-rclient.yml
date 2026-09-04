@@ -11,6 +11,7 @@ finish-args:
   - --share=network
   - --filesystem=xdg-documents/scs-rclient:create
   - --filesystem=xdg-config/rclone:ro
+  - --env=WEBKIT_DISABLE_DMABUF_RENDERER=1
 modules:
   - name: scs-rclient
     buildsystem: simple
