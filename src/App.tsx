@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { load } from "@tauri-apps/plugin-store";
 import Dropdown from "./components/Dropdown";
 import BackgroundWrapper from "./BackgroundWrapper";
 import BaseWebDAVURL from "./components/BaseWebDAVUrl";
@@ -7,10 +8,11 @@ import CredentialsForm from "./components/CredentialsForm";
 import SettingsView from "./components/SettingsView";
 import { RcloneActions } from "./components/RcloneActions";
 import RcloneConsole from "./components/RcloneConsole";
-import { ensureRcloneDetected } from "./utils/rclone";
+import { ensureRcloneDetected, resolveLocalPath } from "./utils/rclone";
 
 function App() {
-  const [mountDir, setMountDir] = useState<string>("");
+  const [baseMountDir, setBaseMountDir] = useState<string>("");
+  const [targetSubdir, setTargetSubdir] = useState<string>("");
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [logs, setLogs] = useState<string>("");
   const [isRunning, setIsRunning] = useState<boolean>(false);
@@ -21,9 +23,23 @@ function App() {
 
     // Fetch and set mount directory
     invoke<string>("get_mount_dir")
-      .then(setMountDir)
+      .then(setBaseMountDir)
+      .catch(console.error);
+
+    // Fetch target subdirectory from settings store
+    load("settings.json", { autoSave: true, defaults: {} })
+      .then(async (store) => {
+        const savedSubdir =
+          (await store.get<{ value: string }>("target_subdirectory")) ||
+          (await store.get<{ value: string }>("test_subdirectory"));
+        if (savedSubdir && typeof savedSubdir.value === "string") {
+          setTargetSubdir(savedSubdir.value);
+        }
+      })
       .catch(console.error);
   }, []);
+
+  const mountDir = baseMountDir ? resolveLocalPath(baseMountDir, targetSubdir) : "";
 
   return (
     <BackgroundWrapper>
@@ -65,7 +81,11 @@ function App() {
               </button>
             </>
           ) : (
-            <SettingsView onClose={() => setShowSettings(false)} />
+            <SettingsView
+              onClose={() => setShowSettings(false)}
+              targetSubdir={targetSubdir}
+              onTargetSubdirChange={setTargetSubdir}
+            />
           )}
         </div>
       </div>

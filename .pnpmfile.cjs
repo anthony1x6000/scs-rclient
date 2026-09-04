@@ -11,6 +11,9 @@ module.exports = {
         if (pkg.dependencies.nanoid) {
           pkg.dependencies.nanoid = "^3.3.18";
         }
+        if (pkg.dependencies.browserslist) {
+          pkg.dependencies.browserslist = "^4.28.7";
+        }
       }
       return pkg;
     },

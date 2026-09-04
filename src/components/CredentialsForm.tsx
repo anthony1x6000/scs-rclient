@@ -37,7 +37,10 @@ function CredentialsForm() {
     try {
       const store = await load("settings.json", { autoSave: true, defaults: {} });
       const savedBase = await store.get<{ value: string }>("webdav_url");
-      const savedSub = await store.get<{ value: string }>("selected_subdirectory");
+      const savedSub =
+        (await store.get<{ value: string }>("selected_subdirectory")) ||
+        (await store.get<{ value: string }>("target_subdirectory")) ||
+        (await store.get<{ value: string }>("test_subdirectory"));
       
       const baseUrl = savedBase?.value || (import.meta.env["VITE_WEBDAV_BASE_URL"] as string | undefined) || "";
       const selectedSubdir = savedSub?.value !== undefined ? savedSub.value : "";
@@ -77,12 +80,16 @@ function CredentialsForm() {
       const store = await load("settings.json", { autoSave: true, defaults: {} });
       await store.set("saved_username", { value: username });
 
-      await invoke("save_credentials", { username, secret: password });
+      try {
+        await invoke("save_credentials", { username, secret: password });
+      } catch (saveErr) {
+        console.warn("Failed to save credentials in secure storage:", saveErr);
+      }
 
       // Trigger the rclone validation process
       await validateCredentials(username, password);
     } catch (e) {
-      console.log("Error during credentials save/test (keyring save failed):", e);
+      console.log("Error during credentials validation:", e);
       setStatus('error');
     }
   };
@@ -94,7 +101,7 @@ function CredentialsForm() {
         await store.set("saved_username", { value: username });
         await invoke("save_credentials", { username, secret: password });
       } catch (e) {
-        console.log("Failed to auto-save credentials on blur (keyring save failed):", e);
+        console.log("Failed to auto-save credentials on blur:", e);
       }
     }
   };

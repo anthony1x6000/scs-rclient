@@ -20,10 +20,13 @@ export async function loadSettings(): Promise<RcloneSettings> {
   const savedBase = await store.get<{ value: string }>("webdav_url");
   const savedUser = await store.get<{ value: string }>("saved_username");
   const savedSub = await store.get<{ value: string }>("selected_subdirectory");
+  const targetSub =
+    (await store.get<{ value: string }>("target_subdirectory")) ||
+    (await store.get<{ value: string }>("test_subdirectory"));
   return {
     baseUrl: savedBase?.value || "",
     username: savedUser?.value || "",
-    selectedSubdir: savedSub?.value || "",
+    selectedSubdir: savedSub?.value || targetSub?.value || "",
   };
 }
 
