@@ -14,7 +14,7 @@ fi
 
 mkdir -p "$SITE_DIR/scripts/actions" "$SITE_DIR/scripts/test" "$SITE_DIR/.github/flatpak"
 if [ -d scripts ]; then
-  cp -a scripts "$SITE_DIR/"
+  cp -a scripts/. "$SITE_DIR/scripts/"
 fi
 if [ -f .github/flatpak/online.anthonyis.scs-rclient.yml ]; then
   cp .github/flatpak/online.anthonyis.scs-rclient.yml "$SITE_DIR/online.anthonyis.scs-rclient.yml"
@@ -35,6 +35,7 @@ fi
 echo "=== Dynamically pulling raw README.md and rendering via GitHub Markdown REST API ==="
 python3 - << 'PYEOF' "$SITE_DIR"
 import base64
+import html
 import json
 import os
 import re
@@ -99,8 +100,8 @@ except Exception as e:
             readme_text = f.read()
 
 if not readme_text:
-    print("::error::Could not retrieve README content from remote or local!", file=sys.stderr)
-    sys.exit(1)
+    print("::warning::Could not retrieve README content from remote or local; publishing placeholder page.", file=sys.stderr)
+    readme_text = "# scs-rclient\n\nRelease metadata is temporarily unavailable."
 
 # 4. Render markdown using GitHub REST API endpoint
 api_url = "https://api.github.com/markdown"
@@ -127,7 +128,7 @@ try:
     print(f"✓ Successfully rendered markdown via GitHub Markdown REST API ({len(rendered_html)} bytes HTML)")
 except Exception as e:
     print(f"Warning: Failed to render via GitHub API ({e}), using raw fallback", file=sys.stderr)
-    rendered_html = f"<pre>{readme_text}</pre>"
+    rendered_html = f"<pre>{html.escape(readme_text)}</pre>"
 
 # 5. Output pure semantic HTML without CSS
 index_html = f"""<!DOCTYPE html>

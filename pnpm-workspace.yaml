@@ -1,6 +1,9 @@
 packages:
   - '.'
 
+# Explicitly load the security-pin hook (dot-prefixed names are not autoloaded).
+pnpmfile: .pnpmfile.cjs
+
 allowBuilds:
   esbuild: true
 minimumReleaseAge: 10080
@@ -10,6 +13,10 @@ trustPolicyIgnoreAfter: 10080
 trustPolicyExclude:
   - semver
 blockExoticSubdeps: true
+# All four pinned packages are exempted together; keep in sync with
+# package.json overrides and .pnpmfile.cjs.
 minimumReleaseAgeExclude:
-  - nanoid@3.3.18
+  - esbuild@0.28.1
   - postcss@8.5.26
+  - nanoid@3.3.18
+  - browserslist@4.28.8

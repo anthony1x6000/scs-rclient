@@ -5,12 +5,12 @@
   "type": "module",
   "packageManager": "pnpm@11.15.1",
   "scripts": {
-    "predev": "pnpm audit",
     "dev": "vite",
-    "prebuild": "pnpm audit",
-    "build": "tsc && vite build",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "bash scripts/test/test-repo-install.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

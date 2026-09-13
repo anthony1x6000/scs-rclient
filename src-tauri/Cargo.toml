@@ -19,7 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = [] }
 tauri-plugin-store = "2"
 tauri-plugin-shell = "2"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }

@@ -1,59 +1,67 @@
-import { useState, useEffect } from "react";
-import { load } from "@tauri-apps/plugin-store";
+import { useState, useEffect, useRef } from "react";
+import { setTargetSubdir } from "../settings";
 import TextInput from "./TextInput";
 
 interface SettingsViewProps {
   onClose: () => void;
-  targetSubdir?: string;
-  onTargetSubdirChange?: (subdir: string) => void;
+  targetSubdir: string;
+  onTargetSubdirChange: (subdir: string) => void;
 }
 
-function SettingsView({ onClose, targetSubdir: initialSubdir, onTargetSubdirChange }: SettingsViewProps) {
-  const [targetSubdir, setTargetSubdir] = useState<string>(initialSubdir ?? "");
+function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsViewProps) {
+  const [draft, setDraft] = useState<string>(targetSubdir);
+  const [savedIndicator, setSavedIndicator] = useState<string>("");
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onChangeRef = useRef(onTargetSubdirChange);
+  onChangeRef.current = onTargetSubdirChange;
+
+  // Sync from parent only when the parent value changes externally.
+  useEffect(() => {
+    setDraft(targetSubdir);
+  }, [targetSubdir]);
 
   useEffect(() => {
-    if (initialSubdir !== undefined) {
-      setTargetSubdir(initialSubdir);
-      return;
-    }
-    async function loadSettings() {
-      try {
-        const store = await load("settings.json", { autoSave: true, defaults: {} });
-        const savedSubdir =
-          (await store.get<{ value: string }>("target_subdirectory")) ||
-          (await store.get<{ value: string }>("test_subdirectory"));
-        if (savedSubdir && typeof savedSubdir.value === "string") {
-          setTargetSubdir(savedSubdir.value);
-        } else {
-          setTargetSubdir("");
-        }
-      } catch (e) {
-        console.error("Failed to load target subdirectory setting:", e);
-      }
-    }
-    loadSettings();
-  }, [initialSubdir]);
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, []);
 
-  const handleChange = async (newVal: string) => {
-    setTargetSubdir(newVal);
-    if (onTargetSubdirChange) {
-      onTargetSubdirChange(newVal);
-    }
+  useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleEsc);
+    return () => window.removeEventListener("keydown", handleEsc);
+  }, [onClose]);
+
+  const persist = async (newVal: string) => {
+    setSavedIndicator("Saving…");
     try {
-      const store = await load("settings.json", { autoSave: true, defaults: {} });
-      await store.set("target_subdirectory", { value: newVal });
+      await setTargetSubdir(newVal);
+      onChangeRef.current(newVal);
+      setSavedIndicator("Saved.");
     } catch (e) {
       console.error("Failed to save target subdirectory setting:", e);
+      setSavedIndicator("Save failed.");
     }
   };
 
+  const handleChange = (newVal: string) => {
+    setDraft(newVal);
+    setSavedIndicator("");
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => void persist(newVal.trim()), 400);
+  };
+
   return (
-    <>
+    <div role="dialog" aria-label="Settings">
+      <label className="sr-only" htmlFor="scs-target-subdir">Mount root subdirectory</label>
       <TextInput
+        id="scs-target-subdir"
         type="text"
-        value={targetSubdir}
+        value={draft}
         onChange={(e) => handleChange(e.target.value)}
-        placeholder="Target Subdirectory..."
+        placeholder="Mount root subdirectory..."
         className="w-[80%]"
       />
       <button
@@ -63,7 +71,8 @@ function SettingsView({ onClose, targetSubdir: initialSubdir, onTargetSubdirChan
       >
         Close Settings
       </button>
-    </>
+      <span className="text-xs text-gray-400 ml-2" role="status" aria-live="polite">{savedIndicator}</span>
+    </div>
   );
 }
 

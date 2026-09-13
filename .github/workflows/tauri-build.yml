@@ -90,10 +90,35 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: lts/*
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Audit NPM Dependencies
         run: pnpm audit
+
+  test-bundle-install:
+    name: Test Standalone Bundle Install
+    runs-on: ubuntu-latest
+    needs: flatpak
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Trust Workspace Directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Download Flatpak Bundle Artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-flatpak
+
+      - name: Test Standalone Bundle Install
+        run: bash scripts/test/test-bundle-install.sh scs-rclient-linux.flatpak
 
   build-linux:
     name: Build Linux Application

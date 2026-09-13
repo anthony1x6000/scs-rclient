@@ -1,28 +1,47 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { load } from "@tauri-apps/plugin-store";
 import { createRcloneCommand, resolveRemoteUrl, obscurePassword, ensureRcloneDetected } from "../utils/rclone";
+import { getWebDAVBase, getSelectedSubdir, getSavedUsername, setSavedUsername } from "../settings";
 import TextInput from "./TextInput";
 
 function CredentialsForm() {
   const [username, setUsername] = useState<string>("");
   const [password, setPassword] = useState<string>("");
   const [status, setStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+  const [statusText, setStatusText] = useState<string>("");
+  const [hasSavedCredentials, setHasSavedCredentials] = useState<boolean>(false);
+  const lookupSeq = useRef(0);
 
+  // Debounced keyring lookup: only the latest username's result wins.
+  useEffect(() => {
+    const name = username.trim();
+    if (!name) {
+      setHasSavedCredentials(false);
+      return;
+    }
+    const seq = ++lookupSeq.current;
+    const timer = setTimeout(async () => {
+      try {
+        const savedPass = await invoke<string>("get_credentials", { username: name });
+        if (lookupSeq.current !== seq) return;
+        if (savedPass) {
+          setPassword(savedPass);
+          setHasSavedCredentials(true);
+        } else {
+          setHasSavedCredentials(false);
+        }
+      } catch {
+        if (lookupSeq.current !== seq) return;
+        setHasSavedCredentials(false);
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [username]);
 
-  const handleUsernameChange = async (val: string) => {
+  const handleUsernameChange = (val: string) => {
     setUsername(val);
     setStatus('idle');
-    try {
-      const savedPass = await invoke<string>("get_credentials", { username: val });
-      if (savedPass) {
-        setPassword(savedPass);
-      } else {
-        setPassword("");
-      }
-    } catch {
-      setPassword("");
-    }
+    setStatusText("");
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -34,21 +53,17 @@ function CredentialsForm() {
 
   const validateCredentials = async (userVal: string, passVal: string) => {
     setStatus('testing');
+    setStatusText("Testing credentials…");
     try {
       await ensureRcloneDetected();
-      const store = await load("settings.json", { autoSave: true, defaults: {} });
-      const savedBase = await store.get<{ value: string }>("webdav_url");
-      const savedSub =
-        (await store.get<{ value: string }>("selected_subdirectory")) ||
-        (await store.get<{ value: string }>("target_subdirectory")) ||
-        (await store.get<{ value: string }>("test_subdirectory"));
-      
-      const baseUrl = savedBase?.value || (import.meta.env["VITE_WEBDAV_BASE_URL"] as string | undefined) || "";
-      const selectedSubdir = savedSub?.value !== undefined ? savedSub.value : "";
-      
+      // Use the same source of truth as execution: selected subdirectory only.
+      const [baseUrl, selectedSubdir] = await Promise.all([
+        getWebDAVBase(),
+        getSelectedSubdir(),
+      ]);
+
       const fullTestUrl = resolveRemoteUrl(baseUrl, selectedSubdir);
-      console.log("Testing credentials with rclone...", fullTestUrl);
-      
+
       const obscuredPassword = passVal ? await obscurePassword(passVal) : "";
 
       const args = [
@@ -64,99 +79,122 @@ function CredentialsForm() {
       const command = createRcloneCommand(args, env);
       const result = await command.execute();
       if (result.code === 0) {
-        console.log("Rclone authentication test succeeded! Output:\n", result.stdout);
         setStatus('success');
+        setStatusText("Credentials valid.");
       } else {
-        console.error(`Rclone authentication test failed with code ${result.code}:\n`, result.stderr);
         setStatus('error');
+        setStatusText(`Authentication test failed (exit ${result.code}).`);
       }
     } catch (e) {
-      console.error("Error during validation:", e);
       setStatus('error');
+      setStatusText(`Error during validation: ${e}`);
     }
   };
 
   const handleLogin = async () => {
-    try {
-      const store = await load("settings.json", { autoSave: true, defaults: {} });
-      await store.set("saved_username", { value: username });
-
-      await invoke("save_credentials", { username, secret: password });
-
-      // Trigger the rclone validation process
-      await validateCredentials(username, password);
-    } catch (e) {
-      console.log("Error during credentials save/test (keyring save failed):", e);
+    const user = username.trim();
+    if (!user) {
       setStatus('error');
+      setStatusText("Username is required.");
+      return;
+    }
+    try {
+      await setSavedUsername(user);
+      await invoke("save_credentials", { username: user, secret: password });
+      setHasSavedCredentials(true);
+      // Explicit user action only — no auto-validation elsewhere.
+      await validateCredentials(user, password);
+    } catch (e) {
+      setStatus('error');
+      setStatusText(`Error during credentials save/test: ${e}`);
     }
   };
 
-  const handleBlur = async () => {
-    if (username.trim() && password.trim()) {
-      try {
-        const store = await load("settings.json", { autoSave: true, defaults: {} });
-        await store.set("saved_username", { value: username });
-        await invoke("save_credentials", { username, secret: password });
-      } catch (e) {
-        console.log("Failed to auto-save credentials on blur (keyring save failed):", e);
+  const handleForget = async () => {
+    const user = username.trim();
+    try {
+      if (user) {
+        await invoke("delete_credentials", { username: user });
       }
+    } catch (e) {
+      setStatusText(`Could not delete stored credentials: ${e}`);
     }
+    setPassword("");
+    setHasSavedCredentials(false);
+    setStatus('idle');
   };
 
   useEffect(() => {
-    async function loadSavedAndTest() {
+    async function loadSaved() {
       try {
-        const store = await load("settings.json", { autoSave: true, defaults: {} });
-        const savedUser = await store.get<{ value: string }>("saved_username");
-        if (savedUser && savedUser.value) {
-          const userVal = savedUser.value;
-          setUsername(userVal);
-          
-          let savedPass = "";
-          try {
-            savedPass = await invoke<string>("get_credentials", { username: userVal });
-          } catch (keyringError) {
-            console.log("No saved credentials in secure storage for user:", userVal);
-          }
-
+        const userVal = await getSavedUsername();
+        if (!userVal) return;
+        setUsername(userVal);
+        try {
+          const savedPass = await invoke<string>("get_credentials", { username: userVal });
           if (savedPass) {
             setPassword(savedPass);
-            // Run the validation check automatically on startup/reload
-            validateCredentials(userVal, savedPass);
+            setHasSavedCredentials(true);
+            // Do NOT auto-validate on launch: user clicks Test/Login explicitly.
           }
+        } catch {
+          // No saved secret — user enters it manually.
         }
       } catch (e) {
-        console.log("Failed to load saved credentials:", e);
+        setStatusText(`Failed to load saved credentials: ${e}`);
       }
     }
-    loadSavedAndTest();
+    loadSaved();
   }, []);
 
   return (
     <>
-      <TextInput 
-        type="text" 
-        value={username} 
-        onChange={(e) => handleUsernameChange(e.target.value)} 
+      <label className="sr-only" htmlFor="scs-username">Username</label>
+      <TextInput
+        id="scs-username"
+        type="text"
+        value={username}
+        onChange={(e) => handleUsernameChange(e.target.value)}
         onKeyDown={handleKeyDown}
-        onBlur={handleBlur}
-        placeholder="Username..." 
+        placeholder="Username..."
         status={status}
         className="w-[20%]"
+        autoComplete="username"
       />
-      <TextInput 
-        type="password" 
-        value={password} 
+      <label className="sr-only" htmlFor="scs-password">Password</label>
+      <TextInput
+        id="scs-password"
+        type="password"
+        value={password}
         onChange={(e) => {
           setPassword(e.target.value);
           setStatus('idle');
-        }} 
+          setStatusText("");
+        }}
         onKeyDown={handleKeyDown}
-        onBlur={handleBlur}
-        placeholder="Password..." 
+        placeholder="Password..."
         status={status}
         className="w-[20%]"
+        autoComplete="current-password"
       />
+      <button
+        type="button"
+        onClick={handleLogin}
+        disabled={status === 'testing' || !username.trim()}
+        className="ml-2 px-3 py-1 text-xs border border-white/20 hover:border-white/40 bg-transparent text-white cursor-pointer disabled:opacity-40"
+      >
+        Test / Login
+      </button>
+      {hasSavedCredentials && (
+        <button
+          type="button"
+          onClick={handleForget}
+          className="ml-2 px-3 py-1 text-xs border border-white/20 hover:border-white/40 bg-transparent text-white cursor-pointer"
+        >
+          Forget
+        </button>
+      )}
+      <span className="sr-only" role="status" aria-live="polite">{statusText}</span>
     </>
   );
 }

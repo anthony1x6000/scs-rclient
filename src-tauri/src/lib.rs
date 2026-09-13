@@ -1,27 +1,82 @@
 use tauri::Manager;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+
+fn validate_username(username: &str) -> Result<(), String> {
+    let trimmed = username.trim();
+    if trimmed.is_empty() {
+        return Err("Invalid username.".to_string());
+    }
+    if trimmed.len() > 256 {
+        return Err("Invalid username.".to_string());
+    }
+    Ok(())
+}
+
+/// Lexically join `sub` under `base`, rejecting absolute paths, `~` escapes,
+/// and `.` / `..` / prefix components. Returns the joined path.
+fn join_contained(base: &std::path::Path, sub: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = sub.trim();
+    if trimmed.is_empty() {
+        return Err("Empty subdirectory.".to_string());
+    }
+    // Reject Windows separators to keep component analysis sound.
+    if trimmed.contains('\\') {
+        return Err("Invalid subdirectory: backslashes are not allowed.".to_string());
+    }
+    let rel = std::path::Path::new(trimmed);
+    if rel.is_absolute() {
+        return Err("Invalid subdirectory: absolute paths are not allowed.".to_string());
+    }
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(_) => {}
+            // CurDir (`.`), ParentDir (`..`), RootDir, and Prefix are all rejected:
+            // the mount target must be a plain relative descent under the base.
+            _ => return Err("Invalid subdirectory: \".\" and \"..\" segments are not allowed.".to_string()),
+        }
+    }
+    Ok(base.join(rel))
+}
+
+fn contained_string(base: &std::path::Path, joined: &std::path::Path) -> Result<String, String> {
+    // Where possible, canonicalize both sides (resolves symlinks) and enforce containment.
+    if let (Ok(cbase), Ok(cjoined)) = (base.canonicalize(), joined.canonicalize()) {
+        if !cjoined.starts_with(&cbase) {
+            return Err("Invalid subdirectory: escapes the allowed directory.".to_string());
+        }
+        return Ok(cjoined.to_string_lossy().to_string());
+    }
+    // Base may not exist yet (fresh profile): fall back to the lexically-checked join.
+    Ok(joined.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn get_mount_dir(app: tauri::AppHandle, target_subdir: Option<String>) -> Result<String, String> {
     if let Some(subdir) = target_subdir {
         let trimmed = subdir.trim();
         if !trimmed.is_empty() {
-            let path = std::path::Path::new(trimmed);
-            if path.is_absolute() {
-                return Ok(path.to_string_lossy().to_string());
-            }
-            if trimmed.starts_with("~/") || trimmed == "~" {
-                if let Ok(home) = app.path().home_dir() {
-                    let mut p = home;
-                    if trimmed.len() > 2 {
-                        p.push(&trimmed[2..]);
-                    }
-                    return Ok(p.to_string_lossy().to_string());
+            // `~` / `~/...` expands under the home directory, still contained.
+            if trimmed == "~" || trimmed.starts_with("~/") {
+                let home = app.path().home_dir().map_err(|_| "Unable to resolve home directory.".to_string())?;
+                if trimmed == "~" {
+                    return contained_string(&home, &home);
                 }
+                let remainder = &trimmed[2..];
+                // `~//etc` yields an absolute remainder — reject instead of escaping home.
+                if remainder.starts_with('/') {
+                    return Err("Invalid subdirectory: absolute paths are not allowed.".to_string());
+                }
+                let joined = join_contained(&home, remainder)?;
+                return contained_string(&home, &joined);
             }
-            if let Ok(mut home) = app.path().home_dir() {
-                home.push(trimmed);
-                return Ok(home.to_string_lossy().to_string());
+            // Absolute paths are rejected: the mount target must live under home.
+            if std::path::Path::new(trimmed).is_absolute() {
+                return Err("Invalid subdirectory: absolute paths are not allowed.".to_string());
+            }
+            if let Ok(home) = app.path().home_dir() {
+                let joined = join_contained(&home, trimmed)?;
+                return contained_string(&home, &joined);
             }
         }
     }
@@ -32,47 +87,51 @@ fn get_mount_dir(app: tauri::AppHandle, target_subdir: Option<String>) -> Result
             path.push("scs-rclient");
             path.to_string_lossy().to_string()
         })
-        .map_err(|e| e.to_string())
+        .map_err(|_| "Unable to resolve the documents directory.".to_string())
 }
 
 #[tauri::command]
 fn save_credentials(username: String, secret: String) -> Result<(), String> {
-    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| {
-        let err_msg = format!("Keyring initialization failed: {}", e);
-        eprintln!("{}", err_msg);
-        err_msg
+    validate_username(&username)?;
+    let entry = keyring::Entry::new("scs-rclient", username.trim()).map_err(|e| {
+        eprintln!("Keyring initialization failed: {}", e);
+        "Failed to access secure storage.".to_string()
     })?;
     entry.set_password(&secret).map_err(|e| {
-        let err_msg = format!("Failed to save credentials in keyring: {}", e);
-        eprintln!("{}", err_msg);
-        err_msg
+        eprintln!("Failed to save credentials in keyring: {}", e);
+        "Failed to save credentials.".to_string()
     })?;
     Ok(())
 }
 
 #[tauri::command]
 fn get_credentials(username: String) -> Result<String, String> {
-    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| {
-        let err_msg = format!("Keyring initialization failed: {}", e);
-        eprintln!("{}", err_msg);
-        err_msg
+    validate_username(&username)?;
+    let entry = keyring::Entry::new("scs-rclient", username.trim()).map_err(|e| {
+        eprintln!("Keyring initialization failed: {}", e);
+        "Failed to access secure storage.".to_string()
     })?;
     entry.get_password().map_err(|e| {
-        let err_msg = format!("Failed to get credentials from keyring: {}", e);
-        eprintln!("{}", err_msg);
-        err_msg
+        eprintln!("Failed to get credentials from keyring: {}", e);
+        "No stored credentials found.".to_string()
     })
 }
 
 #[tauri::command]
 fn delete_credentials(username: String) -> Result<(), String> {
-    let entry = keyring::Entry::new("scs-rclient", &username).map_err(|e| {
-        let err_msg = format!("Keyring initialization failed: {}", e);
-        eprintln!("{}", err_msg);
-        err_msg
+    validate_username(&username)?;
+    let entry = keyring::Entry::new("scs-rclient", username.trim()).map_err(|e| {
+        eprintln!("Keyring initialization failed: {}", e);
+        "Failed to access secure storage.".to_string()
     })?;
-    let _ = entry.delete_credential();
-    Ok(())
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => {
+            eprintln!("Failed to delete credentials from keyring: {}", e);
+            Err("Failed to delete credentials.".to_string())
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -89,11 +148,31 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             // Ensure ~/Documents/scs-rclient exists on startup
-            if let Ok(mut docs_dir) = app.path().document_dir() {
-                docs_dir.push("scs-rclient");
-                if !docs_dir.exists() {
-                    if let Err(e) = std::fs::create_dir_all(&docs_dir) {
-                        eprintln!("Failed to create scs-rclient directory: {}", e);
+            if let Ok(docs_dir) = app.path().document_dir() {
+                let mut dir = docs_dir;
+                dir.push("scs-rclient");
+                // Refuse to follow a planted symlink at the mount parent.
+                if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+                    if meta.file_type().is_symlink() {
+                        eprintln!("Refusing to use symlinked scs-rclient directory: {}", dir.display());
+                        return Ok(());
+                    }
+                }
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    eprintln!("Failed to create scs-rclient directory: {}", e);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&dir) {
+                        let mut perms = meta.permissions();
+                        // Restrict the mount parent to the owner where it is group/other-readable.
+                        if perms.mode() & 0o077 != 0 {
+                            perms.set_mode(0o700);
+                            if let Err(e) = std::fs::set_permissions(&dir, perms) {
+                                eprintln!("Failed to restrict scs-rclient directory permissions: {}", e);
+                            }
+                        }
                     }
                 }
             }

@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { load } from "@tauri-apps/plugin-store";
+import { useState, useEffect, useRef } from "react";
+import { getSubdirectories, getSelectedSubdir, setSubdirectories, setSelectedSubdir } from "../settings";
 
 interface DropdownProps {
   onSelect?: (item: string) => void;
@@ -10,21 +10,22 @@ function Dropdown({ onSelect }: DropdownProps) {
   const [selectedItem, setSelectedItem] = useState<string>("");
   const [isOpen, setIsOpen] = useState<boolean>(false);
   const [searchText, setSearchText] = useState<string>("");
+  const [saveError, setSaveError] = useState<string>("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const onSelectRef = useRef(onSelect);
+  onSelectRef.current = onSelect;
 
   useEffect(() => {
     async function loadStoredSettings() {
       try {
-        const store = await load("settings.json", { autoSave: true, defaults: {} });
-        const savedItems = await store.get<{ value: string[] }>("subdirectories");
-        const savedSelected = await store.get<{ value: string }>("selected_subdirectory");
-        
-        if (savedItems && Array.isArray(savedItems.value)) {
-          setItems(savedItems.value);
-        }
-        if (savedSelected && typeof savedSelected.value === "string") {
-          setSelectedItem(savedSelected.value);
-          if (onSelect) onSelect(savedSelected.value);
-        }
+        const [savedItems, savedSelected] = await Promise.all([
+          getSubdirectories(),
+          getSelectedSubdir(),
+        ]);
+        setItems(savedItems);
+        setSelectedItem(savedSelected);
+        // Initial value sync to parent (no network side effect).
+        if (savedSelected) onSelectRef.current?.(savedSelected);
       } catch (e) {
         console.error("Failed to load subdirectories settings:", e);
       }
@@ -32,36 +33,43 @@ function Dropdown({ onSelect }: DropdownProps) {
     loadStoredSettings();
   }, []);
 
+  useEffect(() => {
+    if (isOpen) inputRef.current?.focus();
+  }, [isOpen]);
+
   const saveSettings = async (updatedItems: string[], updatedSelected: string) => {
+    setSaveError("");
     try {
-      const store = await load("settings.json", { autoSave: true, defaults: {} });
-      await store.set("subdirectories", { value: updatedItems });
-      await store.set("selected_subdirectory", { value: updatedSelected });
+      await Promise.all([
+        setSubdirectories(updatedItems),
+        setSelectedSubdir(updatedSelected),
+      ]);
     } catch (e) {
       console.error("Failed to save subdirectories settings:", e);
+      setSaveError("Could not save selection.");
     }
   };
 
   const handleSelectItem = (item: string) => {
     setSelectedItem(item);
-    if (onSelect) onSelect(item);
+    onSelect?.(item);
     setIsOpen(false);
     setSearchText("");
-    saveSettings(items, item);
+    void saveSettings(items, item);
   };
 
   const handleDeleteItem = (itemToDelete: string) => {
     const updatedItems = items.filter((item) => item !== itemToDelete);
     setItems(updatedItems);
-    
+
     let updatedSelected = selectedItem;
     if (selectedItem === itemToDelete) {
       updatedSelected = "";
       setSelectedItem("");
-      if (onSelect) onSelect("");
+      onSelect?.("");
     }
-    
-    saveSettings(updatedItems, updatedSelected);
+
+    void saveSettings(updatedItems, updatedSelected);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -75,10 +83,10 @@ function Dropdown({ onSelect }: DropdownProps) {
           setItems(updatedItems);
         }
         setSelectedItem(trimmed);
-        if (onSelect) onSelect(trimmed);
+        onSelect?.(trimmed);
         setSearchText("");
         setIsOpen(false);
-        saveSettings(updatedItems, trimmed);
+        void saveSettings(updatedItems, trimmed);
       }
     } else if (e.key === "Escape") {
       setIsOpen(false);
@@ -100,41 +108,44 @@ function Dropdown({ onSelect }: DropdownProps) {
 
   return (
     <div className="relative inline-block" onBlur={handleBlur}>
-      {/* Dropdown trigger */}
+      <label className="sr-only" htmlFor="scs-subdir-search">Sync subdirectory</label>
       {isOpen ? (
-        <input 
-          type="text" 
-          value={searchText} 
-          onChange={(e) => setSearchText(e.target.value)} 
+        <input
+          id="scs-subdir-search"
+          ref={inputRef}
+          type="text"
+          value={searchText}
+          onChange={(e) => setSearchText(e.target.value)}
           onKeyDown={handleKeyDown}
-          autoFocus
           placeholder={selectedItem || "select"}
+          aria-expanded={isOpen}
+          aria-haspopup="listbox"
           className="text-5xl text-gray-300 cursor-text bg-transparent border-none outline-none w-full"
         />
       ) : (
-        <button 
-          type="button" 
+        <button
+          type="button"
           onClick={() => {
             setIsOpen(true);
             setSearchText("");
           }}
+          aria-expanded={isOpen}
+          aria-haspopup="listbox"
+          aria-label={selectedItem ? `Sync subdirectory: ${selectedItem}. Activate to change.` : "Select sync subdirectory"}
           className="text-5xl text-gray-300 lowercase cursor-pointer"
         >
           {selectedItem || "select"}
         </button>
       )}
 
-      {/* Dropdown menu */}
       {isOpen && (
         <div className="absolute bottom-full left-0">
-          {/* List of names */}
-          <ul className="list-none p-0 m-0">
+          <ul className="list-none p-0 m-0" role="listbox" aria-label="Sync subdirectories">
             {filteredItems.map((item) => (
-              <li key={item} className="flex items-center">
-                <button 
-                  type="button" 
+              <li key={item} className="flex items-center" role="option" aria-selected={item === selectedItem}>
+                <button
+                  type="button"
                   onMouseDown={(e) => {
-                    // Prevent input blur before click is handled
                     e.preventDefault();
                   }}
                   onClick={() => handleSelectItem(item)}
@@ -144,24 +155,27 @@ function Dropdown({ onSelect }: DropdownProps) {
                 </button>
                 <button
                   type="button"
+                  aria-label={`Remove ${item}`}
                   onMouseDown={(e) => {
-                    // Prevent input blur before click is handled
                     e.preventDefault();
                   }}
                   onClick={() => handleDeleteItem(item)}
                   className="bg-transparent border-none py-[5px] px-[10px] cursor-pointer text-xs text-red-500 font-bold"
                 >
-                  x
+                  ×
                 </button>
               </li>
             ))}
             {filteredItems.length === 0 && (
               <li className="py-[5px] px-[10px] text-sm text-gray-400 italic">
-                {searchText.trim() ? `Press Enter to add "${searchText}"` : "Type to search/add... (1052427-MATH_1060_OLP_S26)? "}
+                {searchText.trim() ? `Press Enter to add "${searchText}"` : "Type to search or add a subdirectory…"}
               </li>
             )}
           </ul>
         </div>
+      )}
+      {saveError && (
+        <span className="text-xs text-red-400 ml-2" role="alert">{saveError}</span>
       )}
     </div>
   );

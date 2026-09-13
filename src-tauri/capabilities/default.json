@@ -13,12 +13,28 @@
         {
           "name": "rclone",
           "cmd": "rclone",
-          "args": true
+          "args": [
+            { "validator": "^(copy|sync|check|ls|lsd|lsf|obscure|--version)$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" }
+          ]
         },
         {
           "name": "binaries/rclone-sidecar",
           "sidecar": true,
-          "args": true
+          "args": [
+            { "validator": "^(copy|sync|check|ls|lsd|lsf|obscure|--version)$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" }
+          ]
         }
       ]
     },
@@ -28,12 +44,28 @@
         {
           "name": "rclone",
           "cmd": "rclone",
-          "args": true
+          "args": [
+            { "validator": "^(copy|sync|check|ls|lsd|lsf|obscure|--version)$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" }
+          ]
         },
         {
           "name": "binaries/rclone-sidecar",
           "sidecar": true,
-          "args": true
+          "args": [
+            { "validator": "^(copy|sync|check|ls|lsd|lsf|obscure|--version)$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" },
+            { "validator": "^[^\\x00-\\x1F]+$" }
+          ]
         }
       ]
     },
@@ -42,13 +74,11 @@
       "allow": [
         {
           "name": "rclone",
-          "cmd": "rclone",
-          "args": true
+          "cmd": "rclone"
         },
         {
           "name": "binaries/rclone-sidecar",
-          "sidecar": true,
-          "args": true
+          "sidecar": true
         }
       ]
     }

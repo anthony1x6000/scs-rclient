@@ -140,5 +140,8 @@ dist
 # Vite files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+# tsc -b emit for the composite node project (typecheck only, never imported)
+vite.config.js
+vite.config.d.ts
 .vite/
 /src-tauri/binaries

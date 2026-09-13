@@ -1,21 +1,24 @@
 import { Command } from "@tauri-apps/plugin-shell";
 
+export type RcloneStatus = "pending" | "packaged" | "system" | "missing";
+
+let status: RcloneStatus = "pending";
 let useSystemRclone = false;
 
 /**
  * Detects if the packaged sidecar binary is valid and executable.
- * If execution fails (e.g. due to dummy 0-byte file in local builds),
- * falls back to using the system-installed 'rclone' binary.
+ * Falls back to the system-installed 'rclone' binary (dev convenience only).
  */
-export async function detectRclone(): Promise<void> {
+export async function detectRclone(): Promise<RcloneStatus> {
   try {
     const testCmd = Command.sidecar("binaries/rclone-sidecar", ["--version"]);
     const res = await testCmd.execute();
     if (res.code === 0) {
       useSystemRclone = false;
+      status = "packaged";
       console.log("Using packaged rclone sidecar.");
       (window as any).__TEST_SIDECAR_STATUS__ = "packaged";
-      return;
+      return status;
     }
   } catch (e: any) {
     console.warn("Packaged rclone sidecar is invalid or unexecutable. Checking system rclone fallback.", e?.message || e);
@@ -27,9 +30,10 @@ export async function detectRclone(): Promise<void> {
     const res = await testSysCmd.execute();
     if (res.code === 0) {
       useSystemRclone = true;
-      console.log("Using system-installed rclone.");
+      status = "system";
+      console.log("Using system-installed rclone (dev fallback).");
       (window as any).__TEST_SIDECAR_STATUS__ = "system";
-      return;
+      return status;
     } else {
       console.error("System-level rclone returned a non-zero exit code:", res.code);
     }
@@ -38,31 +42,46 @@ export async function detectRclone(): Promise<void> {
   }
 
   useSystemRclone = false;
+  status = "missing";
+  (window as any).__TEST_SIDECAR_STATUS__ = "missing";
+  return status;
 }
 
-let detectPromise: Promise<void> | null = null;
+let detectPromise: Promise<RcloneStatus> | null = null;
 
 /**
  * Ensures that the rclone detection runs exactly once.
+ * Rejects when neither binary validates so callers can block runs.
  */
-export function ensureRcloneDetected(): Promise<void> {
+export function ensureRcloneDetected(): Promise<RcloneStatus> {
   if (!detectPromise) {
-    detectPromise = detectRclone().catch(console.error) as Promise<void>;
+    detectPromise = detectRclone().then((s) => {
+      if (s === "missing") {
+        throw new Error("No usable rclone binary found (sidecar and system both unavailable).");
+      }
+      return s;
+    }).catch((e) => {
+      // Reset so a later retry can re-attempt detection.
+      detectPromise = null;
+      status = "missing";
+      throw e;
+    });
   }
   return detectPromise;
 }
+
+export function getRcloneStatus(): RcloneStatus {
+  return status;
+}
+
 /**
  * Creates a Tauri Command for running rclone.
- * If the sidecar is invalid or we are in development, it executes the system-installed 'rclone'.
- * Otherwise, it executes the packaged sidecar 'binaries/rclone'.
  */
 export function createRcloneCommand(args: string[], env?: Record<string, string>): Command<string> {
   const options = env ? { env } : undefined;
   if (useSystemRclone) {
-    // Uses the system-installed rclone executable from the system's PATH
     return Command.create("rclone", args, options);
   } else {
-    // Uses the packaged sidecar binary (rclone-sidecar-x86_64-pc-windows-msvc.exe or rclone-sidecar-x86_64-unknown-linux-gnu)
     return Command.sidecar("binaries/rclone-sidecar", args, options);
   }
 }
@@ -80,45 +99,120 @@ export function normalizeUrl(url: string): string {
 
 /**
  * Normalizes a subdirectory path by trimming whitespace, leading slashes, and trailing slashes.
+ * Rejects `.` / `..` segments and backslash separators to prevent scope escape.
  */
 export function normalizeSubdir(subdir: string): string {
-  let clean = subdir.trim();
-  while (clean.startsWith("/")) {
-    clean = clean.slice(1);
+  const trimmed = subdir.trim().replace(/\\/g, "/");
+  const parts = trimmed.split("/").filter((p) => p.length > 0);
+  for (const part of parts) {
+    if (part === "." || part === "..") {
+      throw new Error(`Invalid subdirectory "${subdir}": "." and ".." segments are not allowed.`);
+    }
   }
-  while (clean.endsWith("/")) {
-    clean = clean.slice(0, -1);
+  return parts.join("/");
+}
+
+function validateBaseUrl(baseUrl: string): string {
+  const clean = normalizeUrl(baseUrl);
+  if (!/^https?:\/\//i.test(clean)) {
+    throw new Error(`Invalid base URL "${baseUrl}": must start with http:// or https://.`);
   }
   return clean;
 }
 
 /**
  * Resolves the remote WebDAV URL using normalized base and subdirectory parts.
+ * Path segments are percent-encoded; `..`/absolute inputs are rejected.
  */
 export function resolveRemoteUrl(baseUrl: string, subdir: string): string {
-  const cleanBase = normalizeUrl(baseUrl);
-  const cleanSub = normalizeSubdir(subdir);
-  return cleanSub ? `${cleanBase}/${cleanSub}` : cleanBase;
+  const cleanBase = validateBaseUrl(baseUrl);
+  const cleanSub = subdir ? normalizeSubdir(subdir) : "";
+  if (!cleanSub) return cleanBase;
+  const encoded = cleanSub.split("/").map((s) => encodeURIComponent(s)).join("/");
+  return `${cleanBase}/${encoded}`;
 }
 
 /**
  * Resolves the local path by joining the mount directory and subdirectory.
+ * Rejects `..` escape; verifies the result stays under the mount dir.
  */
 export function resolveLocalPath(mountDir: string, subdir: string): string {
-  const cleanMount = normalizeUrl(mountDir);
-  const cleanSub = normalizeSubdir(subdir);
-  return cleanSub ? `${cleanMount}/${cleanSub}` : cleanMount;
+  const cleanMount = mountDir.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  const cleanSub = subdir ? normalizeSubdir(subdir) : "";
+  if (!cleanSub) return mountDir.trim();
+  const joined = `${cleanMount}/${cleanSub}`;
+  const mountParts = cleanMount.split("/").filter(Boolean);
+  const joinedParts: string[] = [];
+  for (const part of joined.split("/").filter(Boolean)) {
+    if (part === "..") {
+      throw new Error(`Invalid subdirectory "${subdir}": escapes the mount directory.`);
+    }
+    if (part !== ".") joinedParts.push(part);
+  }
+  // Containment check: resolved parts must start with the mount prefix.
+  // (Leading "/" tolerated for absolute mounts on POSIX.)
+  const prefix = mountParts.join("/");
+  if (prefix && !joinedParts.join("/").startsWith(prefix)) {
+    throw new Error(`Invalid subdirectory "${subdir}": escapes the mount directory.`);
+  }
+  return joined;
 }
 
 /**
- * Obscures the password using rclone's built-in obscure command.
+ * Obscures the password using rclone's built-in obscure command WITHOUT
+ * placing the cleartext secret on the process command line.
+ *
+ * Spawns `rclone obscure` with no argv secret and pipes the password over
+ * stdin (written twice to satisfy obscure's enter/confirm prompts), then
+ * extracts the obscured token from stdout. Fail-closed: any failure throws
+ * so callers must abort instead of silently running unauthenticated.
  */
 export async function obscurePassword(password: string): Promise<string> {
   await ensureRcloneDetected();
-  const obscureCommand = createRcloneCommand(["obscure", password]);
-  const result = await obscureCommand.execute();
-  if (result.code !== 0) {
-    throw new Error(result.stderr || "Failed to obscure password");
-  }
-  return result.stdout.trim();
+  const cmd = createRcloneCommand(["obscure"]);
+
+  return await new Promise<string>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const fail = (e: unknown) => {
+      if (!settled) {
+        settled = true;
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    };
+
+    cmd.stdout.on("data", (data: string) => {
+      stdout += data;
+    });
+    cmd.stderr.on("data", (data: string) => {
+      stderr += data;
+    });
+    cmd.on("error", (err: string) => fail(new Error(err || "Failed to obscure password")));
+    cmd.on("close", (payload: { code: number | null }) => {
+      if (settled) return;
+      settled = true;
+      if (payload.code !== 0) {
+        reject(new Error(stderr.trim() || "Failed to obscure password"));
+        return;
+      }
+      // obscure prints prompts + the token; the token is the last non-empty line.
+      const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const token = lines[lines.length - 1] ?? "";
+      if (!token) {
+        reject(new Error("Failed to obscure password: empty output"));
+        return;
+      }
+      resolve(token);
+    });
+
+    cmd.spawn().then(async (child) => {
+      try {
+        // Enter + confirm prompts.
+        await child.write(`${password}\n${password}\n`);
+      } catch (e) {
+        fail(e);
+      }
+    }).catch(fail);
+  });
 }

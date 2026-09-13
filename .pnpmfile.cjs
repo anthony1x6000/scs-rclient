@@ -1,22 +1,23 @@
 module.exports = {
   hooks: {
     readPackage(pkg) {
-      if (pkg.dependencies) {
-        if (pkg.dependencies.esbuild) {
-          pkg.dependencies.esbuild = "^0.28.1";
+      for (const kind of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+        const deps = pkg[kind];
+        if (!deps) continue;
+        if (deps.esbuild) {
+          deps.esbuild = "^0.28.1";
         }
-        if (pkg.dependencies.postcss) {
-          pkg.dependencies.postcss = "^8.5.26";
+        if (deps.postcss) {
+          deps.postcss = "^8.5.26";
         }
-        if (pkg.dependencies.nanoid) {
-          pkg.dependencies.nanoid = "^3.3.18";
+        if (deps.nanoid) {
+          deps.nanoid = "^3.3.18";
         }
-        if (pkg.dependencies.browserslist) {
-          pkg.dependencies.browserslist = "^4.28.7";
+        if (deps.browserslist) {
+          deps.browserslist = "^4.28.7";
         }
       }
       return pkg;
     },
   },
 };
-
