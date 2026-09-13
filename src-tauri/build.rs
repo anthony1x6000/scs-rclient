@@ -16,13 +16,21 @@ fn main() {
 
     // Release/CI builds must ship the real verified rclone binary; a placeholder
     // would produce an installer with a broken rclone and no diagnostic.
+    // NOTE: each CI platform only stages its own sidecar (Linux downloads the
+    // linux binary, Windows the .exe), so only the sidecar matching this build's
+    // TARGET triple is required — the other keeps the dev placeholder.
+    let target = std::env::var("TARGET").unwrap_or_default();
     let require_real = std::env::var("TAURI_BUNDLE").is_ok()
         || std::env::var("PROFILE").as_deref() == Ok("release");
 
-    for target in targets {
-        let path = binaries_dir.join(target);
+    for target_name in targets {
+        let path = binaries_dir.join(target_name);
+        let is_for_this_target = (target_name.contains("windows") && target.contains("windows"))
+            || (target_name.contains("unknown-linux-gnu") && target.contains("unknown-linux-gnu"))
+            // Unknown/other targets (e.g. local `cargo check` without TARGET): don't enforce.
+            || target.is_empty();
         if !path.exists() {
-            if require_real {
+            if require_real && is_for_this_target {
                 panic!(
                     "missing real sidecar binary {} for release/bundle build; refusing to ship a placeholder",
                     path.display()
@@ -37,7 +45,7 @@ fn main() {
                 path.display()
             );
             File::create(&path).expect("failed to create dummy sidecar binary");
-        } else if path.metadata().map(|m| m.len() == 0).unwrap_or(false) && require_real {
+        } else if path.metadata().map(|m| m.len() == 0).unwrap_or(false) && require_real && is_for_this_target {
             panic!(
                 "placeholder (0-byte) sidecar binary {} present in release/bundle build; refusing to ship",
                 path.display()
