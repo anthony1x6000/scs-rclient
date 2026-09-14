@@ -36,5 +36,5 @@ A composite GitHub Action that unzips verified rclone binary releases and stages
 - name: Setup Rclone Sidecar
   uses: ./.github/actions/setup-rclone-sidecar
   with:
-    version: ${{ env.RCLONE_VERSION }}
+    version: ${{ env.TARGET_RCLONE_VERSION }}
 ```

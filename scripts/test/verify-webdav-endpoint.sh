@@ -3,6 +3,9 @@
 # Usage: verify-webdav-endpoint.sh <path-to-rclone>
 set -euo pipefail
 
+# Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
+unset RCLONE_VERSION
+
 RCLONE_BIN="${1:-}"
 if [[ -z "$RCLONE_BIN" ]]; then
   echo "::error::Usage: $0 <path-to-rclone>" >&2
