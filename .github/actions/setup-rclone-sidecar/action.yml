@@ -1,0 +1,74 @@
+name: 'Setup Rclone Sidecar'
+description: 'Extracts and stages the verified rclone binary as a Tauri sidecar executable'
+author: 'Anthony Stevens'
+branding:
+  icon: 'download-cloud'
+  color: 'purple'
+
+inputs:
+  version:
+    description: 'Rclone version string (e.g. 1.74.3)'
+    required: true
+  archive-dir:
+    description: 'Directory containing the verified downloaded archives'
+    required: false
+    default: 'verified-binaries'
+  target-dir:
+    description: 'Destination directory for the extracted sidecar'
+    required: false
+    default: 'src-tauri/binaries'
+  target-os:
+    description: 'Target operating system (auto, linux, windows)'
+    required: false
+    default: 'auto'
+
+outputs:
+  sidecar-path:
+    description: 'Path to the staged sidecar executable'
+    value: ${{ steps.extract-sidecar.outputs.sidecar-path }}
+  sidecar-name:
+    description: 'Filename of the staged sidecar executable'
+    value: ${{ steps.extract-sidecar.outputs.sidecar-name }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Extract and Stage Sidecar
+      id: extract-sidecar
+      shell: bash
+      run: |
+        TARGET_OS="${{ inputs.target-os }}"
+        if [ "$TARGET_OS" = "auto" ]; then
+          case "$RUNNER_OS" in
+            Linux) TARGET_OS="linux" ;;
+            Windows) TARGET_OS="windows" ;;
+            macOS) TARGET_OS="macos" ;;
+            *) TARGET_OS="linux" ;;
+          esac
+        fi
+
+        TARGET_DIR="${{ inputs.target-dir }}"
+        ARCHIVE_DIR="${{ inputs.archive-dir }}"
+        VERSION="${{ inputs.version }}"
+
+        mkdir -p "$TARGET_DIR"
+
+        if [ "$TARGET_OS" = "linux" ]; then
+          ARCHIVE="$ARCHIVE_DIR/rclone-v${VERSION}-linux-amd64.zip"
+          unzip -q -o "$ARCHIVE"
+          SIDECAR_NAME="rclone-sidecar-x86_64-unknown-linux-gnu"
+          cp "rclone-v${VERSION}-linux-amd64/rclone" "$TARGET_DIR/$SIDECAR_NAME"
+          chmod +x "$TARGET_DIR/$SIDECAR_NAME"
+          echo "sidecar-name=$SIDECAR_NAME" >> "$GITHUB_OUTPUT"
+          echo "sidecar-path=$TARGET_DIR/$SIDECAR_NAME" >> "$GITHUB_OUTPUT"
+        elif [ "$TARGET_OS" = "windows" ]; then
+          ARCHIVE="$ARCHIVE_DIR/rclone-v${VERSION}-windows-amd64.zip"
+          unzip -q -o "$ARCHIVE"
+          SIDECAR_NAME="rclone-sidecar-x86_64-pc-windows-msvc.exe"
+          cp "rclone-v${VERSION}-windows-amd64/rclone.exe" "$TARGET_DIR/$SIDECAR_NAME"
+          echo "sidecar-name=$SIDECAR_NAME" >> "$GITHUB_OUTPUT"
+          echo "sidecar-path=$TARGET_DIR/$SIDECAR_NAME" >> "$GITHUB_OUTPUT"
+        else
+          echo "Unsupported target OS: $TARGET_OS" >&2
+          exit 1
+        fi
