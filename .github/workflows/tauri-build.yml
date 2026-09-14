@@ -12,8 +12,8 @@ on:
       - published
 
 env:
-  RCLONE_VERSION: 1.74.3
-  RCLONE_SIGNING_KEY: FBF737ECE9F8AB18604BD2AC93935E02FF3B54FA
+  TARGET_RCLONE_VERSION: 1.74.3
+  TARGET_RCLONE_SIGNING_KEY: FBF737ECE9F8AB18604BD2AC93935E02FF3B54FA
 
 jobs:
   verify-rclone:
@@ -33,13 +33,13 @@ jobs:
 
       - name: Confirm Nick Craig-Wood's Signing Key
         run: |
-          gpg --list-keys ${{ env.RCLONE_SIGNING_KEY }}
+          gpg --list-keys ${{ env.TARGET_RCLONE_SIGNING_KEY }}
 
-      - name: Download Rclone v${{ env.RCLONE_VERSION }} and Checksums
+      - name: Download Rclone v${{ env.TARGET_RCLONE_VERSION }} and Checksums
         run: |
-          curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/SHA256SUMS
-          curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip
-          curl -O -L https://downloads.rclone.org/v${{ env.RCLONE_VERSION }}/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip
+          curl -O -L https://downloads.rclone.org/v${{ env.TARGET_RCLONE_VERSION }}/SHA256SUMS
+          curl -O -L https://downloads.rclone.org/v${{ env.TARGET_RCLONE_VERSION }}/rclone-v${{ env.TARGET_RCLONE_VERSION }}-linux-amd64.zip
+          curl -O -L https://downloads.rclone.org/v${{ env.TARGET_RCLONE_VERSION }}/rclone-v${{ env.TARGET_RCLONE_VERSION }}-windows-amd64.zip
 
       - name: Verify Checksums File Signature
         run: |
@@ -52,8 +52,8 @@ jobs:
       - name: Prepare Verified Binaries
         run: |
           mkdir verified-binaries
-          mv rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip verified-binaries/
-          mv rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip verified-binaries/
+          mv rclone-v${{ env.TARGET_RCLONE_VERSION }}-linux-amd64.zip verified-binaries/
+          mv rclone-v${{ env.TARGET_RCLONE_VERSION }}-windows-amd64.zip verified-binaries/
 
       - name: Upload Verified Binaries Artifact
         uses: actions/upload-artifact@v7
@@ -85,12 +85,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-env
         with:
+          install-rust: 'false'
           node-version: 22
 
       - name: Install dependencies
@@ -144,12 +142,10 @@ jobs:
           name: verified-rclone
           path: verified-binaries
 
-      - name: Extract Linux Sidecar
-        run: |
-          unzip verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-linux-amd64.zip
-          mkdir -p src-tauri/binaries
-          cp rclone-v${{ env.RCLONE_VERSION }}-linux-amd64/rclone src-tauri/binaries/rclone-sidecar-x86_64-unknown-linux-gnu
-          chmod +x src-tauri/binaries/rclone-sidecar-x86_64-unknown-linux-gnu
+      - name: Setup Rclone Sidecar
+        uses: ./.github/actions/setup-rclone-sidecar
+        with:
+          version: ${{ env.TARGET_RCLONE_VERSION }}
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -202,12 +198,10 @@ jobs:
           name: verified-rclone
           path: verified-binaries
 
-      - name: Extract Windows Sidecar
-        shell: pwsh
-        run: |
-          Expand-Archive -Path verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip -DestinationPath .
-          New-Item -ItemType Directory -Force -Path src-tauri/binaries
-          Copy-Item -Path rclone-v${{ env.RCLONE_VERSION }}-windows-amd64/rclone.exe -Destination src-tauri/binaries/rclone-sidecar-x86_64-pc-windows-msvc.exe
+      - name: Setup Rclone Sidecar
+        uses: ./.github/actions/setup-rclone-sidecar
+        with:
+          version: ${{ env.TARGET_RCLONE_VERSION }}
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -261,12 +255,10 @@ jobs:
           name: verified-rclone
           path: verified-binaries
 
-      - name: Extract Windows Sidecar
-        shell: pwsh
-        run: |
-          Expand-Archive -Path verified-binaries/rclone-v${{ env.RCLONE_VERSION }}-windows-amd64.zip -DestinationPath .
-          New-Item -ItemType Directory -Force -Path src-tauri/binaries
-          Copy-Item -Path rclone-v${{ env.RCLONE_VERSION }}-windows-amd64/rclone.exe -Destination src-tauri/binaries/rclone-sidecar-x86_64-pc-windows-msvc.exe
+      - name: Setup Rclone Sidecar
+        uses: ./.github/actions/setup-rclone-sidecar
+        with:
+          version: ${{ env.TARGET_RCLONE_VERSION }}
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -507,9 +499,9 @@ jobs:
       - name: Stage verified sidecar next to portable EXEs
         shell: pwsh
         run: |
-          Expand-Archive -Path verified-binaries/rclone-v$env:RCLONE_VERSION-windows-amd64.zip -DestinationPath .
-          Copy-Item -Path rclone-v$env:RCLONE_VERSION-windows-amd64/rclone.exe -Destination dist-win/rclone-sidecar-x86_64-pc-windows-msvc.exe
-          Copy-Item -Path rclone-v$env:RCLONE_VERSION-windows-amd64/rclone.exe -Destination dist-win-noicon/rclone-sidecar-x86_64-pc-windows-msvc.exe
+          Expand-Archive -Path verified-binaries/rclone-v${{ env.TARGET_RCLONE_VERSION }}-windows-amd64.zip -DestinationPath .
+          Copy-Item -Path rclone-v${{ env.TARGET_RCLONE_VERSION }}-windows-amd64/rclone.exe -Destination dist-win/rclone-sidecar-x86_64-pc-windows-msvc.exe
+          Copy-Item -Path rclone-v${{ env.TARGET_RCLONE_VERSION }}-windows-amd64/rclone.exe -Destination dist-win-noicon/rclone-sidecar-x86_64-pc-windows-msvc.exe
 
       - name: Run Windows E2E tests
         shell: pwsh
