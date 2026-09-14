@@ -34,8 +34,16 @@ flatpak info online.anthonyis.scs-rclient
 echo "=== Verifying Application Permissions ==="
 flatpak info --show-permissions online.anthonyis.scs-rclient
 
-echo "=== Best-effort launch smoke test (non-fatal: no display in CI) ==="
-if timeout 20 flatpak run online.anthonyis.scs-rclient >/tmp/scs-launch.log 2>&1; then
+echo "=== Best-effort launch smoke test (non-fatal if no display in CI) ==="
+LAUNCH_CMD="flatpak run online.anthonyis.scs-rclient"
+if command -v xvfb-run >/dev/null 2>&1; then
+  echo "xvfb available: launching under a virtual display."
+  LAUNCH_CMD="xvfb-run -a flatpak run online.anthonyis.scs-rclient"
+else
+  echo "::notice::xvfb-run not available; running headless (GTK init failure is expected)."
+fi
+# shellcheck disable=SC2086
+if timeout 20 $LAUNCH_CMD >/tmp/scs-launch.log 2>&1; then
   echo "App exited on its own within the timeout window."
 else
   code=$?
