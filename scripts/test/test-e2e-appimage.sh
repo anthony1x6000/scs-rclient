@@ -3,6 +3,9 @@
 # extract -> sidecar WebDAV test -> launch smoke (extract-and-run under xvfb)
 set -euo pipefail
 
+# Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
+unset RCLONE_VERSION
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPIMAGE_FILE="${APPIMAGE_FILE:-dist-linux/scs-rclient-linux.AppImage}"
 

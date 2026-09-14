@@ -9,6 +9,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
+Remove-Item env:RCLONE_VERSION -ErrorAction SilentlyContinue
 
 function Assert-File($Path, $Label) {
   if (-not (Test-Path $Path)) { Write-Error "::error::$Label not found: $Path"; exit 1 }
