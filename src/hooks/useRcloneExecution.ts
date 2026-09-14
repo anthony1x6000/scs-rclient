@@ -85,6 +85,7 @@ export function buildActionArgs(
   }
   args.push("-v");
   args.push(`--webdav-url=${remoteUrl}`);
+  args.push("--webdav-vendor=other");
   if (username) {
     args.push(`--webdav-user=${username}`);
   }

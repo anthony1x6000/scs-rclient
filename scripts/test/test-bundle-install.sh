@@ -15,6 +15,9 @@ flatpak info online.anthonyis.scs-rclient
 echo "=== Verifying Application Permissions ==="
 flatpak info --show-permissions online.anthonyis.scs-rclient
 
+echo "=== Verifying sandboxed rclone sidecar inside Flatpak ==="
+flatpak run --command=rclone online.anthonyis.scs-rclient lsf :webdav: --webdav-url "https://a.ocv.me/pub/demo/docs/" --webdav-vendor other
+
 echo "=== Verifying Clean Uninstallation ==="
 flatpak uninstall -y --user --noninteractive online.anthonyis.scs-rclient
 
