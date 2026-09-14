@@ -52,13 +52,14 @@ try {
 if ($LASTEXITCODE -ne 0) { Write-Error "::error::rclone lsf exited with code $LASTEXITCODE"; exit 1 }
 Write-Host $LsfOutput
 
-foreach ($expected in $ExpectedFiles) {
-  if ($LsfOutput -notmatch [regex]::Escape($expected)) {
-    Write-Error "::error::Expected file '$expected' not found in rclone lsf output!"
-    exit 1
+  $LsfText = ($LsfOutput -join "`n")
+  foreach ($expected in $ExpectedFiles) {
+    if (-not ($LsfOutput -contains $expected) -and ($LsfText -notmatch [regex]::Escape($expected))) {
+      Write-Error "::error::Expected file '$expected' not found in rclone lsf output!"
+      exit 1
+    }
+    Write-Host "Found expected file: $expected"
   }
-  Write-Host "Found expected file: $expected"
-}
 
 Write-Host "=== Round-trip: copying README.md ==="
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("webdav-test-" + [System.Guid]::NewGuid().ToString("N"))
