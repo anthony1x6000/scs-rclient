@@ -9,47 +9,8 @@ function CredentialsForm() {
   const [password, setPassword] = useState<string>("");
   const [status, setStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [statusText, setStatusText] = useState<string>("");
-  const [hasSavedCredentials, setHasSavedCredentials] = useState<boolean>(false);
+  const lastSavedUserRef = useRef<string>("");
   const lookupSeq = useRef(0);
-
-  // Debounced keyring lookup: only the latest username's result wins.
-  useEffect(() => {
-    const name = username.trim();
-    if (!name) {
-      setHasSavedCredentials(false);
-      return;
-    }
-    const seq = ++lookupSeq.current;
-    const timer = setTimeout(async () => {
-      try {
-        const savedPass = await invoke<string>("get_credentials", { username: name });
-        if (lookupSeq.current !== seq) return;
-        if (savedPass) {
-          setPassword(savedPass);
-          setHasSavedCredentials(true);
-        } else {
-          setHasSavedCredentials(false);
-        }
-      } catch {
-        if (lookupSeq.current !== seq) return;
-        setHasSavedCredentials(false);
-      }
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [username]);
-
-  const handleUsernameChange = (val: string) => {
-    setUsername(val);
-    setStatus('idle');
-    setStatusText("");
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      handleLogin();
-    }
-  };
 
   const validateCredentials = async (userVal: string, passVal: string) => {
     setStatus('testing');
@@ -63,6 +24,7 @@ function CredentialsForm() {
       ]);
 
       const fullTestUrl = resolveRemoteUrl(baseUrl, selectedSubdir);
+      console.log("Testing credentials with rclone...", fullTestUrl);
 
       const obscuredPassword = passVal ? await obscurePassword(passVal) : "";
 
@@ -79,49 +41,120 @@ function CredentialsForm() {
       const command = createRcloneCommand(args, env);
       const result = await command.execute();
       if (result.code === 0) {
+        console.log("Rclone authentication test succeeded! Output:\n", result.stdout);
         setStatus('success');
         setStatusText("Credentials valid.");
       } else {
+        console.error(`Rclone authentication test failed with code ${result.code}:\n`, result.stderr);
         setStatus('error');
         setStatusText(`Authentication test failed (exit ${result.code}).`);
       }
     } catch (e) {
+      console.error("Error during validation:", e);
       setStatus('error');
       setStatusText(`Error during validation: ${e}`);
     }
   };
 
-  const handleLogin = async () => {
-    const user = username.trim();
-    if (!user) {
-      setStatus('error');
-      setStatusText("Username is required.");
-      return;
-    }
+  const handleSaveAndValidate = async (userVal: string, passVal: string) => {
+    const user = userVal.trim();
+    const pass = passVal.trim();
+    if (!user || !pass) return;
     try {
       await setSavedUsername(user);
-      await invoke("save_credentials", { username: user, secret: password });
-      setHasSavedCredentials(true);
-      // Explicit user action only — no auto-validation elsewhere.
-      await validateCredentials(user, password);
+      await invoke("save_credentials", { username: user, secret: pass });
+      lastSavedUserRef.current = user;
+      await validateCredentials(user, pass);
     } catch (e) {
+      console.error("Error saving credentials:", e);
       setStatus('error');
-      setStatusText(`Error during credentials save/test: ${e}`);
+      setStatusText(`Error saving credentials: ${e}`);
     }
   };
 
-  const handleForget = async () => {
-    const user = username.trim();
-    try {
-      if (user) {
+  const forgetCredentials = async (userToForget?: string) => {
+    const user = userToForget || username.trim() || lastSavedUserRef.current;
+    if (user) {
+      try {
         await invoke("delete_credentials", { username: user });
+      } catch (e) {
+        console.error("Error deleting credentials:", e);
       }
-    } catch (e) {
-      setStatusText(`Could not delete stored credentials: ${e}`);
     }
-    setPassword("");
-    setHasSavedCredentials(false);
+    if (!username.trim() || user === lastSavedUserRef.current) {
+      try {
+        await setSavedUsername("");
+      } catch (e) {
+        console.error("Error clearing saved username:", e);
+      }
+      lastSavedUserRef.current = "";
+    }
     setStatus('idle');
+    setStatusText("");
+  };
+
+  const handleUsernameChange = (val: string) => {
+    setUsername(val);
+    setStatus('idle');
+    setStatusText("");
+
+    if (!val.trim()) {
+      // User removed username -> forget!
+      void forgetCredentials(lastSavedUserRef.current);
+      setPassword("");
+      return;
+    }
+
+    // Debounced keyring lookup for the new username
+    const trimmed = val.trim();
+    const seq = ++lookupSeq.current;
+    setTimeout(async () => {
+      if (lookupSeq.current !== seq) return;
+      try {
+        const savedPass = await invoke<string>("get_credentials", { username: trimmed });
+        if (lookupSeq.current !== seq) return;
+        if (savedPass) {
+          setPassword(savedPass);
+          lastSavedUserRef.current = trimmed;
+          await setSavedUsername(trimmed);
+          void validateCredentials(trimmed, savedPass);
+        }
+      } catch {
+        // No saved credentials for this username
+      }
+    }, 300);
+  };
+
+  const handlePasswordChange = (val: string) => {
+    setPassword(val);
+    setStatus('idle');
+    setStatusText("");
+
+    if (!val.trim()) {
+      // User removed password -> forget!
+      void forgetCredentials(username.trim() || lastSavedUserRef.current);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const user = username.trim();
+      const pass = password.trim();
+      if (user && pass) {
+        void handleSaveAndValidate(user, pass);
+      }
+    }
+  };
+
+  const handleBlur = () => {
+    const user = username.trim();
+    const pass = password.trim();
+    if (user && pass) {
+      void handleSaveAndValidate(user, pass);
+    } else if (!user || !pass) {
+      void forgetCredentials();
+    }
   };
 
   useEffect(() => {
@@ -130,18 +163,19 @@ function CredentialsForm() {
         const userVal = await getSavedUsername();
         if (!userVal) return;
         setUsername(userVal);
+        lastSavedUserRef.current = userVal;
         try {
           const savedPass = await invoke<string>("get_credentials", { username: userVal });
           if (savedPass) {
             setPassword(savedPass);
-            setHasSavedCredentials(true);
-            // Do NOT auto-validate on launch: user clicks Test/Login explicitly.
+            // Automatically test login on mount
+            void validateCredentials(userVal, savedPass);
           }
         } catch {
-          // No saved secret — user enters it manually.
+          // No saved secret
         }
       } catch (e) {
-        setStatusText(`Failed to load saved credentials: ${e}`);
+        console.error("Failed to load saved credentials:", e);
       }
     }
     loadSaved();
@@ -156,6 +190,7 @@ function CredentialsForm() {
         value={username}
         onChange={(e) => handleUsernameChange(e.target.value)}
         onKeyDown={handleKeyDown}
+        onBlur={handleBlur}
         placeholder="Username..."
         status={status}
         className="w-[20%]"
@@ -166,34 +201,14 @@ function CredentialsForm() {
         id="scs-password"
         type="password"
         value={password}
-        onChange={(e) => {
-          setPassword(e.target.value);
-          setStatus('idle');
-          setStatusText("");
-        }}
+        onChange={(e) => handlePasswordChange(e.target.value)}
         onKeyDown={handleKeyDown}
+        onBlur={handleBlur}
         placeholder="Password..."
         status={status}
         className="w-[20%]"
         autoComplete="current-password"
       />
-      <button
-        type="button"
-        onClick={handleLogin}
-        disabled={status === 'testing' || !username.trim()}
-        className="ml-2 px-3 py-1 text-xs border border-white/20 hover:border-white/40 bg-transparent text-white cursor-pointer disabled:opacity-40"
-      >
-        Test / Login
-      </button>
-      {hasSavedCredentials && (
-        <button
-          type="button"
-          onClick={handleForget}
-          className="ml-2 px-3 py-1 text-xs border border-white/20 hover:border-white/40 bg-transparent text-white cursor-pointer"
-        >
-          Forget
-        </button>
-      )}
       <span className="sr-only" role="status" aria-live="polite">{statusText}</span>
     </>
   );

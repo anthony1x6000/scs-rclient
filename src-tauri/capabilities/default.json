@@ -13,28 +13,12 @@
         {
           "name": "rclone",
           "cmd": "rclone",
-          "args": [
-            { "validator": "^(copy|sync|check|ls|lsd|lsf|obscure|--version)$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" }
-          ]
+          "args": true
         },
         {
           "name": "binaries/rclone-sidecar",
           "sidecar": true,
-          "args": [
-            { "validator": "^(copy|sync|check|ls|lsd|lsf|obscure|--version)$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" }
-          ]
+          "args": true
         }
       ]
     },
@@ -44,28 +28,12 @@
         {
           "name": "rclone",
           "cmd": "rclone",
-          "args": [
-            { "validator": "^(copy|sync|check|ls|lsd|lsf|obscure|--version)$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" }
-          ]
+          "args": true
         },
         {
           "name": "binaries/rclone-sidecar",
           "sidecar": true,
-          "args": [
-            { "validator": "^(copy|sync|check|ls|lsd|lsf|obscure|--version)$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" },
-            { "validator": "^[^\\x00-\\x1F]+$" }
-          ]
+          "args": true
         }
       ]
     },

@@ -159,60 +159,14 @@ export function resolveLocalPath(mountDir: string, subdir: string): string {
 }
 
 /**
- * Obscures the password using rclone's built-in obscure command WITHOUT
- * placing the cleartext secret on the process command line.
- *
- * Spawns `rclone obscure` with no argv secret and pipes the password over
- * stdin (written twice to satisfy obscure's enter/confirm prompts), then
- * extracts the obscured token from stdout. Fail-closed: any failure throws
- * so callers must abort instead of silently running unauthenticated.
+ * Obscures the password using rclone's built-in obscure command.
  */
 export async function obscurePassword(password: string): Promise<string> {
   await ensureRcloneDetected();
-  const cmd = createRcloneCommand(["obscure"]);
-
-  return await new Promise<string>((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const fail = (e: unknown) => {
-      if (!settled) {
-        settled = true;
-        reject(e instanceof Error ? e : new Error(String(e)));
-      }
-    };
-
-    cmd.stdout.on("data", (data: string) => {
-      stdout += data;
-    });
-    cmd.stderr.on("data", (data: string) => {
-      stderr += data;
-    });
-    cmd.on("error", (err: string) => fail(new Error(err || "Failed to obscure password")));
-    cmd.on("close", (payload: { code: number | null }) => {
-      if (settled) return;
-      settled = true;
-      if (payload.code !== 0) {
-        reject(new Error(stderr.trim() || "Failed to obscure password"));
-        return;
-      }
-      // obscure prints prompts + the token; the token is the last non-empty line.
-      const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-      const token = lines[lines.length - 1] ?? "";
-      if (!token) {
-        reject(new Error("Failed to obscure password: empty output"));
-        return;
-      }
-      resolve(token);
-    });
-
-    cmd.spawn().then(async (child) => {
-      try {
-        // Enter + confirm prompts.
-        await child.write(`${password}\n${password}\n`);
-      } catch (e) {
-        fail(e);
-      }
-    }).catch(fail);
-  });
+  const obscureCommand = createRcloneCommand(["obscure", password]);
+  const result = await obscureCommand.execute();
+  if (result.code !== 0) {
+    throw new Error(result.stderr || "Failed to obscure password");
+  }
+  return result.stdout.trim();
 }
