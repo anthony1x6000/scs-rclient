@@ -5,6 +5,7 @@ on:
     branches:
       - '**'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
   release:
     types:
@@ -98,8 +99,9 @@ jobs:
       - name: Audit NPM Dependencies
         run: pnpm audit
 
-  test-bundle-install:
-    name: Test Standalone Bundle Install
+  test-e2e-flatpak:
+    name: Test E2E Flatpak (Bundle & Sandboxed Sidecar)
+    # Runs on every PR/push — no `if:` gate by design.
     runs-on: ubuntu-latest
     needs: flatpak
     container:
@@ -406,6 +408,113 @@ jobs:
       - name: Test OSTree Repository Install & Update
         run: bash scripts/test/test-repo-install.sh
 
+  test-e2e-linux:
+    name: Test E2E Linux (deb, AppImage, binary)
+    # Runs on every PR/push — no `if:` gate by design.
+    runs-on: ubuntu-latest
+    needs: build-linux
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install E2E test dependencies
+        run: |
+          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb libfuse2
+
+      - name: Download Linux build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-linux
+          path: .
+
+      - name: Make test scripts executable
+        run: chmod +x scripts/test/*.sh src-tauri/target/release/scs-rclient src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu
+
+      - name: E2E .deb install test
+        run: bash scripts/test/test-e2e-deb.sh
+
+      - name: E2E AppImage test
+        run: bash scripts/test/test-e2e-appimage.sh
+
+      - name: E2E standalone binary test
+        run: bash scripts/test/test-e2e-linux-binary.sh
+
+  test-e2e-rpm:
+    name: Test E2E RPM (Fedora dnf install)
+    # Runs on every PR/push — no `if:` gate by design.
+    runs-on: ubuntu-latest
+    needs: build-linux
+    container:
+      image: fedora:latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download Linux build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-linux
+          path: .
+
+      - name: Install RPM via dnf
+        run: dnf install -y ./dist-linux/scs-rclient-linux.rpm
+
+      - name: Verify package metadata
+        run: |
+          rpm -q scs-rclient
+          rpm -ql scs-rclient
+
+      - name: Test installed sidecar against live WebDAV
+        run: |
+          chmod +x scripts/test/*.sh
+          SIDECAR="$(find /usr/bin /usr/lib /opt -name 'rclone-sidecar*' -type f 2>/dev/null | head -n 1)"
+          echo "Found sidecar: $SIDECAR"
+          bash scripts/test/verify-webdav-endpoint.sh "$SIDECAR"
+
+      - name: Remove RPM package
+        run: |
+          dnf remove -y scs-rclient
+          test ! -e /usr/bin/scs-rclient
+
+  test-e2e-windows:
+    name: Test E2E Windows (NSIS, portable)
+    # Runs on every PR/push — no `if:` gate by design.
+    runs-on: windows-latest
+    needs: [build-windows, build-no-icon-win, verify-rclone]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-windows
+          path: dist-win
+
+      - name: Download Windows No-Icon artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tauri-build-windows-no-icon
+          path: dist-win-noicon
+
+      - name: Download verified rclone binaries
+        uses: actions/download-artifact@v7
+        with:
+          name: verified-rclone
+          path: verified-binaries
+
+      - name: Stage verified sidecar next to portable EXEs
+        shell: pwsh
+        run: |
+          Expand-Archive -Path verified-binaries/rclone-v$env:RCLONE_VERSION-windows-amd64.zip -DestinationPath .
+          Copy-Item -Path rclone-v$env:RCLONE_VERSION-windows-amd64/rclone.exe -Destination dist-win/rclone-sidecar-x86_64-pc-windows-msvc.exe
+          Copy-Item -Path rclone-v$env:RCLONE_VERSION-windows-amd64/rclone.exe -Destination dist-win-noicon/rclone-sidecar-x86_64-pc-windows-msvc.exe
+
+      - name: Run Windows E2E tests
+        shell: pwsh
+        run: pwsh scripts/test/test-e2e-windows.ps1
+
   deploy-gh-pages:
     name: Deploy Flatpak Repository to gh-pages
     runs-on: ubuntu-latest
@@ -440,7 +549,7 @@ jobs:
   publish-release:
     name: Publish Release Assets
     if: github.event_name == 'release'
-    needs: [build-linux, build-windows, build-no-icon-win, flatpak]
+    needs: [build-linux, build-windows, build-no-icon-win, flatpak, test-e2e-linux, test-e2e-rpm, test-e2e-flatpak, test-e2e-windows, test-repo-install]
     runs-on: ubuntu-slim
     permissions:
       contents: write
