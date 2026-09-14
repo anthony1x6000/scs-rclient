@@ -2,6 +2,9 @@
 # E2E test for the standalone Linux release binary + sidecar pair.
 set -euo pipefail
 
+# Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
+unset RCLONE_VERSION
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_BIN="${APP_BIN:-src-tauri/target/release/scs-rclient}"
 SIDECAR="${SIDECAR:-src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu}"

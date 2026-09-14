@@ -1,21 +1,120 @@
 name: 'Setup Build Environment'
-description: 'Sets up pnpm, Node.js, and Rust toolchains with caching'
+description: 'Sets up pnpm, Node.js, and Rust toolchains with intelligent caching for Tauri applications'
+author: 'Anthony Stevens'
+branding:
+  icon: 'layers'
+  color: 'blue'
+
+inputs:
+  node-version:
+    description: 'Version spec of Node.js to use'
+    required: false
+    default: 'lts/*'
+  node-cache:
+    description: 'Package manager cache for Node.js (e.g., pnpm, npm, or empty to disable)'
+    required: false
+    default: 'pnpm'
+  pnpm-version:
+    description: 'Version of pnpm to install (leave empty to use package.json packageManager)'
+    required: false
+    default: ''
+  install-rust:
+    description: 'Whether to install the Rust toolchain and cache'
+    required: false
+    default: 'true'
+  rust-toolchain:
+    description: 'Rust toolchain channel or version to install'
+    required: false
+    default: 'stable'
+  rust-targets:
+    description: 'Comma-separated list of target triples to install'
+    required: false
+    default: ''
+  rust-components:
+    description: 'Comma-separated list of components to install (e.g., clippy, rustfmt)'
+    required: false
+    default: ''
+  rust-cache:
+    description: 'Whether to enable Rust build artifact caching'
+    required: false
+    default: 'true'
+  rust-cache-workspaces:
+    description: 'Paths to Cargo workspaces and their target directories'
+    required: false
+    default: './src-tauri -> target'
+  rust-cache-key:
+    description: 'Additional cache key for Rust cache differentiation'
+    required: false
+    default: ''
+  rust-cache-save:
+    description: 'Whether to save the Rust cache'
+    required: false
+    default: 'true'
+  install-dependencies:
+    description: 'Whether to run pnpm install --frozen-lockfile'
+    required: false
+    default: 'false'
+
+outputs:
+  node-version:
+    description: 'Resolved Node.js version'
+    value: ${{ steps.env-outputs.outputs.node-version }}
+  pnpm-version:
+    description: 'Resolved pnpm version'
+    value: ${{ steps.env-outputs.outputs.pnpm-version }}
+  rustc-version:
+    description: 'Installed rustc version'
+    value: ${{ steps.env-outputs.outputs.rustc-version }}
+  cargo-version:
+    description: 'Installed cargo version'
+    value: ${{ steps.env-outputs.outputs.cargo-version }}
+  rust-cache-hit:
+    description: 'Whether an exact match was found in the Rust cache'
+    value: ${{ steps.rust-cache.outputs.cache-hit }}
+
 runs:
   using: "composite"
   steps:
     - name: Setup pnpm
-      uses: pnpm/action-setup@v6
+      uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
+      with:
+        version: ${{ inputs.pnpm-version }}
 
     - name: Setup Node.js
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
       with:
-        node-version: lts/*
-        cache: 'pnpm'
+        node-version: ${{ inputs.node-version }}
+        cache: ${{ inputs.node-cache }}
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      if: ${{ inputs.install-rust == 'true' }}
+      uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        targets: ${{ inputs.rust-targets }}
+        components: ${{ inputs.rust-components }}
 
     - name: Rust Cache
-      uses: swatinem/rust-cache@v2
+      id: rust-cache
+      if: ${{ inputs.install-rust == 'true' && inputs.rust-cache == 'true' }}
+      uses: swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
       with:
-        workspaces: './src-tauri -> target'
+        workspaces: ${{ inputs.rust-cache-workspaces }}
+        key: ${{ inputs.rust-cache-key }}
+        save-if: ${{ inputs.rust-cache-save }}
+
+    - name: Install dependencies
+      if: ${{ inputs.install-dependencies == 'true' }}
+      shell: bash
+      run: pnpm install --frozen-lockfile
+
+    - name: Record Environment Outputs
+      id: env-outputs
+      shell: bash
+      run: |
+        echo "node-version=$(node --version)" >> "$GITHUB_OUTPUT"
+        echo "pnpm-version=$(pnpm --version)" >> "$GITHUB_OUTPUT"
+        if [ "${{ inputs.install-rust }}" = "true" ]; then
+          echo "rustc-version=$(rustc --version)" >> "$GITHUB_OUTPUT"
+          echo "cargo-version=$(cargo --version)" >> "$GITHUB_OUTPUT"
+        fi
