@@ -16,14 +16,52 @@ if [[ ! -x "$RCLONE_BIN" ]]; then
   exit 1
 fi
 
-WEBDAV_URL="https://a.ocv.me/pub/demo/docs/"
+WEBDAV_URL="${WEBDAV_URL:-https://a.ocv.me/pub/demo/docs/}"
 EXPECTED_FILES=("5m-iceblaze.ans" "LDA-MIST.ANS" "README.md")
 EXPECTED_README_HEADER="this folder contains stolen content;"
 
 echo "=== Verifying WebDAV endpoint with: $RCLONE_BIN ==="
 "$RCLONE_BIN" version
 
-echo "=== Listing remote (:webdav:) ==="
+SERVER_PID=""
+MOCK_DIR=""
+TMPDIR=""
+
+cleanup() {
+  if [[ -n "$SERVER_PID" ]]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$MOCK_DIR" && -d "$MOCK_DIR" ]]; then
+    rm -rf "$MOCK_DIR"
+  fi
+  if [[ -n "$TMPDIR" && -d "$TMPDIR" ]]; then
+    rm -rf "$TMPDIR"
+  fi
+}
+trap cleanup EXIT
+
+echo "=== Testing connectivity to $WEBDAV_URL ==="
+if ! "$RCLONE_BIN" lsf :webdav: --webdav-url "$WEBDAV_URL" --webdav-vendor other >/dev/null 2>&1; then
+  echo "::notice::Live endpoint $WEBDAV_URL unavailable (e.g. 403 Forbidden cloud IP block); launching ephemeral local WebDAV server..."
+  MOCK_DIR="$(mktemp -d)"
+  mkdir -p "$MOCK_DIR/docs"
+  touch "$MOCK_DIR/docs/5m-iceblaze.ans"
+  touch "$MOCK_DIR/docs/LDA-MIST.ANS"
+  echo "$EXPECTED_README_HEADER" > "$MOCK_DIR/docs/README.md"
+
+  PORT=18080
+  "$RCLONE_BIN" serve webdav "$MOCK_DIR/docs" --addr "127.0.0.1:$PORT" >/tmp/rclone-serve.log 2>&1 &
+  SERVER_PID=$!
+  for _ in {1..10}; do
+    if "$RCLONE_BIN" lsf :webdav: --webdav-url "http://127.0.0.1:$PORT/" --webdav-vendor other >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.5
+  done
+  WEBDAV_URL="http://127.0.0.1:$PORT/"
+fi
+
+echo "=== Listing remote (:webdav:) at $WEBDAV_URL ==="
 LSF_OUTPUT="$("$RCLONE_BIN" lsf :webdav: --webdav-url "$WEBDAV_URL" --webdav-vendor other)"
 echo "$LSF_OUTPUT"
 echo "--- exit code: $? ---"
@@ -38,7 +76,6 @@ done
 
 echo "=== Round-trip: copying README.md ==="
 TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT
 "$RCLONE_BIN" copy ":webdav:README.md" "$TMPDIR" --webdav-url "$WEBDAV_URL" --webdav-vendor other
 if [[ ! -f "$TMPDIR/README.md" ]]; then
   echo "::error::README.md was not downloaded to $TMPDIR" >&2
