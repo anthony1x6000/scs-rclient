@@ -3,6 +3,9 @@
 # install -> verify structure/permissions -> sidecar WebDAV test -> GUI smoke -> uninstall
 set -euo pipefail
 
+# Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
+unset RCLONE_VERSION
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEB_FILE="${DEB_FILE:-dist-linux/scs-rclient-linux.deb}"
 

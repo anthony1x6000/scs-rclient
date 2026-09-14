@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
+unset RCLONE_VERSION
+
 BUNDLE_FILE="${1:-scs-rclient-linux.flatpak}"
 
 echo "=== Setting up Flathub remote ==="

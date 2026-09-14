@@ -6,6 +6,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
+Remove-Item env:RCLONE_VERSION -ErrorAction SilentlyContinue
 
 if (-not (Test-Path $RcloneBin)) {
   Write-Error "::error::rclone binary not found: $RcloneBin"
