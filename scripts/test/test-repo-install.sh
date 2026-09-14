@@ -34,6 +34,19 @@ flatpak info online.anthonyis.scs-rclient
 echo "=== Verifying Application Permissions ==="
 flatpak info --show-permissions online.anthonyis.scs-rclient
 
+echo "=== Best-effort launch smoke test (non-fatal: no display in CI) ==="
+if timeout 20 flatpak run online.anthonyis.scs-rclient >/tmp/scs-launch.log 2>&1; then
+  echo "App exited on its own within the timeout window."
+else
+  code=$?
+  if [ "$code" -eq 124 ]; then
+    echo "App stayed running for 20s (healthy start, killed by timeout)."
+  else
+    echo "::warning::launch smoke exited with code $code (expected headless); tail:"
+    tail -n 20 /tmp/scs-launch.log || true
+  fi
+fi
+
 echo "=== Testing Incremental Pull & Update from Repository ==="
 flatpak update -y --user --noninteractive online.anthonyis.scs-rclient
 

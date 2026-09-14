@@ -28,20 +28,26 @@ flatpak remote-add --if-not-exists --user scs-rclient https://anthony1x6000.gith
 <div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate">flatpak install --user https://github.com/anthony1x6000/scs-rclient/releases/latest/download/scs-rclient-linux.flatpak</pre></div>
 <h2 dir="auto">Run the app</h2>
 <div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate">flatpak run online.anthonyis.scs-rclient</pre></div>
-<h2 dir="auto">Default permissions</h2>
+<h2 dir="auto">Default permissions (Flatpak build only)</h2>
+<blockquote>
+<p dir="auto">These apply to the Flatpak build, which runs sandboxed. The native packages<br>
+below (AppImage, DEB, RPM, NSIS/portable EXE) run with full user privileges.</p>
+</blockquote>
 <ul dir="auto">
-<li><code class="notranslate">~/Documents/scs-rclient</code></li>
-<li><code class="notranslate">~/.config/rclone</code> (Read-only)</li>
-<li>Secret Service / Keyring (<code class="notranslate">org.freedesktop.secrets</code>, <code class="notranslate">org.kde.kwalletd5/6</code>)</li>
+<li><code class="notranslate">~/Documents/scs-rclient</code> (create)</li>
+<li><code class="notranslate">~/.config/rclone</code> (read-only)</li>
+<li>Secret Service / Keyring (<code class="notranslate">org.freedesktop.secrets</code>, <code class="notranslate">org.freedesktop.portal.Secret</code>, <code class="notranslate">org.kde.kwalletd5/6</code>)</li>
 <li>Network access (<code class="notranslate">--share=network</code>)</li>
-<li>Display server access (X11 &amp; Wayland)</li>
+<li>Display server access (X11 &amp; Wayland), GPU (<code class="notranslate">--device=dri</code>) + IPC (<code class="notranslate">--share=ipc</code>)</li>
+<li><code class="notranslate">WEBKIT_DISABLE_DMABUF_RENDERER=1</code> env workaround</li>
 </ul>
-<p dir="auto">If you need access to other directories for file synchronization, use <a href="https://flathub.org/en/apps/com.github.tchx84.Flatseal" rel="nofollow">Flatseal</a> or use the CLI:</p>
+<p dir="auto">If you need access to other directories for file synchronization, use <a href="https://flathub.org/en/apps/com.github.tchx84.Flatseal" rel="nofollow">Flatseal</a> or grant a specific folder:</p>
 <div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate"><span class="pl-c"><span class="pl-c">#</span> Grant access to Documents folder</span>
-flatpak override --user --filesystem=<span class="pl-k">~</span>/Documents online.anthonyis.scs-rclient
-
-<span class="pl-c"><span class="pl-c">#</span> Or grant access to entire home directory</span>
-flatpak override --user --filesystem=host online.anthonyis.scs-rclient</pre></div>
+flatpak override --user --filesystem=<span class="pl-k">~</span>/Documents online.anthonyis.scs-rclient</pre></div>
+<blockquote>
+<p dir="auto">Avoid <code class="notranslate">flatpak override --filesystem=host</code>: it exposes your entire home<br>
+directory to the app. Prefer per-folder grants.</p>
+</blockquote>
 <h2 dir="auto">Other release packages</h2>
 <p dir="auto">Standalone release binaries are also available from <a href="https://github.com/anthony1x6000/scs-rclient/releases/latest">GitHub Releases</a>:</p>
 <ul dir="auto">

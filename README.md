@@ -46,23 +46,27 @@ flatpak install --user https://github.com/anthony1x6000/scs-rclient/releases/lat
 flatpak run online.anthonyis.scs-rclient
 ```
 
-## Default permissions
+## Default permissions (Flatpak build only)
 
-- `~/Documents/scs-rclient`
-- `~/.config/rclone` (Read-only)
-- Secret Service / Keyring (`org.freedesktop.secrets`, `org.kde.kwalletd5/6`)
+> These apply to the Flatpak build, which runs sandboxed. The native packages
+> below (AppImage, DEB, RPM, NSIS/portable EXE) run with full user privileges.
+
+- `~/Documents/scs-rclient` (create)
+- `~/.config/rclone` (read-only)
+- Secret Service / Keyring (`org.freedesktop.secrets`, `org.freedesktop.portal.Secret`, `org.kde.kwalletd5/6`)
 - Network access (`--share=network`)
-- Display server access (X11 & Wayland)
+- Display server access (X11 & Wayland), GPU (`--device=dri`) + IPC (`--share=ipc`)
+- `WEBKIT_DISABLE_DMABUF_RENDERER=1` env workaround
 
-If you need access to other directories for file synchronization, use [Flatseal](https://flathub.org/en/apps/com.github.tchx84.Flatseal) or use the CLI:
+If you need access to other directories for file synchronization, use [Flatseal](https://flathub.org/en/apps/com.github.tchx84.Flatseal) or grant a specific folder:
 
 ```bash
 # Grant access to Documents folder
 flatpak override --user --filesystem=~/Documents online.anthonyis.scs-rclient
-
-# Or grant access to entire home directory
-flatpak override --user --filesystem=host online.anthonyis.scs-rclient
 ```
+
+> Avoid `flatpak override --filesystem=host`: it exposes your entire home
+> directory to the app. Prefer per-folder grants.
 
 ## Other release packages
 
