@@ -3,6 +3,8 @@
 html,
 body {
   background-color: black;
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 
 @theme {
@@ -12,5 +14,23 @@ body {
 @layer base {
   body {
     @apply font-light;
+  }
+}
+
+@layer utilities {
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .fade-top {
+    mask-image: linear-gradient(to bottom, transparent, black 18px);
+    -webkit-mask-image: linear-gradient(to bottom, transparent, black 18px);
+  }
+  .fade-bottom {
+    mask-image: linear-gradient(to top, transparent, black 18px);
+    -webkit-mask-image: linear-gradient(to top, transparent, black 18px);
   }
 }

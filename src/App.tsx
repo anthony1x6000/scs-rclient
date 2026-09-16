@@ -61,7 +61,7 @@ function App() {
 
   return (
     <BackgroundWrapper>
-      <div className="flex flex-col h-screen pb-44 box-border">
+      <div className="flex flex-col h-screen pb-44 box-border overflow-hidden">
         {rcloneStatus === "missing" && (
           <div className="p-2 text-xs text-red-300 border border-red-500/50 bg-red-950/25" role="alert">
             No usable rclone binary found. Install rclone or repair the sidecar, then reload.
@@ -79,7 +79,7 @@ function App() {
         <RcloneConsole logs={logs} onClear={() => setLogs("")} />
       </div>
 
-      <div className="bottom-0 absolute p-2 w-[100%] text-white flex flex-col gap-4">
+      <div className="bottom-0 absolute p-2 w-[100%] text-white flex flex-col gap-4 overflow-hidden">
         <div className="p-2 font-['Roboto'] font-light">
           <div className="text-nowrap">
             <Dropdown onSelect={setSelectedSubdir} />
