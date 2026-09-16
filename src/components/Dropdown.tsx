@@ -206,7 +206,6 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
       setPage((p) => Math.min(p + 1, pageCount - 1));
       setHighlight((h) => {
         const base = clampedPage * pageSize;
-        const next = Math.min(total - 1, base + pageSize);
         return h < 0 ? base : Math.min(total - 1, h + pageSize);
       });
     } else if (e.key === "PageUp") {
