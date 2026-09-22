@@ -19,13 +19,12 @@ echo "=== Verifying Application Permissions ==="
 flatpak info --show-permissions online.anthonyis.scs-rclient
 
 echo "=== Verifying sandboxed rclone sidecar inside Flatpak ==="
-WEBDAV_URL="https://a.ocv.me/pub/demo/docs/"
+WEBDAV_URL="https://webdav.filestash.app/"
 if ! flatpak run --command=rclone online.anthonyis.scs-rclient lsf :webdav: --webdav-url "$WEBDAV_URL" --webdav-vendor other 2>/dev/null; then
   echo "::notice::Live endpoint $WEBDAV_URL unavailable (e.g. 403 Forbidden cloud IP block); starting sandboxed WebDAV server..."
   MOCK_DIR="$HOME/Documents/scs-rclient/mock-docs"
-  mkdir -p "$MOCK_DIR"
-  touch "$MOCK_DIR/5m-iceblaze.ans" "$MOCK_DIR/LDA-MIST.ANS"
-  echo "this folder contains stolen content;" > "$MOCK_DIR/README.md"
+  mkdir -p "$MOCK_DIR/Documents" "$MOCK_DIR/Music" "$MOCK_DIR/Pictures" "$MOCK_DIR/Videos"
+  echo "A few things that you can see from here:" > "$MOCK_DIR/README.org"
   PORT=18080
   flatpak run --command=rclone online.anthonyis.scs-rclient serve webdav "$MOCK_DIR" --addr "127.0.0.1:$PORT" >/tmp/flatpak-serve.log 2>&1 &
   SERVER_PID=$!
