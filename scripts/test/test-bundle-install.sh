@@ -4,6 +4,7 @@ set -euo pipefail
 # Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
 unset RCLONE_VERSION
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUNDLE_FILE="${1:-scs-rclient-linux.flatpak}"
 
 echo "=== Setting up Flathub remote ==="
@@ -17,6 +18,16 @@ flatpak info online.anthonyis.scs-rclient
 
 echo "=== Verifying Application Permissions ==="
 flatpak info --show-permissions online.anthonyis.scs-rclient
+
+echo "=== Verifying the installed payload ships a resolvable sidecar ==="
+# The app resolves <dir of its own exe>/rclone-sidecar. Inside the sandbox that is
+# /app/bin/rclone-sidecar, which is <deployment>/files/bin/rclone-sidecar on the
+# host. The manifest must install the sidecar under that exact name; a
+# target-triple-suffixed install makes the packaged app report
+# "No usable rclone binary found".
+FLATPAK_LOCATION="$(flatpak info --user --show-location online.anthonyis.scs-rclient)"
+echo "Flatpak deployment: $FLATPAK_LOCATION"
+bash "$SCRIPT_DIR/verify-sidecar-layout.sh" "$FLATPAK_LOCATION/files/bin" "${TARGET_RCLONE_VERSION:-}"
 
 echo "=== Verifying sandboxed rclone sidecar inside Flatpak ==="
 WEBDAV_URL="https://webdav.filestash.app/"

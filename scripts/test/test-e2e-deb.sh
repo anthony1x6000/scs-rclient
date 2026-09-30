@@ -29,15 +29,10 @@ if [[ ! -x "$APP_BIN" ]]; then
 fi
 ls -l "$APP_BIN"
 
-# The sidecar ships next to the app binary or under /usr/lib/scs-rclient.
-SIDECAR="$(find /usr/bin /usr/lib /opt -name 'rclone-sidecar*' -type f 2>/dev/null | head -n 1 || true)"
-if [[ -z "$SIDECAR" ]]; then
-  echo "::error::Installed rclone sidecar not found!" >&2
-  exit 1
-fi
-echo "Found sidecar: $SIDECAR"
-ls -l "$SIDECAR"
-test -x "$SIDECAR" || { echo "::error::Sidecar is not executable: $SIDECAR" >&2; exit 1; }
+# Tauri resolves the sidecar as <dir of running exe>/rclone-sidecar, so assert that
+# exact path instead of globbing for anything named rclone-sidecar*.
+bash "$SCRIPT_DIR/verify-sidecar-layout.sh" "$APP_BIN" "${TARGET_RCLONE_VERSION:-}"
+SIDECAR="/usr/bin/rclone-sidecar"
 
 echo "=== Running sidecar WebDAV verification ==="
 bash "$SCRIPT_DIR/verify-webdav-endpoint.sh" "$SIDECAR"

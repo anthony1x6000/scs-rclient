@@ -7,20 +7,20 @@ unset RCLONE_VERSION
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_BIN="${APP_BIN:-src-tauri/target/release/scs-rclient}"
-SIDECAR="${SIDECAR:-src-tauri/target/release/rclone-sidecar-x86_64-unknown-linux-gnu}"
+# This is the name the app actually resolves at runtime, not the bundler's
+# triple-suffixed input name (rclone-sidecar-x86_64-unknown-linux-gnu).
+SIDECAR="${SIDECAR:-src-tauri/target/release/rclone-sidecar}"
 
 if [[ ! -f "$APP_BIN" ]]; then
   echo "::error::App binary not found: $APP_BIN" >&2
   exit 1
 fi
-if [[ ! -f "$SIDECAR" ]]; then
-  echo "::error::Sidecar binary not found: $SIDECAR" >&2
-  exit 1
-fi
 
-chmod +x "$APP_BIN" "$SIDECAR"
+chmod +x "$APP_BIN"
 
-echo "=== Verifying binary/sidecar pairing ==="
+echo "=== Verifying the app finds its sidecar next to itself ==="
+bash "$SCRIPT_DIR/verify-sidecar-layout.sh" "$APP_BIN" "${TARGET_RCLONE_VERSION:-}"
+chmod +x "$SIDECAR"
 ls -l "$APP_BIN" "$SIDECAR"
 
 echo "=== Running sidecar WebDAV verification ==="
