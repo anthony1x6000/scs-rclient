@@ -16,9 +16,9 @@ if [[ ! -x "$RCLONE_BIN" ]]; then
   exit 1
 fi
 
-WEBDAV_URL="${WEBDAV_URL:-https://a.ocv.me/pub/demo/docs/}"
-EXPECTED_FILES=("5m-iceblaze.ans" "LDA-MIST.ANS" "README.md")
-EXPECTED_README_HEADER="this folder contains stolen content;"
+WEBDAV_URL="${WEBDAV_URL:-https://webdav.filestash.app/}"
+EXPECTED_FILES=("Documents" "Music" "Pictures" "README.org" "Videos")
+EXPECTED_README_HEADER="A few things that you can see from here:"
 
 echo "=== Verifying WebDAV endpoint with: $RCLONE_BIN ==="
 "$RCLONE_BIN" version
@@ -44,10 +44,8 @@ echo "=== Testing connectivity to $WEBDAV_URL ==="
 if ! "$RCLONE_BIN" lsf :webdav: --webdav-url "$WEBDAV_URL" --webdav-vendor other >/dev/null 2>&1; then
   echo "::notice::Live endpoint $WEBDAV_URL unavailable (e.g. 403 Forbidden cloud IP block); launching ephemeral local WebDAV server..."
   MOCK_DIR="$(mktemp -d)"
-  mkdir -p "$MOCK_DIR/docs"
-  touch "$MOCK_DIR/docs/5m-iceblaze.ans"
-  touch "$MOCK_DIR/docs/LDA-MIST.ANS"
-  echo "$EXPECTED_README_HEADER" > "$MOCK_DIR/docs/README.md"
+  mkdir -p "$MOCK_DIR/docs/Documents" "$MOCK_DIR/docs/Music" "$MOCK_DIR/docs/Pictures" "$MOCK_DIR/docs/Videos"
+  echo "$EXPECTED_README_HEADER" > "$MOCK_DIR/docs/README.org"
 
   PORT=18080
   "$RCLONE_BIN" serve webdav "$MOCK_DIR/docs" --addr "127.0.0.1:$PORT" >/tmp/rclone-serve.log 2>&1 &
@@ -74,16 +72,16 @@ for expected in "${EXPECTED_FILES[@]}"; do
   echo "Found expected file: $expected"
 done
 
-echo "=== Round-trip: copying README.md ==="
+echo "=== Round-trip: copying README.org ==="
 TMPDIR="$(mktemp -d)"
-"$RCLONE_BIN" copy ":webdav:README.md" "$TMPDIR" --webdav-url "$WEBDAV_URL" --webdav-vendor other
-if [[ ! -f "$TMPDIR/README.md" ]]; then
-  echo "::error::README.md was not downloaded to $TMPDIR" >&2
+"$RCLONE_BIN" copy ":webdav:README.org" "$TMPDIR" --webdav-url "$WEBDAV_URL" --webdav-vendor other
+if [[ ! -f "$TMPDIR/README.org" ]]; then
+  echo "::error::README.org was not downloaded to $TMPDIR" >&2
   exit 1
 fi
-if ! grep -qF "$EXPECTED_README_HEADER" "$TMPDIR/README.md"; then
-  echo "::error::Downloaded README.md missing expected header '$EXPECTED_README_HEADER'" >&2
-  head -n 20 "$TMPDIR/README.md" || true
+if ! grep -qF "$EXPECTED_README_HEADER" "$TMPDIR/README.org"; then
+  echo "::error::Downloaded README.org missing expected header '$EXPECTED_README_HEADER'" >&2
+  head -n 20 "$TMPDIR/README.org" || true
   exit 1
 fi
 
