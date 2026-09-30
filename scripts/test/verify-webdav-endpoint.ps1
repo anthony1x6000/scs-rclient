@@ -14,9 +14,9 @@ if (-not (Test-Path $RcloneBin)) {
   exit 1
 }
 
-$WebdavUrl = "https://a.ocv.me/pub/demo/docs/"
-$ExpectedFiles = @("5m-iceblaze.ans", "LDA-MIST.ANS", "README.md")
-$ExpectedReadmeHeader = "this folder contains stolen content;"
+$WebdavUrl = "https://webdav.filestash.app/"
+$ExpectedFiles = @("Documents", "Music", "Pictures", "README.org", "Videos")
+$ExpectedReadmeHeader = "A few things that you can see from here:"
 
 Write-Host "=== Verifying WebDAV endpoint with: $RcloneBin ==="
 & $RcloneBin version
@@ -33,9 +33,11 @@ try {
     $mockDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mock-webdav-" + [System.Guid]::NewGuid().ToString("N"))
     $mockDocs = Join-Path $mockDir "docs"
     New-Item -ItemType Directory -Force -Path $mockDocs | Out-Null
-    New-Item -ItemType File -Force -Path (Join-Path $mockDocs "5m-iceblaze.ans") | Out-Null
-    New-Item -ItemType File -Force -Path (Join-Path $mockDocs "LDA-MIST.ANS") | Out-Null
-    Set-Content -Path (Join-Path $mockDocs "README.md") -Value $ExpectedReadmeHeader -NoNewline
+    New-Item -ItemType Directory -Force -Path (Join-Path $mockDocs "Documents") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $mockDocs "Music") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $mockDocs "Pictures") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $mockDocs "Videos") | Out-Null
+    Set-Content -Path (Join-Path $mockDocs "README.org") -Value $ExpectedReadmeHeader -NoNewline
 
     $Port = 18080
     $serverProc = Start-Process -FilePath $RcloneBin -ArgumentList @("serve", "webdav", $mockDocs, "--addr", "127.0.0.1:$Port") -PassThru
@@ -61,17 +63,17 @@ Write-Host $LsfOutput
     Write-Host "Found expected file: $expected"
   }
 
-Write-Host "=== Round-trip: copying README.md ==="
+Write-Host "=== Round-trip: copying README.org ==="
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("webdav-test-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 try {
-  & $RcloneBin copy ":webdav:README.md" $TmpDir --webdav-url $WebdavUrl --webdav-vendor other
+  & $RcloneBin copy ":webdav:README.org" $TmpDir --webdav-url $WebdavUrl --webdav-vendor other
   if ($LASTEXITCODE -ne 0) { Write-Error "::error::rclone copy exited with code $LASTEXITCODE"; exit 1 }
-  $ReadmePath = Join-Path $TmpDir "README.md"
-  if (-not (Test-Path $ReadmePath)) { Write-Error "::error::README.md was not downloaded to $TmpDir"; exit 1 }
+  $ReadmePath = Join-Path $TmpDir "README.org"
+  if (-not (Test-Path $ReadmePath)) { Write-Error "::error::README.org was not downloaded to $TmpDir"; exit 1 }
   $Content = Get-Content -Raw $ReadmePath
   if ($Content -notmatch [regex]::Escape($ExpectedReadmeHeader)) {
-    Write-Error "::error::Downloaded README.md missing expected header '$ExpectedReadmeHeader'"
+    Write-Error "::error::Downloaded README.org missing expected header '$ExpectedReadmeHeader'"
     exit 1
   }
 } finally {
