@@ -1,6 +1,14 @@
 use std::fs::File;
 use std::path::Path;
 
+/// The smallest size a real rclone binary can plausibly have. The official
+/// release binaries are tens of megabytes, so anything below 1 MiB is either the
+/// 0-byte placeholder this script writes for dev builds or a truncated download.
+/// Rejecting it in a release/bundle build is what stops a placeholder from being
+/// shipped (which the app would then report as
+/// "No usable rclone binary found (sidecar and system both unavailable)").
+const MIN_REAL_SIDECAR_BYTES: u64 = 1024 * 1024;
+
 fn main() {
     // Ensure the src-tauri/binaries directory exists.
     let binaries_dir = Path::new("binaries");
@@ -29,8 +37,26 @@ fn main() {
             || (target_name.contains("unknown-linux-gnu") && target.contains("unknown-linux-gnu"))
             // Unknown/other targets (e.g. local `cargo check` without TARGET): don't enforce.
             || target.is_empty();
+        let enforce = require_real && is_for_this_target;
+
+        // A stale or truncated file is just as fatal as a missing one, and a
+        // same-profile incremental rebuild may reuse target/<profile>/build
+        // outputs, so this check must live here rather than only at staging time.
+        let existing_size = path.metadata().ok().map(|m| m.len());
+        if let (true, Some(size)) = (enforce, existing_size) {
+            if size < MIN_REAL_SIDECAR_BYTES {
+                panic!(
+                    "sidecar binary {} is only {} bytes (< {}); it is a placeholder or a \
+                     truncated download and must not be shipped in a release/bundle build",
+                    path.display(),
+                    size,
+                    MIN_REAL_SIDECAR_BYTES
+                );
+            }
+        }
+
         if !path.exists() {
-            if require_real && is_for_this_target {
+            if enforce {
                 panic!(
                     "missing real sidecar binary {} for release/bundle build; refusing to ship a placeholder",
                     path.display()
@@ -45,11 +71,6 @@ fn main() {
                 path.display()
             );
             File::create(&path).expect("failed to create dummy sidecar binary");
-        } else if path.metadata().map(|m| m.len() == 0).unwrap_or(false) && require_real && is_for_this_target {
-            panic!(
-                "placeholder (0-byte) sidecar binary {} present in release/bundle build; refusing to ship",
-                path.display()
-            );
         }
     }
 

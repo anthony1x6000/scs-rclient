@@ -1,16 +1,25 @@
 # E2E test for Windows release binaries:
 # 1. NSIS installer: silent install -> sidecar WebDAV test -> launch smoke -> silent uninstall
-# 2. Portable EXE (+ no-icon): pairing check -> sidecar WebDAV test -> launch smoke
+# 2. Portable EXE (+ no-icon): sidecar pairing check -> zip check -> sidecar WebDAV test -> launch smoke
+#
+# The sidecar must sit next to the app executable under the exact name Tauri
+# resolves at runtime ("rclone-sidecar.exe"). Globbing for "rclone-sidecar*" would
+# accept the bundler's triple-suffixed name, which the app never looks for.
 param(
   [string]$InstallerPath = "dist-win/scs-rclient-win-installer.exe",
   [string]$PortablePath = "dist-win/scs-rclient-win-portable.exe",
+  [string]$PortableZip = "dist-win/scs-rclient-win-portable.zip",
   [string]$NoIconPath = "dist-win-noicon/scs-rclient-win-noicon.exe",
-  [string]$Verifier = "scripts/test/verify-webdav-endpoint.ps1"
+  [string]$NoIconZip = "dist-win-noicon/scs-rclient-win-noicon.zip",
+  [string]$Verifier = "scripts/test/verify-webdav-endpoint.ps1",
+  [string]$LayoutVerifier = "scripts/test/verify-sidecar-layout.ps1"
 )
 
 $ErrorActionPreference = "Stop"
 # Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
 Remove-Item env:RCLONE_VERSION -ErrorAction SilentlyContinue
+
+$RuntimeSidecarName = "rclone-sidecar.exe"
 
 function Assert-File($Path, $Label) {
   if (-not (Test-Path $Path)) { Write-Error "::error::$Label not found: $Path"; exit 1 }
@@ -30,6 +39,22 @@ function Invoke-LaunchSmoke($ExePath, $Label) {
   try { Stop-Process -Id $proc.Id -Force } catch {}
 }
 
+# Assert the sidecar is resolvable from the app exe directory and that the
+# distributable zip carries the app and its sidecar together. verify-sidecar-layout.ps1
+# is the single source of truth for the runtime path contract.
+function Assert-ResolvableSidecar($AppExe, $Zip, $Label) {
+  Write-Host "=== Verifying sidecar layout for $Label ==="
+  # Run as a child process so the verifier's `exit 1` is reported as an exit code
+  # instead of terminating this harness through a shared session.
+  $LayoutArgs = @("-NoProfile", "-File", $LayoutVerifier, "-AppExe", $AppExe)
+  if ($Zip) { $LayoutArgs += @("-Zip", $Zip) }
+  & pwsh @LayoutArgs
+  if ($LASTEXITCODE -ne 0) {
+    Write-Error "::error::$Label does not ship a resolvable rclone sidecar (verify-sidecar-layout.ps1 exited $LASTEXITCODE)"
+    exit 1
+  }
+}
+
 # --- NSIS installer test ---
 Assert-File $InstallerPath "NSIS installer"
 Assert-File $Verifier "WebDAV verifier"
@@ -47,13 +72,12 @@ if (-not (Test-Path $InstallDir)) {
 Write-Host "Install dir: $InstallDir"
 Get-ChildItem $InstallDir | Format-Table Name, Length
 
-$InstalledSidecar = Get-ChildItem -Path $InstallDir -Recurse -Filter "rclone-sidecar*" -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $InstalledSidecar) { Write-Error "::error::Installed sidecar not found under $InstallDir"; exit 1 }
-Write-Host "Found installed sidecar: $($InstalledSidecar.FullName)"
-
-& $Verifier -RcloneBin $InstalledSidecar.FullName
-
 $InstalledExe = Join-Path $InstallDir "scs-rclient.exe"
+$InstalledSidecar = Join-Path $InstallDir $RuntimeSidecarName
+Assert-ResolvableSidecar $InstalledExe $null "NSIS install"
+
+& $Verifier -RcloneBin $InstalledSidecar
+
 if (Test-Path $InstalledExe) { Invoke-LaunchSmoke $InstalledExe "installed app" }
 
 Write-Host "=== Silent uninstall ==="
@@ -68,19 +92,19 @@ if ((Test-Path $InstallDir) -and ((Get-ChildItem $InstallDir -ErrorAction Silent
 }
 Write-Host "✓ NSIS E2E passed"
 
-# --- Portable EXEs test ---
-foreach ($pair in @(@{ Exe = $PortablePath; Name = "portable" }, @{ Exe = $NoIconPath; Name = "no-icon portable" })) {
-  $exe = $pair.Exe
-  if (-not (Test-Path $exe)) { Write-Host "::warning::Skipping $($pair.Name): $exe not present"; continue }
-  Write-Host "=== Testing $($pair.Name): $exe ==="
-  $dir = Split-Path $exe -Parent
-  $sidecar = Get-ChildItem -Path $dir -Filter "rclone-sidecar*" -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($sidecar) {
-    & $Verifier -RcloneBin $sidecar.FullName
-  } else {
-    Write-Host "::notice::No bundled sidecar next to $exe; testing repo-verified rclone is out of scope here."
-  }
-  Invoke-LaunchSmoke (Resolve-Path $exe).Path $pair.Name
+# --- Portable builds test ---
+$PortableBuilds = @(
+  @{ Exe = $PortablePath; Zip = $PortableZip; Name = "portable" },
+  @{ Exe = $NoIconPath; Zip = $NoIconZip; Name = "no-icon portable" }
+)
+foreach ($build in $PortableBuilds) {
+  Assert-File $build.Exe $build.Name
+  Assert-File (Join-Path (Split-Path $build.Exe -Parent) $RuntimeSidecarName) "$($build.Name) sidecar"
+  Assert-File $build.Zip "$($build.Name) distributable zip"
+  Write-Host "=== Testing $($build.Name): $($build.Exe) ==="
+  Assert-ResolvableSidecar $build.Exe $build.Zip $build.Name
+  & $Verifier -RcloneBin (Join-Path (Split-Path $build.Exe -Parent) $RuntimeSidecarName)
+  Invoke-LaunchSmoke (Resolve-Path $build.Exe).Path $build.Name
 }
 
 Write-Host "✓ Windows E2E passed"
