@@ -105,7 +105,7 @@ export function RcloneConsole({ logs, onClear }: RcloneConsoleProps) {
           onScroll={handleScroll}
           placeholder="Click a command above to run and view output..."
           wrap="off"
-          className="w-full flex-1 min-h-0 p-2 font-mono text-xs bg-black/25 border border-white/10 rounded-sm outline-none no-scrollbar overflow-auto overscroll-contain resize-none"
+          className="w-full flex-1 min-h-0 p-2 font-mono text-xs bg-black/25 border border-white/10 outline-none no-scrollbar overflow-auto overscroll-contain resize-none"
         />
         {/* bottom fade */}
         <div
