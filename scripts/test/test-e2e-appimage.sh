@@ -28,14 +28,17 @@ if [[ ! -d squashfs-root ]]; then
   exit 1
 fi
 
-echo "=== Locating sidecar in squashfs-root ==="
-SIDECAR="$(find squashfs-root -name 'rclone-sidecar*' -type f 2>/dev/null | head -n 1 || true)"
-if [[ -z "$SIDECAR" ]]; then
-  echo "::error::Sidecar not found inside AppImage!" >&2
+echo "=== Locating app binary and sidecar in squashfs-root ==="
+APP_BIN="squashfs-root/usr/bin/scs-rclient"
+if [[ ! -e "$APP_BIN" ]]; then
+  echo "::error::App binary not found inside AppImage at $APP_BIN" >&2
   exit 1
 fi
+# Tauri resolves the sidecar as <dir of running exe>/rclone-sidecar; asserting that
+# exact path catches a misnamed or misplaced sidecar that a glob would accept.
+bash "$SCRIPT_DIR/verify-sidecar-layout.sh" "$APP_BIN" "${TARGET_RCLONE_VERSION:-}"
+SIDECAR="squashfs-root/usr/bin/rclone-sidecar"
 chmod +x "$SIDECAR"
-echo "Found sidecar: $SIDECAR"
 ls -l "$SIDECAR"
 
 echo "=== Running sidecar WebDAV verification ==="
