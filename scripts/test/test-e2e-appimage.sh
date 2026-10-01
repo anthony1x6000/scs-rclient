@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# E2E test for the .AppImage release binary:
-# extract -> sidecar WebDAV test -> launch smoke (extract-and-run under xvfb)
+# E2E test for the .AppImage release binary: extract -> GUI launch smoke (under xvfb)
 set -euo pipefail
 
 # Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
@@ -28,21 +27,12 @@ if [[ ! -d squashfs-root ]]; then
   exit 1
 fi
 
-echo "=== Locating app binary and sidecar in squashfs-root ==="
+echo "=== Locating app binary in squashfs-root ==="
 APP_BIN="squashfs-root/usr/bin/scs-rclient"
 if [[ ! -e "$APP_BIN" ]]; then
   echo "::error::App binary not found inside AppImage at $APP_BIN" >&2
   exit 1
 fi
-# Tauri resolves the sidecar as <dir of running exe>/rclone-sidecar; asserting that
-# exact path catches a misnamed or misplaced sidecar that a glob would accept.
-bash "$SCRIPT_DIR/verify-sidecar-layout.sh" "$APP_BIN" "${TARGET_RCLONE_VERSION:-}"
-SIDECAR="squashfs-root/usr/bin/rclone-sidecar"
-chmod +x "$SIDECAR"
-ls -l "$SIDECAR"
-
-echo "=== Running sidecar WebDAV verification ==="
-bash "$SCRIPT_DIR/verify-webdav-endpoint.sh" "$PWD/$SIDECAR"
 popd >/dev/null
 
 echo "=== GUI launch smoke test (xvfb-run + extract-and-run) ==="

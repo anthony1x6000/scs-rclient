@@ -15,11 +15,11 @@
   
   <description>
     <p>
-      scs-rclient is a modern desktop GUI wrapper for rclone, bundling rclone directly to streamline WebDAV synchronization and file transfers.
+      scs-rclient is a modern desktop GUI for WebDAV synchronization and file transfers.
     </p>
     <p>Key Features:</p>
     <ul>
-      <li>Embedded and verified rclone binary sidecar</li>
+      <li>Native WebDAV operations built with Rust</li>
       <li>Intuitive WebDAV configuration and authentication management</li>
       <li>Console output viewer with real-time logs and transfer status</li>
       <li>Cross-platform desktop integration built on Tauri and Rust</li>
@@ -37,7 +37,7 @@
   <releases>
     <release version="0.1.0" date="2026-08-13">
       <description>
-        <p>Release with bundled rclone sidecar, WebDAV configuration, and Flatpak support.</p>
+        <p>Release with native WebDAV support, configuration, and Flatpak support.</p>
       </description>
     </release>
   </releases>
