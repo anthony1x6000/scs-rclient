@@ -112,7 +112,7 @@ fn decode_percent(s: &str) -> String {
 /// Computes the item path relative to the collection URL.
 pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
     let decoded_href = decode_percent(item_href);
-    let url_parsed = reqwest::Url::parse(base_url);
+    let url_parsed = rustydav::prelude::Url::parse(base_url);
     let base_path = match &url_parsed {
         Ok(u) => decode_percent(u.path()),
         Err(_) => base_url.to_string(),
