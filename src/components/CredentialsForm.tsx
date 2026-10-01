@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { createRcloneCommand, resolveRemoteUrl, obscurePassword, ensureRcloneDetected } from "../utils/rclone";
 import { getWebDAVBase, getSelectedSubdir, getSavedUsername, setSavedUsername } from "../settings";
 import TextInput from "./TextInput";
 
@@ -16,43 +15,24 @@ function CredentialsForm() {
     setStatus('testing');
     setStatusText("Testing credentials…");
     try {
-      await ensureRcloneDetected();
-      // Use the same source of truth as execution: selected subdirectory only.
       const [baseUrl, selectedSubdir] = await Promise.all([
         getWebDAVBase(),
         getSelectedSubdir(),
       ]);
 
-      const fullTestUrl = resolveRemoteUrl(baseUrl, selectedSubdir);
-      console.log("Testing credentials with rclone...", fullTestUrl);
+      await invoke("verify_webdav", {
+        baseUrl,
+        subdir: selectedSubdir,
+        username: userVal,
+        password: passVal || undefined,
+      });
 
-      const obscuredPassword = passVal ? await obscurePassword(passVal) : "";
-
-      const args = [
-        "lsf",
-        ":webdav:",
-        `--webdav-url=${fullTestUrl}`
-      ];
-      if (userVal) {
-        args.push(`--webdav-user=${userVal}`);
-      }
-
-      const env = obscuredPassword ? { RCLONE_WEBDAV_PASS: obscuredPassword } : undefined;
-      const command = createRcloneCommand(args, env);
-      const result = await command.execute();
-      if (result.code === 0) {
-        console.log("Rclone authentication test succeeded! Output:\n", result.stdout);
-        setStatus('success');
-        setStatusText("Credentials valid.");
-      } else {
-        console.error(`Rclone authentication test failed with code ${result.code}:\n`, result.stderr);
-        setStatus('error');
-        setStatusText(`Authentication test failed (exit ${result.code}).`);
-      }
-    } catch (e) {
+      setStatus('success');
+      setStatusText("Credentials valid.");
+    } catch (e: any) {
       console.error("Error during validation:", e);
       setStatus('error');
-      setStatusText(`Error during validation: ${e}`);
+      setStatusText(`Authentication failed: ${e?.message || e}`);
     }
   };
 

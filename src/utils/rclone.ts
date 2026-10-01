@@ -1,91 +1,3 @@
-import { Command } from "@tauri-apps/plugin-shell";
-
-export type RcloneStatus = "pending" | "packaged" | "system" | "missing";
-
-let status: RcloneStatus = "pending";
-let useSystemRclone = false;
-
-/**
- * Detects if the packaged sidecar binary is valid and executable.
- * Falls back to the system-installed 'rclone' binary (dev convenience only).
- */
-export async function detectRclone(): Promise<RcloneStatus> {
-  try {
-    const testCmd = Command.sidecar("binaries/rclone-sidecar", ["--version"]);
-    const res = await testCmd.execute();
-    if (res.code === 0) {
-      useSystemRclone = false;
-      status = "packaged";
-      console.log("Using packaged rclone sidecar.");
-      (window as any).__TEST_SIDECAR_STATUS__ = "packaged";
-      return status;
-    }
-  } catch (e: any) {
-    console.warn("Packaged rclone sidecar is invalid or unexecutable. Checking system rclone fallback.", e?.message || e);
-    (window as any).__TEST_SIDECAR_ERROR__ = e?.message || e;
-  }
-
-  try {
-    const testSysCmd = Command.create("rclone", ["--version"]);
-    const res = await testSysCmd.execute();
-    if (res.code === 0) {
-      useSystemRclone = true;
-      status = "system";
-      console.log("Using system-installed rclone (dev fallback).");
-      (window as any).__TEST_SIDECAR_STATUS__ = "system";
-      return status;
-    } else {
-      console.error("System-level rclone returned a non-zero exit code:", res.code);
-    }
-  } catch (e: any) {
-    console.error("System-level rclone is not available or is invalid on this system:", e?.message || e);
-  }
-
-  useSystemRclone = false;
-  status = "missing";
-  (window as any).__TEST_SIDECAR_STATUS__ = "missing";
-  return status;
-}
-
-let detectPromise: Promise<RcloneStatus> | null = null;
-
-/**
- * Ensures that the rclone detection runs exactly once.
- * Rejects when neither binary validates so callers can block runs.
- */
-export function ensureRcloneDetected(): Promise<RcloneStatus> {
-  if (!detectPromise) {
-    detectPromise = detectRclone().then((s) => {
-      if (s === "missing") {
-        throw new Error("No usable rclone binary found (sidecar and system both unavailable).");
-      }
-      return s;
-    }).catch((e) => {
-      // Reset so a later retry can re-attempt detection.
-      detectPromise = null;
-      status = "missing";
-      throw e;
-    });
-  }
-  return detectPromise;
-}
-
-export function getRcloneStatus(): RcloneStatus {
-  return status;
-}
-
-/**
- * Creates a Tauri Command for running rclone.
- */
-export function createRcloneCommand(args: string[], env?: Record<string, string>): Command<string> {
-  const options = env ? { env } : undefined;
-  if (useSystemRclone) {
-    return Command.create("rclone", args, options);
-  } else {
-    return Command.sidecar("binaries/rclone-sidecar", args, options);
-  }
-}
-
 /**
  * Normalizes a URL by trimming whitespace and trailing slashes.
  */
@@ -150,23 +62,9 @@ export function resolveLocalPath(mountDir: string, subdir: string): string {
     if (part !== ".") joinedParts.push(part);
   }
   // Containment check: resolved parts must start with the mount prefix.
-  // (Leading "/" tolerated for absolute mounts on POSIX.)
   const prefix = mountParts.join("/");
   if (prefix && !joinedParts.join("/").startsWith(prefix)) {
     throw new Error(`Invalid subdirectory "${subdir}": escapes the mount directory.`);
   }
   return joined;
-}
-
-/**
- * Obscures the password using rclone's built-in obscure command.
- */
-export async function obscurePassword(password: string): Promise<string> {
-  await ensureRcloneDetected();
-  const obscureCommand = createRcloneCommand(["obscure", password]);
-  const result = await obscureCommand.execute();
-  if (result.code !== 0) {
-    throw new Error(result.stderr || "Failed to obscure password");
-  }
-  return result.stdout.trim();
 }
