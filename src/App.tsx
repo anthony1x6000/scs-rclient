@@ -7,7 +7,6 @@ import CredentialsForm from "./components/CredentialsForm";
 import SettingsView from "./components/SettingsView";
 import { RcloneActions } from "./components/RcloneActions";
 import RcloneConsole from "./components/RcloneConsole";
-import { ensureRcloneDetected } from "./utils/rclone";
 import { getTargetSubdir } from "./settings";
 
 function App() {
@@ -17,7 +16,6 @@ function App() {
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [logs, setLogs] = useState<string>("");
   const [isRunning, setIsRunning] = useState<boolean>(false);
-  const [rcloneStatus, setRcloneStatus] = useState<string>("pending");
   const mountSeq = useRef(0);
 
   const updateMountDir = async (subdir?: string) => {
@@ -33,15 +31,6 @@ function App() {
   };
 
   useEffect(() => {
-    // Detect rclone sidecar on mount (surface failure instead of swallowing).
-    ensureRcloneDetected().then(
-      (s) => setRcloneStatus(s),
-      (e) => {
-        console.error(e);
-        setRcloneStatus("missing");
-      }
-    );
-
     // Fetch target subdirectory from the single settings module.
     getTargetSubdir()
       .then((sub) => {
@@ -62,11 +51,6 @@ function App() {
   return (
     <BackgroundWrapper>
       <div className="flex flex-col h-screen pb-44 box-border overflow-hidden">
-        {rcloneStatus === "missing" && (
-          <div className="p-2 text-xs text-red-300 border border-red-500/50 bg-red-950/25" role="alert">
-            No usable rclone binary found. Install rclone or repair the sidecar, then reload.
-          </div>
-        )}
         <div className="px-2 text-xs text-gray-400" aria-label="Sync subdirectory">
           Sync item: {selectedSubdir || "none selected"}
         </div>

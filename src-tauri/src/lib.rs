@@ -134,6 +134,86 @@ fn delete_credentials(username: String) -> Result<(), String> {
     }
 }
 
+mod webdav;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+pub struct WebdavState {
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
+#[tauri::command]
+fn verify_webdav(
+    base_url: String,
+    subdir: String,
+    username: String,
+    password: Option<String>,
+) -> Result<(), String> {
+    let secret = match password {
+        Some(p) => p,
+        None => get_credentials(username.clone())?,
+    };
+    let remote_url = webdav::build_remote_url(&base_url, &subdir);
+    webdav::verify_webdav_auth(&remote_url, &username, &secret)
+}
+
+#[tauri::command]
+fn cancel_webdav_action(state: tauri::State<'_, WebdavState>) -> Result<(), String> {
+    state.cancel_flag.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+async fn run_webdav_action(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, WebdavState>,
+    action: String,
+    base_url: String,
+    subdir: String,
+    target_subdir: Option<String>,
+    username: Option<String>,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    state.cancel_flag.store(false, Ordering::SeqCst);
+    let cancel_flag = state.cancel_flag.clone();
+
+    let mount_dir_str = get_mount_dir(app.clone(), target_subdir)?;
+    let local_path = match join_contained(std::path::Path::new(&mount_dir_str), &subdir) {
+        Ok(p) => p,
+        Err(_) => std::path::Path::new(&mount_dir_str).join(&subdir),
+    };
+
+    let remote_url = webdav::build_remote_url(&base_url, &subdir);
+
+    let (user, pass) = if let Some(u) = username.filter(|u| !u.trim().is_empty()) {
+        let p = get_credentials(u.clone()).unwrap_or_default();
+        (u, p)
+    } else {
+        (String::new(), String::new())
+    };
+
+    let client = rustydav::client::Client::init(&user, &pass);
+    let app_handle = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let emit_log = move |msg: &str| {
+            let _ = app_handle.emit("webdav-log", msg);
+        };
+        webdav::execute_webdav_action(
+            &client,
+            &action,
+            &remote_url,
+            &local_path,
+            &cancel_flag,
+            emit_log,
+        )
+    })
+    .await
+    .map_err(|e| format!("Task execution error: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -143,7 +223,10 @@ pub fn run() {
         }
     }
 
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
     tauri::Builder::default()
+        .manage(WebdavState { cancel_flag })
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
@@ -182,7 +265,10 @@ pub fn run() {
             get_mount_dir,
             save_credentials,
             get_credentials,
-            delete_credentials
+            delete_credentials,
+            verify_webdav,
+            cancel_webdav_action,
+            run_webdav_action
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,8 +1,7 @@
 import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { createRcloneCommand, resolveRemoteUrl, resolveLocalPath, obscurePassword, ensureRcloneDetected } from "../utils/rclone";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { loadAppSettings } from "../settings";
-import { Child, TerminatedPayload } from "@tauri-apps/plugin-shell";
 
 export interface RcloneSettings {
   baseUrl: string;
@@ -29,7 +28,7 @@ function appendCapped(prev: string, addition: string): string {
 }
 
 /**
- * Loads rclone target WebDAV settings from the single settings module.
+ * Loads target WebDAV settings from the single settings module.
  */
 export async function loadSettings(): Promise<RcloneSettings> {
   const s = await loadAppSettings();
@@ -41,71 +40,19 @@ export async function loadSettings(): Promise<RcloneSettings> {
   };
 }
 
-/**
- * Builds the arguments list for launching the rclone subprocess.
- */
-export function buildActionArgs(
-  action: RcloneActionType,
-  localPath: string,
-  remoteUrl: string,
-  username?: string
-): string[] {
-  let args: string[] = [];
-  switch (action) {
-    case 'put':
-      args = ["copy", localPath, ":webdav:"];
-      break;
-    case 'put-dry':
-      args = ["copy", localPath, ":webdav:", "--dry-run"];
-      break;
-    case 'put-checksum':
-      args = ["copy", localPath, ":webdav:", "--checksum"];
-      break;
-    case 'get':
-      args = ["copy", ":webdav:", localPath];
-      break;
-    case 'get-dry':
-      args = ["copy", ":webdav:", localPath, "--dry-run"];
-      break;
-    case 'get-checksum':
-      args = ["copy", ":webdav:", localPath, "--checksum"];
-      break;
-    case 'ls':
-      args = ["ls", ":webdav:"];
-      break;
-    case 'lsd':
-      args = ["lsd", ":webdav:"];
-      break;
-    case 'check':
-      args = ["check", localPath, ":webdav:"];
-      break;
-    case 'sync':
-      args = ["sync", localPath, ":webdav:"];
-      break;
-  }
-  args.push("-v");
-  args.push(`--webdav-url=${remoteUrl}`);
-  args.push("--webdav-vendor=other");
-  if (username) {
-    args.push(`--webdav-user=${username}`);
-  }
-  return args;
-}
-
 export function useRcloneExecution(
   onLog: (text: string | ((prev: string) => string)) => void,
   isRunning: boolean,
   setIsRunning: (running: boolean) => void
 ) {
-  const activeChildRef = useRef<Child | null>(null);
-  // Synchronous guard: refs update immediately, unlike state (fixes double-spawn race).
   const runningRef = useRef(false);
+  const unlistenRef = useRef<UnlistenFn | null>(null);
 
   useEffect(() => {
     return () => {
-      if (activeChildRef.current) {
-        activeChildRef.current.kill().catch(console.error);
-        activeChildRef.current = null;
+      if (unlistenRef.current) {
+        unlistenRef.current();
+        unlistenRef.current = null;
       }
       runningRef.current = false;
     };
@@ -117,7 +64,6 @@ export function useRcloneExecution(
     } else {
       onLog((prev) => {
         const next = addition(prev);
-        // `addition` callbacks in this file always append; cap defensively.
         if (next.length > prev.length && next.startsWith(prev)) {
           return appendCapped("", next);
         }
@@ -127,25 +73,21 @@ export function useRcloneExecution(
   };
 
   const finishRun = (onDone?: (code: number | null) => void, code: number | null = null) => {
-    activeChildRef.current = null;
+    if (unlistenRef.current) {
+      unlistenRef.current();
+      unlistenRef.current = null;
+    }
     runningRef.current = false;
     setIsRunning(false);
     onDone?.(code);
   };
 
   const cancelCommand = async () => {
-    if (activeChildRef.current) {
-      log((prev) => prev + "\nCanceling active operation...\n");
-      const child = activeChildRef.current;
-      activeChildRef.current = null;
-      try {
-        await child.kill();
-        log((prev) => prev + "Operation canceled by user.\n");
-      } catch (e) {
-        log((prev) => prev + `Failed to cancel operation: ${e}\n`);
-      }
-      runningRef.current = false;
-      setIsRunning(false);
+    log((prev) => prev + "\nCanceling active operation...\n");
+    try {
+      await invoke("cancel_webdav_action");
+    } catch (e) {
+      log((prev) => prev + `Failed to cancel operation: ${e}\n`);
     }
   };
 
@@ -156,15 +98,6 @@ export function useRcloneExecution(
     log("Loading configuration...\n");
 
     try {
-      // Await sidecar detection on the run path (no stale-default race).
-      try {
-        await ensureRcloneDetected();
-      } catch (e) {
-        log(`Error: rclone is unavailable: ${e}\n`);
-        finishRun(opts?.onDone, null);
-        return;
-      }
-
       const settings = await loadSettings();
       if (!settings.baseUrl) {
         log("Error: WebDAV URL must be configured.\n");
@@ -178,88 +111,32 @@ export function useRcloneExecution(
         return;
       }
 
-      let password = "";
-      if (settings.username) {
-        // Retrieve password securely from the OS keyring — fail closed.
-        log("Retrieving password from secure keyring...\n");
-        try {
-          password = await invoke<string>("get_credentials", { username: settings.username });
-        } catch (e) {
-          log(`Error: Could not retrieve credentials from keyring: ${e}. Aborting (will not run unauthenticated).\n`);
-          finishRun(opts?.onDone, null);
-          return;
-        }
-      } else {
-        log("No username configured. Proceeding without credentials.\n");
-      }
-
-      // Obscure password because rclone expects obscured passwords for on-the-fly config.
-      // Fail closed: never silently proceed unauthenticated after an obscure failure.
-      let obscuredPassword = "";
-      if (password) {
-        log("Obscuring password...\n");
-        try {
-          obscuredPassword = await obscurePassword(password);
-        } catch (e) {
-          log(`Error: Failed to obscure password: ${e}. Aborting (will not run unauthenticated).\n`);
-          finishRun(opts?.onDone, null);
-          return;
-        }
-      }
-
-      const resolvedMountDir = await invoke<string>("get_mount_dir", {
-        targetSubdir: settings.targetSubdir || undefined,
-      });
-
-      let remoteUrl: string;
-      let localPath: string;
-      try {
-        remoteUrl = resolveRemoteUrl(settings.baseUrl, settings.selectedSubdir);
-        localPath = resolveLocalPath(resolvedMountDir, settings.selectedSubdir);
-      } catch (e) {
-        log(`Error: Invalid path configuration: ${e}\n`);
-        finishRun(opts?.onDone, null);
-        return;
-      }
-
       log(
         (prev) =>
           prev +
           `Selected Subdirectory: ${settings.selectedSubdir}\n` +
-          `Local Path: ${localPath}\n` +
-          `Remote URL: ${remoteUrl}\n\n` +
-          `Running command...\n`
+          `Running native WebDAV ${action}...\n\n`
       );
 
-      const args = buildActionArgs(action, localPath, remoteUrl, settings.username || undefined);
-      // Sanitized echo: action + paths only, never credentials.
-      log(`rclone ${action}: local ↔ remote sync operation (see paths above)\n\n`);
+      // Listen for backend WebDAV logs
+      const unlisten = await listen<string>("webdav-log", (event) => {
+        log(event.payload);
+      });
+      unlistenRef.current = unlisten;
 
-      const env = obscuredPassword ? { RCLONE_WEBDAV_PASS: obscuredPassword } : undefined;
-      const rcloneCmd = createRcloneCommand(args, env);
-
-      const dataHandler = (data: string) => {
-        log(data);
-      };
-
-      rcloneCmd.stdout.on("data", dataHandler);
-      rcloneCmd.stderr.on("data", dataHandler);
-
-      rcloneCmd.on("close", (data: TerminatedPayload) => {
-        log(`\nCommand finished with exit code ${data.code}.\n`);
-        finishRun(opts?.onDone, data.code);
+      await invoke("run_webdav_action", {
+        action,
+        baseUrl: settings.baseUrl,
+        subdir: settings.selectedSubdir,
+        targetSubdir: settings.targetSubdir || undefined,
+        username: settings.username || undefined,
       });
 
-      rcloneCmd.on("error", (error: string) => {
-        log(`\nCommand error: ${error}\n`);
-        finishRun(opts?.onDone, null);
-      });
-
-      const child = await rcloneCmd.spawn();
-      activeChildRef.current = child;
-    } catch (e) {
-      log(`System Error: ${e}\n`);
-      finishRun(opts?.onDone, null);
+      log(`\nWebDAV operation finished successfully.\n`);
+      finishRun(opts?.onDone, 0);
+    } catch (e: any) {
+      log(`\nWebDAV Error: ${e?.message || e}\n`);
+      finishRun(opts?.onDone, 1);
     }
   };
 
