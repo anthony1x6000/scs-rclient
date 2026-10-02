@@ -90,7 +90,7 @@ export function RcloneConsole({ logs, onClear }: RcloneConsoleProps) {
           {copied ? "Copied!" : "Copy"}
         </button>
       </div>
-      <label className="sr-only" htmlFor="scs-console">Rclone output</label>
+      <label className="sr-only" htmlFor="scs-console">WebDAV console output</label>
       <div ref={wrapRef} className="relative flex-1 min-h-0 flex flex-col overflow-hidden px-2 pb-1">
         {/* top fade */}
         <div
@@ -103,7 +103,7 @@ export function RcloneConsole({ logs, onClear }: RcloneConsoleProps) {
           readOnly
           value={logs}
           onScroll={handleScroll}
-          placeholder="Click a command above to run and view output..."
+          placeholder="Click an action above to run and view output..."
           wrap="off"
           className="w-full flex-1 min-h-0 p-2 font-mono text-xs bg-black/25 border border-white/10 outline-none no-scrollbar overflow-auto overscroll-contain resize-none"
         />
