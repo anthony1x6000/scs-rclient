@@ -109,6 +109,10 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
   };
 
   const handleConcurrencyBlur = () => {
+    if (concurrencyDebounceRef.current) {
+      clearTimeout(concurrencyDebounceRef.current);
+      concurrencyDebounceRef.current = null;
+    }
     const clamped = parseAndClampScanConcurrency(concurrencyDraft);
     const finalVal = clamped ?? DEFAULT_SCAN_CONCURRENCY;
     setConcurrencyDraft(String(finalVal));

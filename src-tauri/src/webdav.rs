@@ -15,6 +15,15 @@ pub const MAX_SCAN_CONCURRENCY: usize = 64;
 /// while bounding memory usage and avoiding infinite traversal cycles.
 pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
 
+// Static compile-time assertion verifying that rustydav::client::Client implements Send + Sync
+// and can safely be shared across concurrent scanning worker threads.
+// Note: rustydav::client::Client internally wraps reqwest::blocking::Client, which maintains
+// an Arc-backed connection pool designed for concurrent multi-threaded usage.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<rustydav::client::Client>();
+};
+
 /// Returns the concurrency limit for remote WebDAV folder scanning.
 pub fn get_scan_concurrency() -> usize {
     std::env::var("WEBDAV_SCAN_CONCURRENCY")
@@ -85,13 +94,52 @@ impl Default for WebdavItem {
     }
 }
 
+/// Returns true if a path or href contains directory traversal sequences or forbidden characters.
+/// Allows legitimate hidden files (e.g. `.gitignore`, `.env`, `.github`) while strictly blocking
+/// directory traversal attacks (`..`, `../`, `..\`, `/..`, `\..`, `%2e%2e`).
+pub fn has_traversal_sequence(s: &str) -> bool {
+    if s.contains('\\') || s.contains('\0') || s.contains('\r') || s.contains('\n') {
+        return true;
+    }
+    if s == ".." || s.starts_with("../") || s.ends_with("/..") || s.contains("/../") {
+        return true;
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("%2e%2e") || lower.contains("%2f..") || lower.contains("..%2f") {
+        return true;
+    }
+    for part in s.split('/') {
+        if part.trim() == ".." {
+            return true;
+        }
+    }
+    false
+}
+
+/// Computes a normalized cache key partitioned by authenticated credential context.
+///
+/// Multi-Account Isolation:
+/// Cache keys include the authenticated username when available (`username@clean_url`) to prevent
+/// cache collisions across different user credentials accessing the same WebDAV host (CWE-287 / CWE-384).
+pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
+    let clean_url = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    match auth_user {
+        Some(user) if !user.trim().is_empty() => {
+            format!("{}@{}", user.trim().to_ascii_lowercase(), clean_url)
+        }
+        _ => clean_url,
+    }
+}
+
 /// Represents a cached remote WebDAV directory listing.
-/// Note: Cached listings are keyed by normalized remote collection URL.
-/// If switching credentials or access permissions for the same URL, invoke `clear_remote_cache()`
-/// or click the 'Clear Cache' button under Settings to invalidate prior cached listings.
+/// Note: Cached listings are keyed by normalized collection URL and authenticated user.
+/// If switching credentials or access permissions for the same URL, listings are safely partitioned,
+/// or invoke `clear_remote_cache()` / click 'Clear Cache' under Settings to invalidate prior cached listings.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CachedRemoteListing {
     pub remote_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_user: Option<String>,
     pub timestamp: u64,
     pub items: Vec<WebdavItem>,
 }
@@ -253,11 +301,16 @@ fn write_cache_map(path: &Path, cache: &HashMap<String, CachedRemoteListing>) {
     }
 }
 
-/// Loads cached remote items for remote_url if valid and not expired.
-pub fn load_remote_cache(remote_url: &str) -> Option<Vec<WebdavItem>> {
+/// Loads cached remote items for remote_url and auth_user if valid and not expired.
+///
+/// Security:
+/// - Validates that hrefs and relative paths do not contain directory traversal sequences (`has_traversal_sequence`).
+/// - Legitimate hidden files (e.g. `.gitignore`, `.env`) are preserved.
+/// - Does not rely on rigid prefix matching, correctly supporting root-relative hrefs returned by WebDAV servers.
+pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Vec<WebdavItem>> {
     let path = get_cache_file_path()?;
     let cache = read_cache_map(&path);
-    let key = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    let key = cache_key(remote_url, auth_user);
     let entry = cache.get(&key)?;
 
     let ttl = get_cache_ttl_secs();
@@ -273,15 +326,11 @@ pub fn load_remote_cache(remote_url: &str) -> Option<Vec<WebdavItem>> {
 
     let mut valid_items = Vec::with_capacity(entry.items.len());
     for item in &entry.items {
-        if item.href.contains("../") || item.href.contains("..\\") || item.href.contains('\\') {
+        if has_traversal_sequence(&item.href) {
             continue;
         }
         let rel = relative_item_path(remote_url, &item.href);
-        if !rel.is_empty() && !is_safe_relative_path(&rel) {
-            continue;
-        }
-        let item_lower = item.href.to_ascii_lowercase();
-        if !item_lower.starts_with(&key) {
+        if has_traversal_sequence(&rel) {
             continue;
         }
         valid_items.push(item.clone());
@@ -290,13 +339,11 @@ pub fn load_remote_cache(remote_url: &str) -> Option<Vec<WebdavItem>> {
     Some(valid_items)
 }
 
-/// Saves remote items to the local cache file for remote_url.
+/// Saves remote items to the local cache file for remote_url and auth_user.
 ///
-/// Filters out any item with an unsafe relative path or traversal sequence to prevent cache poisoning.
-/// Note: Cached listings are keyed by normalized remote collection URL.
-/// If switching credentials or access permissions for the same URL, invoke `clear_remote_cache()`
-/// or click the 'Clear Cache' button under Settings to invalidate prior cached listings.
-pub fn save_remote_cache(remote_url: &str, items: &[WebdavItem]) {
+/// Filters out any item with traversal sequences (`has_traversal_sequence`) to prevent cache poisoning.
+/// Cached listings are keyed by normalized collection URL and authenticated user.
+pub fn save_remote_cache(remote_url: &str, auth_user: Option<&str>, items: &[WebdavItem]) {
     let path = match get_cache_file_path() {
         Some(p) => p,
         None => return,
@@ -310,20 +357,22 @@ pub fn save_remote_cache(remote_url: &str, items: &[WebdavItem]) {
 
     let mut safe_items = Vec::with_capacity(items.len());
     for item in items {
-        if item.href.contains("../") || item.href.contains("..\\") || item.href.contains('\\') {
+        if has_traversal_sequence(&item.href) {
             continue;
         }
         let rel = relative_item_path(remote_url, &item.href);
-        if rel.is_empty() || is_safe_relative_path(&rel) {
-            safe_items.push(item.clone());
+        if has_traversal_sequence(&rel) {
+            continue;
         }
+        safe_items.push(item.clone());
     }
 
-    let key = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    let key = cache_key(remote_url, auth_user);
     cache.insert(
         key,
         CachedRemoteListing {
             remote_url: remote_url.to_string(),
+            auth_user: auth_user.map(|u| u.trim().to_ascii_lowercase()),
             timestamp: now,
             items: safe_items,
         },
@@ -335,11 +384,12 @@ pub fn save_remote_cache(remote_url: &str, items: &[WebdavItem]) {
 /// Updates or inserts an item in the remote cache after upload.
 pub fn update_remote_cache_item(
     remote_url: &str,
+    auth_user: Option<&str>,
     rel_path: &str,
     new_size: u64,
     new_mtime: Option<u64>,
 ) {
-    if !is_safe_relative_path(rel_path) {
+    if rel_path.is_empty() || has_traversal_sequence(rel_path) || rel_path.starts_with('/') {
         return;
     }
     let path = match get_cache_file_path() {
@@ -351,7 +401,7 @@ pub fn update_remote_cache_item(
         return;
     }
 
-    let key = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    let key = cache_key(remote_url, auth_user);
     if let Some(entry) = cache.get_mut(&key) {
         let expected_url = build_file_url(remote_url, rel_path);
         let mut found = false;
@@ -377,8 +427,8 @@ pub fn update_remote_cache_item(
 }
 
 /// Removes an item from the remote cache after deletion.
-pub fn remove_remote_cache_item(remote_url: &str, rel_path: &str) {
-    if !is_safe_relative_path(rel_path) {
+pub fn remove_remote_cache_item(remote_url: &str, auth_user: Option<&str>, rel_path: &str) {
+    if rel_path.is_empty() || has_traversal_sequence(rel_path) || rel_path.starts_with('/') {
         return;
     }
     let path = match get_cache_file_path() {
@@ -390,7 +440,7 @@ pub fn remove_remote_cache_item(remote_url: &str, rel_path: &str) {
         return;
     }
 
-    let key = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    let key = cache_key(remote_url, auth_user);
     if let Some(entry) = cache.get_mut(&key) {
         let expected_url = build_file_url(remote_url, rel_path);
         entry.items.retain(|item| {
@@ -933,15 +983,24 @@ pub fn list_remote_recursive_with_log<F>(
 where
     F: FnMut(&str),
 {
-    list_remote_recursive_with_concurrency_and_log(client, remote_url, cancel_flag, None, log)
+    list_remote_recursive_with_concurrency_and_log(client, remote_url, cancel_flag, None, None, log)
 }
 
 /// Recursively lists remote WebDAV items under remote_url with configurable worker concurrency and streamed diagnostic logs.
+///
+/// Thread Safety:
+/// `rustydav::client::Client` implements `Send + Sync` (internally backed by `reqwest::blocking::Client` connection pool)
+/// allowing concurrent Depth: 1 requests across worker threads.
+///
+/// Parameters:
+/// - `concurrency`: Worker thread count (1..64). If `None`, defaults to `get_scan_concurrency()`.
+/// - `auth_user`: Optional username for credential-scoped cache partitioning (CWE-287 / CWE-384).
 pub fn list_remote_recursive_with_concurrency_and_log<F>(
     client: &rustydav::client::Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
     concurrency: Option<usize>,
+    auth_user: Option<&str>,
     mut log: F,
 ) -> Result<Vec<WebdavItem>, String>
 where
@@ -953,7 +1012,7 @@ where
     }
 
     if is_cache_enabled() {
-        if let Some(cached_items) = load_remote_cache(remote_url) {
+        if let Some(cached_items) = load_remote_cache(remote_url, auth_user) {
             log(&format!(
                 "Loaded {} item(s) from remote listing cache for {}.\n",
                 cached_items.len(),
@@ -985,7 +1044,7 @@ where
                         child_count
                     ));
                     if is_cache_enabled() {
-                        save_remote_cache(remote_url, &items);
+                        save_remote_cache(remote_url, auth_user, &items);
                     }
                     return Ok(items);
                 } else {
@@ -1048,6 +1107,7 @@ where
             let mut state = match state_ref.lock() {
                 Ok(s) => s,
                 Err(poisoned) => {
+                    eprintln!("[webdav scan] Mutex poisoned on lock; recovering state.");
                     let s = poisoned.into_inner();
                     if s.stopped || s.error.is_some() {
                         return None;
@@ -1083,6 +1143,7 @@ where
                 match res {
                     Ok((new_state, _)) => state = new_state,
                     Err(poisoned) => {
+                        eprintln!("[webdav scan] Mutex poisoned during worker wait; recovering state.");
                         let (new_state, _) = poisoned.into_inner();
                         if new_state.stopped || new_state.error.is_some() {
                             return None;
@@ -1090,13 +1151,25 @@ where
                         state = new_state;
                     }
                 }
+                // Check cancellation and stopped state immediately after reacquiring lock from wait
+                if cancel_flag.load(Ordering::SeqCst) {
+                    state.stopped = true;
+                    cvar_ref.notify_all();
+                    return None;
+                }
+                if state.stopped || state.error.is_some() {
+                    return None;
+                }
             }
         }
     }
 
     impl<'a> Drop for WorkerGuard<'a> {
         fn drop(&mut self) {
-            let mut state = self.state_ref.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self.state_ref.lock().unwrap_or_else(|p| {
+                eprintln!("[webdav scan] Mutex poisoned during worker drop; recovering state.");
+                p.into_inner()
+            });
             state.active_workers = state.active_workers.saturating_sub(1);
             if std::thread::panicking() {
                 state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
@@ -1311,7 +1384,7 @@ where
     state.all_items.sort_by(|a, b| a.href.cmp(&b.href));
 
     if is_cache_enabled() {
-        save_remote_cache(remote_url, &state.all_items);
+        save_remote_cache(remote_url, auth_user, &state.all_items);
     }
 
     let file_count = state.all_items.iter().filter(|i| !i.is_dir).count();
@@ -1460,10 +1533,10 @@ pub fn execute_webdav_action<F>(
 where
     F: FnMut(&str),
 {
-    execute_webdav_action_with_options(client, action, remote_url, local_dir, cancel_flag, None, log)
+    execute_webdav_action_with_options(client, action, remote_url, local_dir, cancel_flag, None, None, log)
 }
 
-/// Executes a native WebDAV action with custom options (such as scan concurrency) and streams logs.
+/// Executes a native WebDAV action with custom options (such as scan concurrency and auth context) and streams logs.
 pub fn execute_webdav_action_with_options<F>(
     client: &rustydav::client::Client,
     action: &str,
@@ -1471,6 +1544,7 @@ pub fn execute_webdav_action_with_options<F>(
     local_dir: &Path,
     cancel_flag: &AtomicBool,
     concurrency: Option<usize>,
+    auth_user: Option<&str>,
     mut log: F,
 ) -> Result<(), String>
 where
@@ -1481,7 +1555,7 @@ where
         "ls" => {
             log(&format!("Listing remote files in {}...\n", remote_url));
             let items = list_remote_recursive_with_concurrency_and_log(
-                client, remote_url, cancel_flag, concurrency, &mut log,
+                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
             )?;
             let mut count = 0;
             let mut total_size = 0;
@@ -1544,7 +1618,7 @@ where
                 remote_url
             ));
             let remote_items = list_remote_recursive_with_concurrency_and_log(
-                client, remote_url, cancel_flag, concurrency, &mut log,
+                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
             )?;
             let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
             for item in remote_items {
@@ -1653,7 +1727,7 @@ where
                         let mtime = std::fs::metadata(&path)
                             .ok()
                             .and_then(|m| get_metadata_mtime(&m));
-                        update_remote_cache_item(remote_url, &rel_str, size, mtime);
+                        update_remote_cache_item(remote_url, auth_user, &rel_str, size, mtime);
                     }
                     log(&format!(
                         "[{}/{}] Copied: {} ({} bytes){}\n",
@@ -1677,7 +1751,7 @@ where
             let with_checksum = action == "get-checksum";
             log(&format!("Listing remote files in {}...\n", remote_url));
             let items = list_remote_recursive_with_concurrency_and_log(
-                client, remote_url, cancel_flag, concurrency, &mut log,
+                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
             )?;
             let files_to_download: Vec<(&WebdavItem, String)> = items
                 .iter()
@@ -1826,7 +1900,7 @@ where
         "check" => {
             log(&format!("Comparing local files with remote in {}...\n", remote_url));
             let remote_items = list_remote_recursive_with_concurrency_and_log(
-                client, remote_url, cancel_flag, concurrency, &mut log,
+                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
             )?;
             let mut remote_map: HashMap<String, u64> = HashMap::new();
             for item in remote_items {
@@ -1881,7 +1955,7 @@ where
 
             log(&format!("Querying remote files in {} to detect changes...\n", remote_url));
             let remote_items = list_remote_recursive_with_concurrency_and_log(
-                client, remote_url, cancel_flag, concurrency, &mut log,
+                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
             )?;
             let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
             for item in &remote_items {
@@ -1953,7 +2027,7 @@ where
                         let mtime = std::fs::metadata(&path)
                             .ok()
                             .and_then(|m| get_metadata_mtime(&m));
-                        update_remote_cache_item(remote_url, &rel, size, mtime);
+                        update_remote_cache_item(remote_url, auth_user, &rel, size, mtime);
                     }
                     log(&format!("[{}/{}] Synced: {} ({} bytes)\n", current_num, total_to_upload, rel, size));
                     uploaded += 1;
@@ -1974,7 +2048,7 @@ where
                     let del_res = client.delete(&file_url);
                     if del_res.is_ok() {
                         if is_cache_enabled() {
-                            remove_remote_cache_item(remote_url, &rel);
+                            remove_remote_cache_item(remote_url, auth_user, &rel);
                         }
                         log(&format!("Deleted remote file not in local: {}\n", rel));
                         deleted += 1;
@@ -2413,39 +2487,64 @@ mod tests {
         std::env::set_var("WEBDAV_CACHE_FILE", &temp_cache);
 
         let test_url = "https://example.com/remote/files/";
+        let alice_user = Some("alice");
+        let bob_user = Some("bob");
+
         let items = vec![
             WebdavItem::new("https://example.com/remote/files/doc.pdf", false, 4096),
+            WebdavItem::new("https://example.com/remote/files/.gitignore", false, 128),
         ];
 
-        save_remote_cache(test_url, &items);
-        let loaded = load_remote_cache(test_url).expect("Cache should load saved items");
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].size, 4096);
+        // Save under alice
+        save_remote_cache(test_url, alice_user, &items);
+        let loaded_alice = load_remote_cache(test_url, alice_user).expect("Cache should load alice's items");
+        assert_eq!(loaded_alice.len(), 2);
+        assert_eq!(loaded_alice[0].size, 4096);
+        // Hidden files like .gitignore must be preserved
+        assert!(loaded_alice.iter().any(|i| i.href.ends_with(".gitignore")));
 
-        update_remote_cache_item(test_url, "doc.pdf", 8192, Some(12345678));
-        let updated = load_remote_cache(test_url).unwrap();
-        assert_eq!(updated[0].size, 8192);
-        assert_eq!(updated[0].mtime, Some(12345678));
+        // Multi-credential isolation: Bob querying the same URL should find NO cached items
+        let loaded_bob = load_remote_cache(test_url, bob_user);
+        assert!(loaded_bob.is_none(), "Bob should not see Alice's cached items");
 
-        remove_remote_cache_item(test_url, "doc.pdf");
-        let after_removal = load_remote_cache(test_url).unwrap();
-        assert_eq!(after_removal.len(), 0);
+        // Update item in alice's cache
+        update_remote_cache_item(test_url, alice_user, "doc.pdf", 8192, Some(12345678));
+        let updated = load_remote_cache(test_url, alice_user).unwrap();
+        let doc = updated.iter().find(|i| i.href.ends_with("doc.pdf")).unwrap();
+        assert_eq!(doc.size, 8192);
+        assert_eq!(doc.mtime, Some(12345678));
+
+        // Remove item from alice's cache
+        remove_remote_cache_item(test_url, alice_user, "doc.pdf");
+        let after_removal = load_remote_cache(test_url, alice_user).unwrap();
+        assert_eq!(after_removal.len(), 1);
+        assert!(after_removal[0].href.ends_with(".gitignore"));
 
         // Path traversal rejection in cache
         let malicious_items = vec![
             WebdavItem::new("https://example.com/remote/files/../../etc/passwd", false, 100),
+            WebdavItem::new("https://example.com/remote/files/%2e%2e/shadow", false, 100),
             WebdavItem::new("https://example.com/remote/files/valid.txt", false, 200),
         ];
-        save_remote_cache(test_url, &malicious_items);
-        let safe_loaded = load_remote_cache(test_url).unwrap();
+        save_remote_cache(test_url, alice_user, &malicious_items);
+        let safe_loaded = load_remote_cache(test_url, alice_user).unwrap();
         assert_eq!(safe_loaded.len(), 1);
         assert_eq!(safe_loaded[0].size, 200);
 
         // Invalid rel_path updates and removals are safely ignored
-        update_remote_cache_item(test_url, "../malicious", 500, None);
-        remove_remote_cache_item(test_url, "../malicious");
-        let still_safe = load_remote_cache(test_url).unwrap();
+        update_remote_cache_item(test_url, alice_user, "../malicious", 500, None);
+        remove_remote_cache_item(test_url, alice_user, "../malicious");
+        let still_safe = load_remote_cache(test_url, alice_user).unwrap();
         assert_eq!(still_safe.len(), 1);
+
+        // Verify traversal sequence helper
+        assert!(has_traversal_sequence("../secret"));
+        assert!(has_traversal_sequence("foo/../bar"));
+        assert!(has_traversal_sequence("foo/%2e%2e/bar"));
+        assert!(has_traversal_sequence("foo\\bar"));
+        assert!(!has_traversal_sequence(".gitignore"));
+        assert!(!has_traversal_sequence(".env"));
+        assert!(!has_traversal_sequence("subdir/.hidden_file"));
 
         clear_remote_cache().unwrap();
         assert!(!temp_cache.exists());

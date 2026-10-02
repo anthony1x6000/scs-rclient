@@ -1041,6 +1041,7 @@ fn test_concurrent_scanning_stress_1_to_64_threads() {
             &base_url,
             &cancel_flag,
             Some(threads),
+            Some("testuser"),
             |_| {},
         )
         .unwrap_or_else(|e| panic!("Concurrent scan failed with {} threads: {}", threads, e));
