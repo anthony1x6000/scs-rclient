@@ -555,6 +555,17 @@ fn test_live_copyparty_e2e_full_roundtrip() {
     assert!(remote_paths.contains("css/themes/dark/style.css"));
     assert!(remote_paths.contains(".gemini/settings.json"));
 
+    // Clean up remote files created in full roundtrip test
+    if let Ok(items) = list_remote_recursive(&client, &base_url, &cancel_flag) {
+        for item in items {
+            let rel = relative_item_path(&base_url, &item.href);
+            if !rel.is_empty() {
+                let file_url = resolve_item_url(&base_url, &item.href);
+                let _ = client.delete(&file_url);
+            }
+        }
+    }
+
     let _ = fs::remove_dir_all(&tmp_test_dir);
 }
 
