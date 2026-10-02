@@ -10,13 +10,8 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  # contents: write is the merge itself. actions: write re-fires the
-  # build/deploy workflows after it, because a GITHUB_TOKEN merge creates no push
-  # event for them to trigger on.
-  contents: write
+  contents: read
   pull-requests: write
-  actions: write
-  checks: read
 
 jobs:
   review:
@@ -26,7 +21,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     name: AI Code Review Agent
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
 
     steps:
       - name: Checkout Repository
@@ -34,28 +29,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Wait for Other PR Checks to Pass
-        id: wait-checks
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          # A gate that cannot open must end red. Exiting green with the review
-          # skipped reads as "ai reviewed and approved" on the checks list, which
-          # is a false signal; red is honest that no review was produced.
-          if node scripts/ai-code-review.mjs wait-checks; then
-            echo "passed=true" >> $GITHUB_OUTPUT
-          else
-            echo "passed=false" >> $GITHUB_OUTPUT
-            echo "::error title=ai review skipped::other PR checks did not pass, so no ai review was produced. the failing checks are listed above; fix or re-run them, then re-run this workflow."
-            exit 1
-          fi
-
       - name: Extract and Filter Source Diff
-        if: steps.wait-checks.outputs.passed == 'true'
         id: diff
         env:
           BASE_REF: ${{ github.base_ref || 'main' }}
@@ -114,7 +88,7 @@ jobs:
           fi
 
       - name: Post Comment When No Source Code Changes
-        if: steps.wait-checks.outputs.passed == 'true' && steps.diff.outputs.has_diff == 'false'
+        if: steps.diff.outputs.has_diff == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -125,13 +99,13 @@ jobs:
           fi
 
       - name: Prepare AI Review Payload
-        if: steps.wait-checks.outputs.passed == 'true' && steps.diff.outputs.has_diff == 'true'
+        if: steps.diff.outputs.has_diff == 'true'
         env:
           MAX_TOKENS: 16384
         run: node scripts/ai-code-review.mjs prepare-payload
 
       - name: Call AI Code Review Agent
-        if: steps.wait-checks.outputs.passed == 'true' && steps.diff.outputs.has_diff == 'true'
+        if: steps.diff.outputs.has_diff == 'true'
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_NIM_KEY }}
         run: |
@@ -159,72 +133,8 @@ jobs:
           fi
 
       - name: Post PR Review Comment and Verdict
-        if: steps.wait-checks.outputs.passed == 'true' && steps.diff.outputs.has_diff == 'true'
+        if: steps.diff.outputs.has_diff == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: node scripts/ai-code-review.mjs post-comment
-
-      # Closes the loop: an APPROVE verdict merges the PR. `success()` means the
-      # post-comment step exited 0, which now happens only on an explicit
-      # "verdict: APPROVE"; REQUEST CHANGES or a review with no verdict fails
-      # that step and skips this one. PRs whose filtered diff was empty never
-      # reach it either: the reviewer never saw those files, and unreviewed is
-      # not approved.
-      #
-      # GH_TOKEN is the dedicated agent PAT, not GITHUB_TOKEN, because a push
-      # event produced by GITHUB_TOKEN creates no workflow runs. Merging with
-      # GITHUB_TOKEN would therefore skip the per-app workflows that deploy on
-      # push to staging/main while the PR still reported a successful merge.
-      - name: Auto-Merge Approved PR
-        if: >-
-          success() &&
-          github.event_name == 'pull_request' &&
-          steps.diff.outputs.has_diff == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_REF: ${{ github.base_ref || 'main' }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
-        run: |
-          # Never merge a commit this review did not cover: a push that landed
-          # after the review started would otherwise ride in on the old verdict.
-          if ! CURRENT_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha); then
-            echo "::error title=auto-merge unavailable::the api did not return pr #$PR_NUMBER."
-            exit 1
-          fi
-
-          if [ "$CURRENT_HEAD" != "$HEAD_SHA" ]; then
-            echo "::warning title=auto-merge skipped::pr head moved to $CURRENT_HEAD, past the reviewed $HEAD_SHA. that commit gets its own review, so the merge is left to it."
-            exit 0
-          fi
-
-          # `gh pr checks --watch` cannot run in this job: it would watch this
-          # run's own in-progress check until the timeout. wait-checks skips
-          # ai review runs instead and exits non-zero if any sibling check on
-          # this sha did not pass, so a re-run that went red still blocks.
-          WAIT_FOR_SECURITY=true node scripts/ai-code-review.mjs wait-checks
-
-          gh pr merge "$PR_NUMBER" --squash
-          echo "merged pr #$PR_NUMBER on ai review verdict: APPROVE."
-
-          # That merge used GITHUB_TOKEN, and a push event it produces creates no
-          # workflow runs, so the build/deploy workflow that runs on push to
-          # main would never fire and the merge would land unbuilt/undeployed.
-          # workflow_dispatch is exempt from that suppression, so re-fire the
-          # workflows whose path filters match this PR.
-          if ! CHANGED=$(git diff --name-only "origin/$BASE_REF...HEAD"); then
-            echo "::error title=deploy dispatch failed::pr merged, but the changed files could not be read, so the deploy was not re-fired. re-run them on $BASE_REF by hand."
-            exit 1
-          fi
-
-          fire_deploy() {
-            if grep -qE "$2" <<<"$CHANGED"; then
-              echo "changes match $1; re-firing its deploy on $BASE_REF."
-              gh workflow run "$1" --ref "$BASE_REF"
-            fi
-          }
-
-          fire_deploy tauri-build.yml '.*'

@@ -359,6 +359,127 @@ function postComment() {
   process.exit(1);
 }
 
+async function checkAndMerge() {
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  const repo = process.env.REPO || process.env.GITHUB_REPOSITORY;
+  const prNumber = process.env.PR_NUMBER;
+  const headSha = process.env.HEAD_SHA;
+  const baseRef = process.env.BASE_REF || "main";
+
+  if (!token || !repo || !prNumber || !headSha) {
+    console.error("missing required environment variables (GITHUB_TOKEN, REPO, PR_NUMBER, HEAD_SHA).");
+    process.exit(1);
+  }
+
+  console.log(`evaluating auto-merge criteria for PR #${prNumber} on ${repo} at commit ${headSha}...`);
+
+  // 1. Verify PR head commit matches HEAD_SHA
+  let pr;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "scs-rclient-auto-merge"
+      }
+    });
+    if (!res.ok) {
+      console.error(`failed to fetch PR #${prNumber}: HTTP ${res.status}`);
+      process.exit(1);
+    }
+    pr = await res.json();
+  } catch (err) {
+    console.error("error fetching PR:", err.message);
+    process.exit(1);
+  }
+
+  if (pr.head.sha !== headSha) {
+    console.log(`PR head sha moved (${pr.head.sha} != ${headSha}). Skipping merge.`);
+    process.exit(0);
+  }
+
+  // 2. Query check runs for headSha
+  let checkRuns = [];
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "scs-rclient-auto-merge"
+      }
+    });
+    if (!res.ok) {
+      console.error(`failed to fetch check-runs: HTTP ${res.status}`);
+      process.exit(1);
+    }
+    const body = await res.json();
+    checkRuns = body.check_runs || [];
+  } catch (err) {
+    console.error("error fetching check runs:", err.message);
+    process.exit(1);
+  }
+
+  // 3. Find AI Code Review and AI Security Review checks
+  const codeReviewCheck = checkRuns.find((r) => {
+    const name = (r.name || "").toLowerCase();
+    return name.includes("ai code review") || name.includes("ai-code-review");
+  });
+  const securityReviewCheck = checkRuns.find((r) => {
+    const name = (r.name || "").toLowerCase();
+    return name.includes("ai security review") || name.includes("ai-security-review");
+  });
+
+  if (!codeReviewCheck) {
+    console.log("AI Code Review check not found. Skipping auto-merge.");
+    process.exit(0);
+  }
+  if (codeReviewCheck.status !== "completed" || codeReviewCheck.conclusion !== "success") {
+    console.log(`AI Code Review check not approved (status: ${codeReviewCheck.status}, conclusion: ${codeReviewCheck.conclusion}). Skipping auto-merge.`);
+    process.exit(0);
+  }
+
+  if (!securityReviewCheck) {
+    console.log("AI Security Review check not found. Skipping auto-merge.");
+    process.exit(0);
+  }
+  if (securityReviewCheck.status !== "completed" || securityReviewCheck.conclusion !== "success") {
+    console.log(`AI Security Review check not approved (status: ${securityReviewCheck.status}, conclusion: ${securityReviewCheck.conclusion}). Skipping auto-merge.`);
+    process.exit(0);
+  }
+
+  // 4. Verify no failed checks on this commit
+  const failedChecks = checkRuns.filter((r) =>
+    r.status === "completed" && ["failure", "timed_out", "cancelled", "action_required"].includes(r.conclusion)
+  );
+  if (failedChecks.length > 0) {
+    console.log(`Other checks failed on commit: ${failedChecks.map((c) => `${c.name} (${c.conclusion})`).join(", ")}. Skipping auto-merge.`);
+    process.exit(0);
+  }
+
+  const inProgressChecks = checkRuns.filter((r) => {
+    const name = (r.name || "").toLowerCase();
+    if (name.includes("auto-merge")) return false;
+    return r.status !== "completed";
+  });
+  if (inProgressChecks.length > 0) {
+    console.log(`Checks still in progress: ${inProgressChecks.map((c) => c.name).join(", ")}. Skipping auto-merge.`);
+    process.exit(0);
+  }
+
+  // 5. Merge PR
+  console.log(`all criteria satisfied (builds, tests, AI code review, and AI security review passed). Merging PR #${prNumber}...`);
+  execSync(`gh pr merge "${prNumber}" --squash`, { stdio: "inherit" });
+  console.log(`successfully merged PR #${prNumber}.`);
+
+  // 6. Trigger deploy/build workflow on baseRef
+  try {
+    execSync(`gh workflow run tauri-build.yml --ref "${baseRef}"`, { stdio: "inherit" });
+    console.log(`re-fired tauri-build.yml on ${baseRef}.`);
+  } catch (deployErr) {
+    console.warn("warning: failed to re-fire tauri-build.yml:", deployErr.message);
+  }
+}
+
 if (action === "wait-checks") {
   waitChecks().catch((err) => {
     console.error("fatal in waitChecks:", err);
@@ -368,7 +489,13 @@ if (action === "wait-checks") {
   preparePayload();
 } else if (action === "post-comment") {
   postComment();
+} else if (action === "check-and-merge") {
+  checkAndMerge().catch((err) => {
+    console.error("fatal in checkAndMerge:", err);
+    process.exit(1);
+  });
 } else {
-  console.error("unknown action. Use: wait-checks, prepare-payload, or post-comment.");
+  console.error("unknown action. Use: wait-checks, prepare-payload, post-comment, or check-and-merge.");
   process.exit(1);
 }
+

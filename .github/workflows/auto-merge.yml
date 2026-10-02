@@ -1,0 +1,41 @@
+name: Auto-Merge
+
+on:
+  workflow_run:
+    workflows: ["Tauri Build"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to merge"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  checks: read
+
+jobs:
+  auto-merge:
+    name: Auto-Merge Approved PR
+    if: >-
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.pull_requests[0] != null)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Check Checks and Merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number || inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          BASE_REF: ${{ github.event.workflow_run.pull_requests[0].base.ref || 'main' }}
+        run: node scripts/ai-code-review.mjs check-and-merge
