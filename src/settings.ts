@@ -9,7 +9,12 @@ export const STORE_KEYS = {
   targetSubdir: "target_subdirectory",
   legacyTestSubdir: "test_subdirectory",
   subdirectories: "subdirectories",
+  scanConcurrency: "scan_concurrency",
 } as const;
+
+export const DEFAULT_SCAN_CONCURRENCY = 6;
+export const MIN_SCAN_CONCURRENCY = 1;
+export const MAX_SCAN_CONCURRENCY = 16;
 
 interface WrappedValue<T> {
   value: T;
@@ -104,18 +109,33 @@ export async function setSubdirectories(items: string[]): Promise<void> {
   await setWrapped(STORE_KEYS.subdirectories, items);
 }
 
+export async function getScanConcurrency(): Promise<number> {
+  const val = await getWrapped<number>(STORE_KEYS.scanConcurrency);
+  if (typeof val === "number" && !isNaN(val)) {
+    return Math.min(Math.max(Math.round(val), MIN_SCAN_CONCURRENCY), MAX_SCAN_CONCURRENCY);
+  }
+  return DEFAULT_SCAN_CONCURRENCY;
+}
+
+export async function setScanConcurrency(threads: number): Promise<void> {
+  const clamped = Math.min(Math.max(Math.round(threads), MIN_SCAN_CONCURRENCY), MAX_SCAN_CONCURRENCY);
+  await setWrapped(STORE_KEYS.scanConcurrency, clamped);
+}
+
 /** Load the independent settings reads in parallel (no sequential waterfall). */
 export async function loadAppSettings(): Promise<{
   baseUrl: string;
   selectedSubdir: string;
   targetSubdir: string;
   username: string;
+  scanConcurrency: number;
 }> {
-  const [baseUrl, selectedSubdir, targetSubdir, username] = await Promise.all([
+  const [baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency] = await Promise.all([
     getWebDAVBase(),
     getSelectedSubdir(),
     getTargetSubdir(),
     getSavedUsername(),
+    getScanConcurrency(),
   ]);
-  return { baseUrl, selectedSubdir, targetSubdir, username };
+  return { baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency };
 }

@@ -1,5 +1,12 @@
 import { useState, useEffect, useRef } from "react";
-import { setTargetSubdir } from "../settings";
+import {
+  setTargetSubdir,
+  getScanConcurrency,
+  setScanConcurrency,
+  DEFAULT_SCAN_CONCURRENCY,
+  MIN_SCAN_CONCURRENCY,
+  MAX_SCAN_CONCURRENCY,
+} from "../settings";
 import TextInput from "./TextInput";
 
 interface SettingsViewProps {
@@ -10,10 +17,23 @@ interface SettingsViewProps {
 
 function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsViewProps) {
   const [draft, setDraft] = useState<string>(targetSubdir);
+  const [concurrencyDraft, setConcurrencyDraft] = useState<number | string>(DEFAULT_SCAN_CONCURRENCY);
   const [savedIndicator, setSavedIndicator] = useState<string>("");
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const concurrencyDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onChangeRef = useRef(onTargetSubdirChange);
   onChangeRef.current = onTargetSubdirChange;
+
+  // Load stored scan concurrency on mount
+  useEffect(() => {
+    let active = true;
+    getScanConcurrency().then((c) => {
+      if (active) setConcurrencyDraft(c);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Sync from parent only when the parent value changes externally.
   useEffect(() => {
@@ -23,6 +43,7 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
   useEffect(() => {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (concurrencyDebounceRef.current) clearTimeout(concurrencyDebounceRef.current);
     };
   }, []);
 
@@ -46,6 +67,17 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
     }
   };
 
+  const persistConcurrency = async (threads: number) => {
+    setSavedIndicator("Saving…");
+    try {
+      await setScanConcurrency(threads);
+      setSavedIndicator("Saved.");
+    } catch (e) {
+      console.error("Failed to save scan concurrency setting:", e);
+      setSavedIndicator("Save failed.");
+    }
+  };
+
   const handleChange = (newVal: string) => {
     setDraft(newVal);
     setSavedIndicator("");
@@ -53,27 +85,57 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
     debounceRef.current = setTimeout(() => void persist(newVal.trim()), 400);
   };
 
+  const handleConcurrencyChange = (raw: string) => {
+    setConcurrencyDraft(raw);
+    const parsed = parseInt(raw, 10);
+    if (!isNaN(parsed)) {
+      setSavedIndicator("");
+      if (concurrencyDebounceRef.current) clearTimeout(concurrencyDebounceRef.current);
+      concurrencyDebounceRef.current = setTimeout(() => void persistConcurrency(parsed), 400);
+    }
+  };
+
   return (
-    <div role="dialog" aria-label="Settings">
-      <label className="sr-only" htmlFor="scs-target-subdir">Mount root subdirectory</label>
-      <TextInput
-        id="scs-target-subdir"
-        type="text"
-        value={draft}
-        onChange={(e) => handleChange(e.target.value)}
-        placeholder="Mount root subdirectory..."
-        className="w-[80%]"
-      />
+    <div role="dialog" aria-label="Settings" className="flex items-center gap-2 w-full">
+      <div className="flex-1 min-w-0">
+        <label className="sr-only" htmlFor="scs-target-subdir">Mount root subdirectory</label>
+        <TextInput
+          id="scs-target-subdir"
+          type="text"
+          value={draft}
+          onChange={(e) => handleChange(e.target.value)}
+          placeholder="Mount root subdirectory..."
+          className="w-full"
+        />
+      </div>
+      <div className="flex items-center gap-1.5 shrink-0">
+        <label htmlFor="scs-scan-concurrency" className="text-xs text-gray-300 font-light select-none">
+          Threads:
+        </label>
+        <input
+          id="scs-scan-concurrency"
+          type="number"
+          min={MIN_SCAN_CONCURRENCY}
+          max={MAX_SCAN_CONCURRENCY}
+          value={concurrencyDraft}
+          onChange={(e) => handleConcurrencyChange(e.target.value)}
+          title="Number of concurrent scanning threads (1–16)"
+          className="w-14 px-1.5 py-1 text-xs text-center border border-white/20 bg-black/40 text-white rounded outline-none focus:border-white/60 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+        />
+      </div>
       <button
         type="button"
         onClick={onClose}
-        className="w-[20%] text-center ml-2 px-2 py-1 text-xs border border-white/20 hover:border-white/40 focus:border-white/60 bg-transparent text-white outline-none cursor-pointer hover:bg-white/5 active:scale-95 transition-all text-nowrap"
+        className="shrink-0 px-3 py-1 text-xs border border-white/20 hover:border-white/40 focus:border-white/60 bg-transparent text-white outline-none cursor-pointer hover:bg-white/5 active:scale-95 transition-all text-nowrap"
       >
         Close Settings
       </button>
-      <span className="text-xs text-gray-400 ml-2" role="status" aria-live="polite">{savedIndicator}</span>
+      <span className="text-xs text-gray-400 shrink-0 min-w-[45px]" role="status" aria-live="polite">
+        {savedIndicator}
+      </span>
     </div>
   );
 }
 
 export default SettingsView;
+

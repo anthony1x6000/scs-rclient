@@ -592,6 +592,20 @@ pub fn list_remote_recursive_with_log<F>(
     client: &rustydav::client::Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
+    log: F,
+) -> Result<Vec<WebdavItem>, String>
+where
+    F: FnMut(&str),
+{
+    list_remote_recursive_with_concurrency_and_log(client, remote_url, cancel_flag, None, log)
+}
+
+/// Recursively lists remote WebDAV items under remote_url with configurable worker concurrency and streamed diagnostic logs.
+pub fn list_remote_recursive_with_concurrency_and_log<F>(
+    client: &rustydav::client::Client,
+    remote_url: &str,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
     mut log: F,
 ) -> Result<Vec<WebdavItem>, String>
 where
@@ -645,7 +659,9 @@ where
     // Fallback: Concurrent Breadth-First-Search traversal using Depth: 1
     log("Scanning directories using Depth: 1...\n");
 
-    let num_workers = get_scan_concurrency();
+    let num_workers = concurrency
+        .map(|c| c.clamp(1, MAX_SCAN_CONCURRENCY))
+        .unwrap_or_else(get_scan_concurrency);
     let remote_parsed = rustydav::prelude::Url::parse(remote_url)
         .map_err(|e| format!("Invalid remote URL: {}", e))?;
     let remote_origin = remote_parsed.origin();
@@ -685,6 +701,7 @@ where
     std::thread::scope(|s| {
         for _ in 0..num_workers {
             let worker_log_tx = log_tx.clone();
+            let worker_remote_origin = remote_origin.clone();
             let state_ref = &state_mutex;
             let cvar_ref = &cvar;
 
@@ -806,7 +823,7 @@ where
                                 new_dirs += 1;
                                 let sub_url = resolve_item_url(&current_url, &item.href);
                                 if let Ok(parsed_sub) = rustydav::prelude::Url::parse(&sub_url) {
-                                    if parsed_sub.origin() == remote_origin {
+                                    if parsed_sub.origin() == worker_remote_origin {
                                         let rel_from_root = relative_item_path(remote_url, &sub_url);
                                         if !rel_from_root.is_empty() && is_safe_relative_path(&rel_from_root) {
                                             if validate_webdav_url(&sub_url).is_ok() {
@@ -1042,6 +1059,22 @@ pub fn execute_webdav_action<F>(
     remote_url: &str,
     local_dir: &Path,
     cancel_flag: &AtomicBool,
+    log: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str),
+{
+    execute_webdav_action_with_options(client, action, remote_url, local_dir, cancel_flag, None, log)
+}
+
+/// Executes a native WebDAV action with custom options (such as scan concurrency) and streams logs.
+pub fn execute_webdav_action_with_options<F>(
+    client: &rustydav::client::Client,
+    action: &str,
+    remote_url: &str,
+    local_dir: &Path,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
     mut log: F,
 ) -> Result<(), String>
 where
@@ -1051,7 +1084,9 @@ where
     match action {
         "ls" => {
             log(&format!("Listing remote files in {}...\n", remote_url));
-            let items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let items = list_remote_recursive_with_concurrency_and_log(
+                client, remote_url, cancel_flag, concurrency, &mut log,
+            )?;
             let mut count = 0;
             let mut total_size = 0;
             for item in &items {
@@ -1112,7 +1147,9 @@ where
                 local_files.len(),
                 remote_url
             ));
-            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let remote_items = list_remote_recursive_with_concurrency_and_log(
+                client, remote_url, cancel_flag, concurrency, &mut log,
+            )?;
             let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
             for item in remote_items {
                 if item.is_dir {
@@ -1237,7 +1274,9 @@ where
             let is_dry = action == "get-dry";
             let with_checksum = action == "get-checksum";
             log(&format!("Listing remote files in {}...\n", remote_url));
-            let items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let items = list_remote_recursive_with_concurrency_and_log(
+                client, remote_url, cancel_flag, concurrency, &mut log,
+            )?;
             let files_to_download: Vec<(&WebdavItem, String)> = items
                 .iter()
                 .filter(|item| !item.is_dir)
@@ -1384,7 +1423,9 @@ where
         }
         "check" => {
             log(&format!("Comparing local files with remote in {}...\n", remote_url));
-            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let remote_items = list_remote_recursive_with_concurrency_and_log(
+                client, remote_url, cancel_flag, concurrency, &mut log,
+            )?;
             let mut remote_map: HashMap<String, u64> = HashMap::new();
             for item in remote_items {
                 if item.is_dir {
@@ -1437,7 +1478,9 @@ where
             let mut local_set: HashSet<String> = HashSet::new();
 
             log(&format!("Querying remote files in {} to detect changes...\n", remote_url));
-            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let remote_items = list_remote_recursive_with_concurrency_and_log(
+                client, remote_url, cancel_flag, concurrency, &mut log,
+            )?;
             let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
             for item in &remote_items {
                 if item.is_dir {

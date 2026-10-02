@@ -174,6 +174,7 @@ async fn run_webdav_action(
     subdir: String,
     target_subdir: Option<String>,
     username: Option<String>,
+    concurrency: Option<usize>,
 ) -> Result<(), String> {
     use tauri::Emitter;
 
@@ -206,12 +207,13 @@ async fn run_webdav_action(
         let emit_log = move |msg: &str| {
             let _ = app_handle.emit("webdav-log", msg);
         };
-        webdav::execute_webdav_action(
+        webdav::execute_webdav_action_with_options(
             &client,
             &action,
             &remote_url,
             &local_path,
             &cancel_flag,
+            concurrency,
             emit_log,
         )
     })
