@@ -2,8 +2,25 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Condvar, Mutex};
+use std::time::Duration;
 
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
+/// Default concurrency level for remote Depth: 1 folder scanning.
+pub const DEFAULT_SCAN_CONCURRENCY: usize = 6;
+/// Maximum concurrency level for remote Depth: 1 folder scanning to prevent overwhelming the server.
+pub const MAX_SCAN_CONCURRENCY: usize = 16;
+/// Safety limit on the number of traversed directories to guard against recursive symlink bombs / infinite trees.
+pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
+
+/// Returns the concurrency limit for remote WebDAV folder scanning.
+pub fn get_scan_concurrency() -> usize {
+    std::env::var("WEBDAV_SCAN_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, MAX_SCAN_CONCURRENCY))
+        .unwrap_or(DEFAULT_SCAN_CONCURRENCY)
+}
 
 /// Retrieves maximum allowed WebDAV file size in bytes, configurable via MAX_WEBDAV_FILE_SIZE_BYTES.
 pub fn get_max_file_size() -> u64 {
@@ -580,6 +597,7 @@ pub fn list_remote_recursive_with_log<F>(
 where
     F: FnMut(&str),
 {
+    validate_webdav_url(remote_url)?;
     if cancel_flag.load(Ordering::SeqCst) {
         return Err("Operation canceled by user.".to_string());
     }
@@ -624,96 +642,274 @@ where
         }
     }
 
-    // Fallback: Breadth-First-Search traversal using Depth: 1
+    // Fallback: Concurrent Breadth-First-Search traversal using Depth: 1
     log("Scanning directories using Depth: 1...\n");
-    let mut queue = VecDeque::new();
-    queue.push_back(remote_url.to_string());
-    let mut visited = HashSet::new();
-    let mut all_items = Vec::new();
 
-    visited.insert(remote_url.trim_end_matches('/').to_ascii_lowercase());
+    let num_workers = get_scan_concurrency();
+    let remote_parsed = rustydav::prelude::Url::parse(remote_url)
+        .map_err(|e| format!("Invalid remote URL: {}", e))?;
+    let remote_origin = remote_parsed.origin();
 
-    let mut scanned_count = 0;
-    while let Some(current_url) = queue.pop_front() {
-        if cancel_flag.load(Ordering::SeqCst) {
-            return Err("Operation canceled by user.".to_string());
-        }
+    let root_visited_key = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    let mut initial_visited = HashSet::new();
+    initial_visited.insert(root_visited_key);
 
-        scanned_count += 1;
-        let rel_folder = relative_item_path(remote_url, &current_url);
-        let display_folder = if rel_folder.is_empty() {
-            "/ (root)"
-        } else {
-            &rel_folder
-        };
-        log(&format!(
-            "[{}] Scanning directory: {}...\n",
-            scanned_count, display_folder
-        ));
+    let mut initial_queue = VecDeque::new();
+    initial_queue.push_back(remote_url.to_string());
 
-        let res = client
-            .list(&current_url, "1")
-            .map_err(|e| format!("List request failed for {}: {}", current_url, e))?;
-
-        let status = res.status();
-        if !status.is_success() && status.as_u16() != 207 {
-            if scanned_count == 1 && status.as_u16() == 404 {
-                log("Remote directory does not exist yet (404); starting with empty listing.\n");
-                return Ok(all_items);
-            }
-            return Err(format!("Server returned HTTP {} for {}", status, current_url));
-        }
-
-        let body = res.text().unwrap_or_default();
-        let items = parse_propfind_xml(&body);
-
-        let mut children_in_dir = 0;
-        let mut new_dirs = 0;
-        let mut new_files = 0;
-        for item in items {
-            let rel = relative_item_path(&current_url, &item.href);
-            if rel.is_empty() {
-                // Skips current collection directory itself
-                continue;
-            }
-
-            children_in_dir += 1;
-            if item.is_dir {
-                new_dirs += 1;
-                let sub_url = resolve_item_url(&current_url, &item.href);
-                let sub_key = sub_url.trim_end_matches('/').to_ascii_lowercase();
-                if visited.insert(sub_key) {
-                    queue.push_back(sub_url);
-                }
-                all_items.push(item);
-            } else {
-                new_files += 1;
-                all_items.push(item);
-            }
-        }
-
-        if children_in_dir == 0 && current_url == remote_url {
-            let snippet_len = body.len().min(400);
-            log(&format!(
-                "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
-                &body[..snippet_len]
-            ));
-        } else {
-            log(&format!(
-                "   -> Found {} file(s) and {} subfolder(s) in {}\n",
-                new_files, new_dirs, display_folder
-            ));
-        }
+    struct ScanState {
+        queue: VecDeque<String>,
+        active_workers: usize,
+        visited: HashSet<String>,
+        seen_items: HashSet<(bool, String)>,
+        all_items: Vec<WebdavItem>,
+        scanned_count: usize,
+        error: Option<String>,
+        stopped: bool,
     }
 
-    let file_count = all_items.iter().filter(|i| !i.is_dir).count();
-    let dir_count = all_items.iter().filter(|i| i.is_dir).count();
+    let state_mutex = Mutex::new(ScanState {
+        queue: initial_queue,
+        active_workers: 0,
+        visited: initial_visited,
+        seen_items: HashSet::new(),
+        all_items: Vec::new(),
+        scanned_count: 0,
+        error: None,
+        stopped: false,
+    });
+    let cvar = Condvar::new();
+
+    let (log_tx, log_rx) = mpsc::channel::<String>();
+
+    std::thread::scope(|s| {
+        for _ in 0..num_workers {
+            let worker_log_tx = log_tx.clone();
+            let state_ref = &state_mutex;
+            let cvar_ref = &cvar;
+
+            s.spawn(move || {
+                let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    loop {
+                        let next_task = {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            loop {
+                                if cancel_flag.load(Ordering::SeqCst) {
+                                    state.stopped = true;
+                                    cvar_ref.notify_all();
+                                    return;
+                                }
+                                if state.stopped || state.error.is_some() {
+                                    return;
+                                }
+                                if let Some(url) = state.queue.pop_front() {
+                                    state.active_workers += 1;
+                                    state.scanned_count += 1;
+                                    let scan_idx = state.scanned_count;
+                                    break Some((url, scan_idx));
+                                }
+                                if state.active_workers == 0 {
+                                    state.stopped = true;
+                                    cvar_ref.notify_all();
+                                    return;
+                                }
+                                let res = cvar_ref.wait_timeout(state, Duration::from_millis(250));
+                                match res {
+                                    Ok((new_state, _)) => state = new_state,
+                                    Err(poisoned) => {
+                                        let (new_state, _) = poisoned.into_inner();
+                                        state = new_state;
+                                    }
+                                }
+                            }
+                        };
+
+                        let (current_url, scan_idx) = match next_task {
+                            Some(t) => t,
+                            None => return,
+                        };
+
+                        let rel_folder = relative_item_path(remote_url, &current_url);
+                        let display_folder = if rel_folder.is_empty() {
+                            "/ (root)".to_string()
+                        } else {
+                            rel_folder
+                        };
+
+                        let _ = worker_log_tx.send(format!(
+                            "[{}] Scanning directory: {}...\n",
+                            scan_idx, display_folder
+                        ));
+
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.active_workers = state.active_workers.saturating_sub(1);
+                            state.stopped = true;
+                            cvar_ref.notify_all();
+                            return;
+                        }
+
+                        let list_res = client.list(&current_url, "1");
+                        let res = match list_res {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                                state.active_workers = state.active_workers.saturating_sub(1);
+                                state.error = Some(format!("List request failed for {}: {}", current_url, e));
+                                state.stopped = true;
+                                cvar_ref.notify_all();
+                                return;
+                            }
+                        };
+
+                        let status = res.status();
+                        if !status.is_success() && status.as_u16() != 207 {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.active_workers = state.active_workers.saturating_sub(1);
+                            if scan_idx == 1 && status.as_u16() == 404 {
+                                let _ = worker_log_tx.send(
+                                    "Remote directory does not exist yet (404); starting with empty listing.\n"
+                                        .to_string(),
+                                );
+                                state.stopped = true;
+                                cvar_ref.notify_all();
+                                return;
+                            }
+                            state.error = Some(format!("Server returned HTTP {} for {}", status, current_url));
+                            state.stopped = true;
+                            cvar_ref.notify_all();
+                            return;
+                        }
+
+                        let body = res.text().unwrap_or_default();
+                        let items = parse_propfind_xml(&body);
+
+                        let mut children_in_dir = 0;
+                        let mut new_dirs = 0;
+                        let mut new_files = 0;
+
+                        let mut discovered_sub_urls = Vec::new();
+                        let mut discovered_items = Vec::new();
+
+                        for item in items {
+                            let rel = relative_item_path(&current_url, &item.href);
+                            if rel.is_empty() {
+                                // Skips current collection directory itself
+                                continue;
+                            }
+                            if !is_safe_relative_path(&rel) {
+                                continue;
+                            }
+
+                            children_in_dir += 1;
+                            if item.is_dir {
+                                new_dirs += 1;
+                                let sub_url = resolve_item_url(&current_url, &item.href);
+                                if let Ok(parsed_sub) = rustydav::prelude::Url::parse(&sub_url) {
+                                    if parsed_sub.origin() == remote_origin {
+                                        let rel_from_root = relative_item_path(remote_url, &sub_url);
+                                        if !rel_from_root.is_empty() && is_safe_relative_path(&rel_from_root) {
+                                            if validate_webdav_url(&sub_url).is_ok() {
+                                                discovered_sub_urls.push(sub_url);
+                                            }
+                                        }
+                                    }
+                                }
+                                discovered_items.push(item);
+                            } else {
+                                new_files += 1;
+                                discovered_items.push(item);
+                            }
+                        }
+
+                        if children_in_dir == 0 && current_url == remote_url {
+                            let snippet_len = body.len().min(400);
+                            let _ = worker_log_tx.send(format!(
+                                "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
+                                &body[..snippet_len]
+                            ));
+                        } else {
+                            let _ = worker_log_tx.send(format!(
+                                "   -> Found {} file(s) and {} subfolder(s) in {}\n",
+                                new_files, new_dirs, display_folder
+                            ));
+                        }
+
+                        {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.active_workers = state.active_workers.saturating_sub(1);
+
+                            if state.stopped || state.error.is_some() {
+                                cvar_ref.notify_all();
+                                return;
+                            }
+
+                            for item in discovered_items {
+                                let key = (item.is_dir, item.href.trim_end_matches('/').to_ascii_lowercase());
+                                if state.seen_items.insert(key) {
+                                    state.all_items.push(item);
+                                }
+                            }
+
+                            for sub_url in discovered_sub_urls {
+                                let sub_key = sub_url.trim_end_matches('/').to_ascii_lowercase();
+                                if state.visited.insert(sub_key) {
+                                    if state.visited.len() > MAX_SCANNED_DIRS_LIMIT {
+                                        state.error = Some(format!(
+                                            "Directory traversal limit reached ({} folders). Aborting scan for security.",
+                                            MAX_SCANNED_DIRS_LIMIT
+                                        ));
+                                        state.stopped = true;
+                                        cvar_ref.notify_all();
+                                        return;
+                                    }
+                                    state.queue.push_back(sub_url);
+                                }
+                            }
+
+                            cvar_ref.notify_all();
+                        }
+                    }
+                }));
+
+                if run_result.is_err() {
+                    let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                    state.active_workers = state.active_workers.saturating_sub(1);
+                    state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
+                    state.stopped = true;
+                    cvar_ref.notify_all();
+                }
+            });
+        }
+
+        drop(log_tx);
+
+        while let Ok(msg) = log_rx.recv() {
+            log(&msg);
+        }
+    });
+
+    let mut state = state_mutex.into_inner().unwrap_or_else(|p| p.into_inner());
+
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err("Operation canceled by user.".to_string());
+    }
+
+    if let Some(err) = state.error {
+        return Err(err);
+    }
+
+    state.all_items.sort_by(|a, b| a.href.cmp(&b.href));
+
+    let file_count = state.all_items.iter().filter(|i| !i.is_dir).count();
+    let dir_count = state.all_items.iter().filter(|i| i.is_dir).count();
     log(&format!(
         "\nScan complete: {} file(s) and {} subdirector(ies) discovered across {} folder(s).\n\n",
-        file_count, dir_count, scanned_count
+        file_count, dir_count, state.scanned_count
     ));
 
-    Ok(all_items)
+    Ok(state.all_items)
+
 }
 
 /// Extracts modification time from std::fs::Metadata as UNIX timestamp (seconds).
@@ -1747,4 +1943,14 @@ mod tests {
         assert_eq!(computed, direct);
         let _ = std::fs::remove_file(&temp_file);
     }
+
+    #[test]
+    fn test_get_scan_concurrency_defaults() {
+        assert_eq!(DEFAULT_SCAN_CONCURRENCY, 6);
+        assert_eq!(MAX_SCAN_CONCURRENCY, 16);
+        assert_eq!(MAX_SCANNED_DIRS_LIMIT, 10_000);
+        let concurrency = get_scan_concurrency();
+        assert!(concurrency >= 1 && concurrency <= MAX_SCAN_CONCURRENCY);
+    }
 }
+
