@@ -1,11 +1,34 @@
 use scs_rclient_lib::webdav::{
     build_file_url, collect_local_files, compute_sha256, execute_webdav_action,
-    list_remote_recursive, parse_propfind_xml, relative_item_path,
-    verify_webdav_auth,
+    list_remote_recursive, parse_propfind_xml, parse_webdav_date, relative_item_path,
+    should_upload_file, verify_webdav_auth,
 };
 use std::collections::HashSet;
 use std::fs;
 use std::sync::atomic::AtomicBool;
+
+#[test]
+fn test_incremental_upload_decision_matrix() {
+    // 1. Different sizes -> must always upload
+    assert!(should_upload_file(100, Some(1000), 200, Some(1000)));
+    assert!(should_upload_file(100, None, 200, None));
+
+    // 2. Same size, local file newer than remote + 1s -> must upload
+    assert!(should_upload_file(100, Some(1005), 100, Some(1000)));
+
+    // 3. Same size, local file older or within 1s margin -> skip (already up-to-date)
+    assert!(!should_upload_file(100, Some(1000), 100, Some(1000)));
+    assert!(!should_upload_file(100, Some(1001), 100, Some(1000)));
+    assert!(!should_upload_file(100, Some(990), 100, Some(1000)));
+
+    // 4. Date parsing integration
+    let remote_date = parse_webdav_date("Mon, 28 Sep 2026 13:45:09 GMT").unwrap();
+    let local_newer = remote_date + 60;
+    let local_older = remote_date - 60;
+    assert!(should_upload_file(500, Some(local_newer), 500, Some(remote_date)));
+    assert!(!should_upload_file(500, Some(local_older), 500, Some(remote_date)));
+    assert!(!should_upload_file(500, Some(remote_date), 500, Some(remote_date)));
+}
 
 #[test]
 fn test_xml_parsing_robustness() {
@@ -268,6 +291,70 @@ fn test_live_copyparty_e2e_full_roundtrip() {
         "PUT output should log deep css: {}",
         log_output
     );
+
+    // 3b. INCREMENTAL PUT TEST: Second PUT without modifying files -> must skip all up-to-date files
+    log_output.clear();
+    let put2_res = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_sync_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(put2_res.is_ok(), "Second PUT failed: {:?}", put2_res);
+    assert!(
+        log_output.contains("0 file(s) to upload") || log_output.contains("0 file(s) copied"),
+        "Second PUT must skip all files and upload 0: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("7 file(s) up to date") || log_output.contains("all files up to date"),
+        "Second PUT should report all 7 files up to date: {}",
+        log_output
+    );
+
+    // 3c. Modify index.html content and add new_file.txt -> PUT should only upload those 2 files
+    let extra_file_path = local_sync_dir.join("new_file.txt");
+    fs::write(&extra_file_path, "Brand new file").unwrap();
+    fs::write(
+        &index_path,
+        "<html><head><title>Updated Course Homepage</title></head><body><h1>Welcome updated</h1></body></html>",
+    )
+    .unwrap();
+
+    log_output.clear();
+    let put3_res = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_sync_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(put3_res.is_ok(), "Incremental PUT failed: {:?}", put3_res);
+    assert!(
+        log_output.contains("Copied: new_file.txt"),
+        "Incremental PUT must copy new_file.txt: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("Copied: index.html"),
+        "Incremental PUT must copy modified index.html: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("2 file(s) to upload"),
+        "Incremental PUT should report 2 files to upload: {}",
+        log_output
+    );
+
+    // Clean up extra file and restore original index.html
+    fs::remove_file(&extra_file_path).unwrap();
+    let del_extra_url = build_file_url(&base_url, "new_file.txt");
+    let _ = client.delete(&del_extra_url);
+    fs::write(&index_path, index_content).unwrap();
+    let _ = execute_webdav_action(&client, "put", &base_url, &local_sync_dir, &cancel_flag, |_| {});
 
     // 4. Execute LS (Verify listing finds files recursively across depths 1, 2, 3)
     log_output.clear();
