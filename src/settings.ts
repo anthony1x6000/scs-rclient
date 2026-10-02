@@ -9,7 +9,12 @@ export const STORE_KEYS = {
   targetSubdir: "target_subdirectory",
   legacyTestSubdir: "test_subdirectory",
   subdirectories: "subdirectories",
+  scanConcurrency: "scan_concurrency",
 } as const;
+
+export const DEFAULT_SCAN_CONCURRENCY = 6;
+export const MIN_SCAN_CONCURRENCY = 1;
+export const MAX_SCAN_CONCURRENCY = 64;
 
 interface WrappedValue<T> {
   value: T;
@@ -104,18 +109,62 @@ export async function setSubdirectories(items: string[]): Promise<void> {
   await setWrapped(STORE_KEYS.subdirectories, items);
 }
 
+/**
+ * Clamps the scan concurrency value to the supported range [MIN_SCAN_CONCURRENCY, MAX_SCAN_CONCURRENCY].
+ * Uses truncation toward zero matching Rust's integer clamping behavior.
+ */
+export function clampScanConcurrency(threads: number): number {
+  return Math.min(Math.max(Math.trunc(threads), MIN_SCAN_CONCURRENCY), MAX_SCAN_CONCURRENCY);
+}
+
+/**
+ * Parses and clamps a string input into a valid scan concurrency integer.
+ * Returns null if the input is non-numeric, contains non-digit characters, or is empty.
+ */
+export function parseAndClampScanConcurrency(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (trimmed === "" || !/^\d+$/.test(trimmed)) return null;
+  const parsed = parseInt(trimmed, 10);
+  if (isNaN(parsed)) return null;
+  return clampScanConcurrency(parsed);
+}
+
+export async function getScanConcurrency(): Promise<number> {
+  const val = await getWrapped<number>(STORE_KEYS.scanConcurrency);
+  if (typeof val === "number" && !isNaN(val)) {
+    return clampScanConcurrency(val);
+  }
+  return DEFAULT_SCAN_CONCURRENCY;
+}
+
+export async function setScanConcurrency(threads: number): Promise<void> {
+  const clamped = clampScanConcurrency(threads);
+  await setWrapped(STORE_KEYS.scanConcurrency, clamped);
+}
+
 /** Load the independent settings reads in parallel (no sequential waterfall). */
 export async function loadAppSettings(): Promise<{
   baseUrl: string;
   selectedSubdir: string;
   targetSubdir: string;
   username: string;
+  scanConcurrency: number;
 }> {
-  const [baseUrl, selectedSubdir, targetSubdir, username] = await Promise.all([
+  const [baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency] = await Promise.all([
     getWebDAVBase(),
     getSelectedSubdir(),
     getTargetSubdir(),
     getSavedUsername(),
+    getScanConcurrency(),
   ]);
-  return { baseUrl, selectedSubdir, targetSubdir, username };
+  return { baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency };
+}
+
+/**
+ * Clears the persistent WebDAV remote directory listing cache.
+ * Note: Clears all cached remote endpoint listings across the application.
+ */
+export async function clearWebDAVCache(): Promise<void> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("clear_webdav_cache");
 }

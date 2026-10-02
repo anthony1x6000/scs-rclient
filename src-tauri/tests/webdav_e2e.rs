@@ -721,3 +721,356 @@ fn test_live_copyparty_incremental_put_timestamp_differentiation() {
     let _ = client.delete(&base_url);
     let _ = fs::remove_dir_all(&tmp_test_dir);
 }
+
+#[test]
+fn test_concurrent_scanning_stress_1_to_64_threads() {
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    assert_eq!(scs_rclient_lib::webdav::MAX_SCAN_CONCURRENCY, 64);
+
+    // Build ample directory tree: 10 modules with nested folders, deep archives, and shared assets
+    struct MockEntry {
+        subfolders: Vec<String>,
+        files: Vec<(String, u64)>, // (filename, size)
+    }
+
+    let mut dir_map: HashMap<String, MockEntry> = HashMap::new();
+
+    // Root collection
+    let root_path = "/stress-course/".to_string();
+    let mut root_subfolders = Vec::new();
+    let root_files = vec![
+        ("Syllabus.pdf".to_string(), 102400),
+        ("Course_Schedule.xlsx".to_string(), 51200),
+        ("README.txt".to_string(), 1024),
+    ];
+
+    let mut total_expected_dirs = 0;
+    let mut total_expected_files = root_files.len();
+
+    // 10 modules with diverse nested directory structures
+    for m in 1..=10 {
+        let mod_name = format!("Module_{:02}", m);
+        root_subfolders.push(format!("{}/", mod_name));
+        total_expected_dirs += 1;
+
+        let mod_path = format!("/stress-course/{}/", mod_name);
+        let mod_subfolders = vec![
+            "Lectures/".to_string(),
+            "Assignments/".to_string(),
+            "Readings/".to_string(),
+            "Assets/".to_string(),
+        ];
+        total_expected_dirs += 4;
+        let mod_files = vec![
+            (format!("overview_m{:02}.pdf", m), 20480),
+            (format!("goals_m{:02}.txt", m), 2048),
+        ];
+        total_expected_files += mod_files.len();
+        dir_map.insert(
+            mod_path,
+            MockEntry {
+                subfolders: mod_subfolders,
+                files: mod_files,
+            },
+        );
+
+        // Lectures
+        let lec_path = format!("/stress-course/{}/Lectures/", mod_name);
+        let lec_files = vec![
+            ("slides.pdf".to_string(), 150000),
+            ("notes.md".to_string(), 5000),
+            ("transcript.vtt".to_string(), 12000),
+        ];
+        total_expected_files += lec_files.len();
+        dir_map.insert(
+            lec_path,
+            MockEntry {
+                subfolders: Vec::new(),
+                files: lec_files,
+            },
+        );
+
+        // Assignments
+        let assn_path = format!("/stress-course/{}/Assignments/", mod_name);
+        let assn_files = vec![
+            ("rubric.pdf".to_string(), 35000),
+            ("spec.docx".to_string(), 45000),
+            ("solution_sample.zip".to_string(), 250000),
+        ];
+        total_expected_files += assn_files.len();
+        dir_map.insert(
+            assn_path,
+            MockEntry {
+                subfolders: Vec::new(),
+                files: assn_files,
+            },
+        );
+
+        // Readings
+        let read_path = format!("/stress-course/{}/Readings/", mod_name);
+        let read_files = vec![
+            ("paper1.pdf".to_string(), 85000),
+            ("paper2.pdf".to_string(), 92000),
+        ];
+        total_expected_files += read_files.len();
+        dir_map.insert(
+            read_path,
+            MockEntry {
+                subfolders: Vec::new(),
+                files: read_files,
+            },
+        );
+
+        // Assets with nested Images
+        let assets_path = format!("/stress-course/{}/Assets/", mod_name);
+        total_expected_dirs += 1;
+        dir_map.insert(
+            assets_path,
+            MockEntry {
+                subfolders: vec!["Images/".to_string()],
+                files: vec![("data.csv".to_string(), 4000)],
+            },
+        );
+        total_expected_files += 1;
+
+        let img_path = format!("/stress-course/{}/Assets/Images/", mod_name);
+        let img_files = vec![
+            ("diagram.png".to_string(), 30000),
+            ("chart.svg".to_string(), 15000),
+        ];
+        total_expected_files += img_files.len();
+        dir_map.insert(
+            img_path,
+            MockEntry {
+                subfolders: Vec::new(),
+                files: img_files,
+            },
+        );
+    }
+
+    // Deep nested archives
+    root_subfolders.push("Archives/".to_string());
+    total_expected_dirs += 6;
+    dir_map.insert(
+        "/stress-course/Archives/".to_string(),
+        MockEntry {
+            subfolders: vec!["2024/".to_string()],
+            files: Vec::new(),
+        },
+    );
+    dir_map.insert(
+        "/stress-course/Archives/2024/".to_string(),
+        MockEntry {
+            subfolders: vec!["Winter/".to_string()],
+            files: Vec::new(),
+        },
+    );
+    dir_map.insert(
+        "/stress-course/Archives/2024/Winter/".to_string(),
+        MockEntry {
+            subfolders: vec!["Midterms/".to_string()],
+            files: Vec::new(),
+        },
+    );
+    dir_map.insert(
+        "/stress-course/Archives/2024/Winter/Midterms/".to_string(),
+        MockEntry {
+            subfolders: vec!["Solutions/".to_string()],
+            files: Vec::new(),
+        },
+    );
+    dir_map.insert(
+        "/stress-course/Archives/2024/Winter/Midterms/Solutions/".to_string(),
+        MockEntry {
+            subfolders: vec!["V1/".to_string()],
+            files: vec![("exam_master.pdf".to_string(), 80000)],
+        },
+    );
+    total_expected_files += 1;
+    dir_map.insert(
+        "/stress-course/Archives/2024/Winter/Midterms/Solutions/V1/".to_string(),
+        MockEntry {
+            subfolders: Vec::new(),
+            files: vec![
+                ("q1_sol.pdf".to_string(), 25000),
+                ("q2_sol.pdf".to_string(), 30000),
+            ],
+        },
+    );
+    total_expected_files += 2;
+
+    // Common shared directory
+    root_subfolders.push("Shared/".to_string());
+    total_expected_dirs += 3;
+    dir_map.insert(
+        "/stress-course/Shared/".to_string(),
+        MockEntry {
+            subfolders: vec!["Code/".to_string()],
+            files: Vec::new(),
+        },
+    );
+    dir_map.insert(
+        "/stress-course/Shared/Code/".to_string(),
+        MockEntry {
+            subfolders: vec!["Python/".to_string()],
+            files: Vec::new(),
+        },
+    );
+    dir_map.insert(
+        "/stress-course/Shared/Code/Python/".to_string(),
+        MockEntry {
+            subfolders: Vec::new(),
+            files: vec![
+                ("main.py".to_string(), 1200),
+                ("test.py".to_string(), 800),
+                ("config.json".to_string(), 350),
+            ],
+        },
+    );
+    total_expected_files += 3;
+
+    dir_map.insert(
+        root_path,
+        MockEntry {
+            subfolders: root_subfolders,
+            files: root_files,
+        },
+    );
+
+    // Pre-generate WebDAV XML Multi-Status responses for instant serving
+    let mut responses: HashMap<String, Vec<u8>> = HashMap::new();
+    for (dir_path, entry) in &dir_map {
+        let mut xml = String::new();
+        xml.push_str(r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">"#);
+        xml.push_str(&format!(
+            r#"<D:response><D:href>{}</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"#,
+            dir_path
+        ));
+        for sub in &entry.subfolders {
+            let full_sub = format!("{}{}", dir_path, sub);
+            xml.push_str(&format!(
+                r#"<D:response><D:href>{}</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"#,
+                full_sub
+            ));
+        }
+        for (f, sz) in &entry.files {
+            let full_f = format!("{}{}", dir_path, f);
+            xml.push_str(&format!(
+                r#"<D:response><D:href>{}</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>{}</D:getcontentlength><D:getlastmodified>Mon, 28 Sep 2026 12:00:00 GMT</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"#,
+                full_f, sz
+            ));
+        }
+        xml.push_str("</D:multistatus>");
+
+        let resp = format!(
+            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            xml.len(),
+            xml
+        );
+        responses.insert(dir_path.trim_end_matches('/').to_ascii_lowercase(), resp.into_bytes());
+    }
+
+    let shared_responses = Arc::new(responses);
+
+    // Spawn mock WebDAV server that simulates D2L/IIS Depth: infinity rejection
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let is_running = Arc::new(AtomicBool::new(true));
+
+    let server_running = is_running.clone();
+    let server_resp = shared_responses.clone();
+
+    let server_handle = std::thread::spawn(move || {
+        while server_running.load(Ordering::SeqCst) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            if !server_running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let resp_map = server_resp.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let n = match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => n,
+                    _ => return,
+                };
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+
+                // Simulate D2L/IIS rejection of Depth: infinity with HTTP 403 Forbidden
+                if req_str.to_ascii_lowercase().contains("depth: infinity") {
+                    let forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(forbidden.as_bytes());
+                    return;
+                }
+
+                let first_line = req_str.lines().next().unwrap_or("");
+                let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+                let lookup_key = path.trim_end_matches('/').to_ascii_lowercase();
+
+                if let Some(resp_bytes) = resp_map.get(&lookup_key) {
+                    let _ = stream.write_all(resp_bytes);
+                } else {
+                    let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(not_found.as_bytes());
+                }
+            });
+        }
+    });
+
+    let cancel_flag = AtomicBool::new(false);
+    let base_url = format!("http://127.0.0.1:{}/stress-course/", port);
+    let client = rustydav::client::Client::init("testuser", "testpass");
+
+    let total_expected_items = total_expected_files + total_expected_dirs;
+    assert_eq!(total_expected_dirs, 69);
+    assert_eq!(total_expected_files, 139);
+    assert_eq!(total_expected_items, 208);
+
+    // Stress test across all worker thread counts from 1 to 64
+    for threads in 1..=64 {
+        let items = scs_rclient_lib::webdav::list_remote_recursive_with_concurrency_and_log(
+            &client,
+            &base_url,
+            &cancel_flag,
+            Some(threads),
+            Some("testuser"),
+            |_| {},
+        )
+        .unwrap_or_else(|e| panic!("Concurrent scan failed with {} threads: {}", threads, e));
+
+        let files_count = items.iter().filter(|i| !i.is_dir).count();
+        let dirs_count = items.iter().filter(|i| i.is_dir).count();
+
+        assert_eq!(
+            files_count, total_expected_files,
+            "Thread count {} found {} files, expected {}",
+            threads, files_count, total_expected_files
+        );
+        assert_eq!(
+            dirs_count, total_expected_dirs,
+            "Thread count {} found {} dirs, expected {}",
+            threads, dirs_count, total_expected_dirs
+        );
+        assert_eq!(
+            items.len(),
+            total_expected_items,
+            "Thread count {} found {} items, expected {}",
+            threads,
+            items.len(),
+            total_expected_items
+        );
+    }
+
+    // Cleanly stop mock server
+    is_running.store(false, Ordering::SeqCst);
+    let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
+    let _ = server_handle.join();
+}

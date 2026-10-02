@@ -2,8 +2,36 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Condvar, Mutex};
+use std::time::Duration;
 
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
+/// Default concurrency level for remote Depth: 1 folder scanning.
+pub const DEFAULT_SCAN_CONCURRENCY: usize = 6;
+/// Maximum concurrency level for remote Depth: 1 folder scanning to prevent overwhelming the server.
+pub const MAX_SCAN_CONCURRENCY: usize = 64;
+/// Safety limit on the number of traversed directories to guard against recursive symlink bombs or infinite trees.
+/// Set to 10,000 to comfortably accommodate very large course hierarchies (typical max depth ~10 * breadth ~100)
+/// while bounding memory usage and avoiding infinite traversal cycles.
+pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
+
+// Static compile-time assertion verifying that rustydav::client::Client implements Send + Sync
+// and can safely be shared across concurrent scanning worker threads.
+// Note: rustydav::client::Client internally wraps reqwest::blocking::Client, which maintains
+// an Arc-backed connection pool designed for concurrent multi-threaded usage.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<rustydav::client::Client>();
+};
+
+/// Returns the concurrency limit for remote WebDAV folder scanning.
+pub fn get_scan_concurrency() -> usize {
+    std::env::var("WEBDAV_SCAN_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, MAX_SCAN_CONCURRENCY))
+        .unwrap_or(DEFAULT_SCAN_CONCURRENCY)
+}
 
 /// Retrieves maximum allowed WebDAV file size in bytes, configurable via MAX_WEBDAV_FILE_SIZE_BYTES.
 pub fn get_max_file_size() -> u64 {
@@ -64,6 +92,381 @@ impl Default for WebdavItem {
             mtime: None,
         }
     }
+}
+
+/// Returns true if a path or href contains directory traversal sequences or forbidden characters.
+/// Allows legitimate hidden files (e.g. `.gitignore`, `.env`, `.github`) while strictly blocking
+/// directory traversal attacks (`..`, `../`, `..\`, `/..`, `\..`, `%2e%2e`).
+pub fn has_traversal_sequence(s: &str) -> bool {
+    if s.contains('\\') || s.contains('\0') || s.contains('\r') || s.contains('\n') {
+        return true;
+    }
+    if s == ".." || s.starts_with("../") || s.ends_with("/..") || s.contains("/../") {
+        return true;
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("%2e%2e") || lower.contains("%2f..") || lower.contains("..%2f") {
+        return true;
+    }
+    for part in s.split('/') {
+        if part.trim() == ".." {
+            return true;
+        }
+    }
+    false
+}
+
+/// Computes a normalized cache key partitioned by authenticated credential context.
+///
+/// Multi-Account Isolation:
+/// Cache keys include the authenticated username when available (`username@clean_url`) to prevent
+/// cache collisions across different user credentials accessing the same WebDAV host (CWE-287 / CWE-384).
+pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
+    let clean_url = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    match auth_user {
+        Some(user) if !user.trim().is_empty() => {
+            format!("{}@{}", user.trim().to_ascii_lowercase(), clean_url)
+        }
+        _ => clean_url,
+    }
+}
+
+/// Represents a cached remote WebDAV directory listing.
+/// Note: Cached listings are keyed by normalized collection URL and authenticated user.
+/// If switching credentials or access permissions for the same URL, listings are safely partitioned,
+/// or invoke `clear_remote_cache()` / click 'Clear Cache' under Settings to invalidate prior cached listings.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedRemoteListing {
+    pub remote_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_user: Option<String>,
+    pub timestamp: u64,
+    pub items: Vec<WebdavItem>,
+}
+
+/// Default TTL for cached remote file listings (24 hours).
+pub const DEFAULT_CACHE_TTL_SECS: u64 = 86400;
+
+/// Returns whether remote WebDAV file caching is enabled.
+pub fn is_cache_enabled() -> bool {
+    if cfg!(test) || std::env::var("TEST_WEBDAV_URL").is_ok() {
+        return std::env::var("ENABLE_WEBDAV_CACHE_IN_TEST").as_deref() == Ok("1");
+    }
+    std::env::var("WEBDAV_CACHE_DISABLED").as_deref() != Ok("1")
+}
+
+/// Returns the cache time-to-live in seconds.
+pub fn get_cache_ttl_secs() -> u64 {
+    std::env::var("WEBDAV_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CACHE_TTL_SECS)
+}
+
+/// Returns the path to the WebDAV remote listing cache file if a secure user directory is available.
+///
+/// Security & Access Control:
+/// - Unix/Linux/macOS: The cache file is located inside `$XDG_CACHE_HOME` or `$HOME/.cache`, with
+///   parent directory created mode `0o700` and file written mode `0o600` (CWE-200 / CWE-732).
+/// - Windows Limitation: Fine-grained per-file DACLs are not manipulated via Win32 API.
+///   Access control relies on the container DACL (`%LOCALAPPDATA%` or `%APPDATA%`), which natively
+///   restricts access to the current user profile and SYSTEM.
+/// - Fallback Rejection: If no user home or AppData directory is resolvable, fallback to shared/world-readable
+///   temporary directories (/tmp) is strictly rejected (returns `None`), safely disabling disk caching.
+pub fn get_cache_file_path() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("WEBDAV_CACHE_FILE") {
+        let p = PathBuf::from(custom);
+        if !p.as_os_str().is_empty() {
+            return Some(p);
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+            let p = PathBuf::from(xdg);
+            if p.is_absolute() {
+                return Some(p.join("scs-rclient").join("webdav_cache.json"));
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let p = PathBuf::from(home);
+            if p.is_absolute() {
+                return Some(p.join(".cache").join("scs-rclient").join("webdav_cache.json"));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            let p = PathBuf::from(local_appdata);
+            if !p.as_os_str().is_empty() {
+                return Some(p.join("scs-rclient").join("webdav_cache.json"));
+            }
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let p = PathBuf::from(appdata);
+            if !p.as_os_str().is_empty() {
+                return Some(p.join("scs-rclient").join("webdav_cache.json"));
+            }
+        }
+    }
+
+    None
+}
+
+/// Atomically writes content to the cache file using a temporary file and atomic rename.
+///
+/// Security & Access Control:
+/// - Unix/Linux/macOS: The parent directory is created with mode `0o700` and the temporary file
+///   with mode `0o600` before atomic rename, ensuring multi-user isolation on shared systems.
+/// - Windows Limitation: Fine-grained per-file DACLs are not manipulated via Win32 API.
+///   Security isolation relies on the enclosing parent folder's DACL (e.g. `%LOCALAPPDATA%`).
+fn write_cache_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            builder.mode(0o700);
+            let _ = builder.create(parent);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows Limitation: Written without custom DACLs; relies on %LOCALAPPDATA% directory ACLs.
+        std::fs::write(&tmp_path, content)?;
+    }
+
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Helper to safely read and deserialize the cache map from disk.
+fn read_cache_map(path: &Path) -> HashMap<String, CachedRemoteListing> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_file(path);
+            return HashMap::new();
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if content.len() <= 50 * 1024 * 1024 {
+            if let Ok(map) = serde_json::from_str(&content) {
+                return map;
+            }
+        }
+    }
+    HashMap::new()
+}
+
+/// Helper to safely serialize and atomically write the cache map to disk.
+fn write_cache_map(path: &Path, cache: &HashMap<String, CachedRemoteListing>) {
+    if let Ok(json) = serde_json::to_string_pretty(cache) {
+        let _ = write_cache_atomic(path, &json);
+    }
+}
+
+/// Loads cached remote items for remote_url and auth_user if valid and not expired.
+///
+/// Security:
+/// - Validates that hrefs and relative paths do not contain directory traversal sequences (`has_traversal_sequence`).
+/// - Legitimate hidden files (e.g. `.gitignore`, `.env`) are preserved.
+/// - Does not rely on rigid prefix matching, correctly supporting root-relative hrefs returned by WebDAV servers.
+pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Vec<WebdavItem>> {
+    let path = get_cache_file_path()?;
+    let cache = read_cache_map(&path);
+    let key = cache_key(remote_url, auth_user);
+    let entry = cache.get(&key)?;
+
+    let ttl = get_cache_ttl_secs();
+    if ttl > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        if now.saturating_sub(entry.timestamp) > ttl {
+            return None;
+        }
+    }
+
+    let mut valid_items = Vec::with_capacity(entry.items.len());
+    for item in &entry.items {
+        if has_traversal_sequence(&item.href) {
+            continue;
+        }
+        let rel = relative_item_path(remote_url, &item.href);
+        if has_traversal_sequence(&rel) {
+            continue;
+        }
+        valid_items.push(item.clone());
+    }
+
+    Some(valid_items)
+}
+
+/// Saves remote items to the local cache file for remote_url and auth_user.
+///
+/// Filters out any item with traversal sequences (`has_traversal_sequence`) to prevent cache poisoning.
+/// Cached listings are keyed by normalized collection URL and authenticated user.
+pub fn save_remote_cache(remote_url: &str, auth_user: Option<&str>, items: &[WebdavItem]) {
+    let path = match get_cache_file_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let mut cache = read_cache_map(&path);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut safe_items = Vec::with_capacity(items.len());
+    for item in items {
+        if has_traversal_sequence(&item.href) {
+            continue;
+        }
+        let rel = relative_item_path(remote_url, &item.href);
+        if has_traversal_sequence(&rel) {
+            continue;
+        }
+        safe_items.push(item.clone());
+    }
+
+    let key = cache_key(remote_url, auth_user);
+    cache.insert(
+        key,
+        CachedRemoteListing {
+            remote_url: remote_url.to_string(),
+            auth_user: auth_user.map(|u| u.trim().to_ascii_lowercase()),
+            timestamp: now,
+            items: safe_items,
+        },
+    );
+
+    write_cache_map(&path, &cache);
+}
+
+/// Updates or inserts an item in the remote cache after upload.
+pub fn update_remote_cache_item(
+    remote_url: &str,
+    auth_user: Option<&str>,
+    rel_path: &str,
+    new_size: u64,
+    new_mtime: Option<u64>,
+) {
+    if rel_path.is_empty() || has_traversal_sequence(rel_path) || rel_path.starts_with('/') {
+        return;
+    }
+    let path = match get_cache_file_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let mut cache = read_cache_map(&path);
+    if cache.is_empty() {
+        return;
+    }
+
+    let key = cache_key(remote_url, auth_user);
+    if let Some(entry) = cache.get_mut(&key) {
+        let expected_url = build_file_url(remote_url, rel_path);
+        let mut found = false;
+        for item in &mut entry.items {
+            let item_rel = relative_item_path(remote_url, &item.href);
+            if item_rel == rel_path || item.href.eq_ignore_ascii_case(&expected_url) {
+                item.size = new_size;
+                item.mtime = new_mtime;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            entry.items.push(WebdavItem {
+                href: expected_url,
+                is_dir: false,
+                size: new_size,
+                mtime: new_mtime,
+            });
+        }
+        write_cache_map(&path, &cache);
+    }
+}
+
+/// Removes an item from the remote cache after deletion.
+pub fn remove_remote_cache_item(remote_url: &str, auth_user: Option<&str>, rel_path: &str) {
+    if rel_path.is_empty() || has_traversal_sequence(rel_path) || rel_path.starts_with('/') {
+        return;
+    }
+    let path = match get_cache_file_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let mut cache = read_cache_map(&path);
+    if cache.is_empty() {
+        return;
+    }
+
+    let key = cache_key(remote_url, auth_user);
+    if let Some(entry) = cache.get_mut(&key) {
+        let expected_url = build_file_url(remote_url, rel_path);
+        entry.items.retain(|item| {
+            let item_rel = relative_item_path(remote_url, &item.href);
+            item_rel != rel_path && !item.href.eq_ignore_ascii_case(&expected_url)
+        });
+        write_cache_map(&path, &cache);
+    }
+}
+
+/// Clears the remote listing cache file.
+pub fn clear_remote_cache() -> Result<(), String> {
+    let path = match get_cache_file_path() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        }
+    }
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to clear cache: {}", e))?;
+    }
+    Ok(())
 }
 
 /// Parses a WebDAV date string into a UNIX timestamp (seconds since epoch).
@@ -575,13 +978,48 @@ pub fn list_remote_recursive_with_log<F>(
     client: &rustydav::client::Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
+    log: F,
+) -> Result<Vec<WebdavItem>, String>
+where
+    F: FnMut(&str),
+{
+    list_remote_recursive_with_concurrency_and_log(client, remote_url, cancel_flag, None, None, log)
+}
+
+/// Recursively lists remote WebDAV items under remote_url with configurable worker concurrency and streamed diagnostic logs.
+///
+/// Thread Safety:
+/// `rustydav::client::Client` implements `Send + Sync` (internally backed by `reqwest::blocking::Client` connection pool)
+/// allowing concurrent Depth: 1 requests across worker threads.
+///
+/// Parameters:
+/// - `concurrency`: Worker thread count (1..64). If `None`, defaults to `get_scan_concurrency()`.
+/// - `auth_user`: Optional username for credential-scoped cache partitioning (CWE-287 / CWE-384).
+pub fn list_remote_recursive_with_concurrency_and_log<F>(
+    client: &rustydav::client::Client,
+    remote_url: &str,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
+    auth_user: Option<&str>,
     mut log: F,
 ) -> Result<Vec<WebdavItem>, String>
 where
     F: FnMut(&str),
 {
+    validate_webdav_url(remote_url)?;
     if cancel_flag.load(Ordering::SeqCst) {
         return Err("Operation canceled by user.".to_string());
+    }
+
+    if is_cache_enabled() {
+        if let Some(cached_items) = load_remote_cache(remote_url, auth_user) {
+            log(&format!(
+                "Loaded {} item(s) from remote listing cache for {}.\n",
+                cached_items.len(),
+                remote_url
+            ));
+            return Ok(cached_items);
+        }
     }
 
     // Try Depth: infinity first
@@ -605,6 +1043,9 @@ where
                         "Server returned {} items via Depth: infinity.\n",
                         child_count
                     ));
+                    if is_cache_enabled() {
+                        save_remote_cache(remote_url, auth_user, &items);
+                    }
                     return Ok(items);
                 } else {
                     log("Depth: infinity returned 0 child items (server likely restricts Depth: infinity). Falling back to Depth: 1 traversal...\n");
@@ -624,96 +1065,337 @@ where
         }
     }
 
-    // Fallback: Breadth-First-Search traversal using Depth: 1
+    // Fallback: Concurrent Breadth-First-Search traversal using Depth: 1
     log("Scanning directories using Depth: 1...\n");
-    let mut queue = VecDeque::new();
-    queue.push_back(remote_url.to_string());
-    let mut visited = HashSet::new();
-    let mut all_items = Vec::new();
 
-    visited.insert(remote_url.trim_end_matches('/').to_ascii_lowercase());
+    let num_workers = concurrency
+        .map(|c| c.clamp(1, MAX_SCAN_CONCURRENCY))
+        .unwrap_or_else(get_scan_concurrency);
+    let remote_parsed = rustydav::prelude::Url::parse(remote_url)
+        .map_err(|e| format!("Invalid remote URL: {}", e))?;
+    let remote_origin = remote_parsed.origin();
 
-    let mut scanned_count = 0;
-    while let Some(current_url) = queue.pop_front() {
-        if cancel_flag.load(Ordering::SeqCst) {
-            return Err("Operation canceled by user.".to_string());
-        }
+    let root_visited_key = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    let mut initial_visited = HashSet::new();
+    initial_visited.insert(root_visited_key);
 
-        scanned_count += 1;
-        let rel_folder = relative_item_path(remote_url, &current_url);
-        let display_folder = if rel_folder.is_empty() {
-            "/ (root)"
-        } else {
-            &rel_folder
-        };
-        log(&format!(
-            "[{}] Scanning directory: {}...\n",
-            scanned_count, display_folder
-        ));
+    let mut initial_queue = VecDeque::new();
+    initial_queue.push_back(remote_url.to_string());
 
-        let res = client
-            .list(&current_url, "1")
-            .map_err(|e| format!("List request failed for {}: {}", current_url, e))?;
+    struct ScanState {
+        queue: VecDeque<String>,
+        active_workers: usize,
+        visited: HashSet<String>,
+        seen_items: HashSet<(bool, String)>,
+        all_items: Vec<WebdavItem>,
+        scanned_count: usize,
+        error: Option<String>,
+        stopped: bool,
+    }
 
-        let status = res.status();
-        if !status.is_success() && status.as_u16() != 207 {
-            if scanned_count == 1 && status.as_u16() == 404 {
-                log("Remote directory does not exist yet (404); starting with empty listing.\n");
-                return Ok(all_items);
-            }
-            return Err(format!("Server returned HTTP {} for {}", status, current_url));
-        }
+    struct WorkerGuard<'a> {
+        state_ref: &'a Mutex<ScanState>,
+        cvar_ref: &'a Condvar,
+    }
 
-        let body = res.text().unwrap_or_default();
-        let items = parse_propfind_xml(&body);
-
-        let mut children_in_dir = 0;
-        let mut new_dirs = 0;
-        let mut new_files = 0;
-        for item in items {
-            let rel = relative_item_path(&current_url, &item.href);
-            if rel.is_empty() {
-                // Skips current collection directory itself
-                continue;
-            }
-
-            children_in_dir += 1;
-            if item.is_dir {
-                new_dirs += 1;
-                let sub_url = resolve_item_url(&current_url, &item.href);
-                let sub_key = sub_url.trim_end_matches('/').to_ascii_lowercase();
-                if visited.insert(sub_key) {
-                    queue.push_back(sub_url);
+    impl<'a> WorkerGuard<'a> {
+        fn acquire(
+            state_ref: &'a Mutex<ScanState>,
+            cvar_ref: &'a Condvar,
+            cancel_flag: &AtomicBool,
+        ) -> Option<(Self, String, usize)> {
+            let mut state = match state_ref.lock() {
+                Ok(s) => s,
+                Err(poisoned) => {
+                    eprintln!("[webdav scan] Mutex poisoned on lock; recovering state.");
+                    let s = poisoned.into_inner();
+                    if s.stopped || s.error.is_some() {
+                        return None;
+                    }
+                    s
                 }
-                all_items.push(item);
-            } else {
-                new_files += 1;
-                all_items.push(item);
+            };
+            loop {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    state.stopped = true;
+                    cvar_ref.notify_all();
+                    return None;
+                }
+                if state.stopped || state.error.is_some() {
+                    return None;
+                }
+                if let Some(url) = state.queue.pop_front() {
+                    state.active_workers += 1;
+                    state.scanned_count += 1;
+                    let scan_idx = state.scanned_count;
+                    let guard = Self {
+                        state_ref,
+                        cvar_ref,
+                    };
+                    return Some((guard, url, scan_idx));
+                }
+                if state.active_workers == 0 {
+                    state.stopped = true;
+                    cvar_ref.notify_all();
+                    return None;
+                }
+                let res = cvar_ref.wait_timeout(state, Duration::from_millis(250));
+                match res {
+                    Ok((new_state, _)) => state = new_state,
+                    Err(poisoned) => {
+                        eprintln!("[webdav scan] Mutex poisoned during worker wait; recovering state.");
+                        let (new_state, _) = poisoned.into_inner();
+                        if new_state.stopped || new_state.error.is_some() {
+                            return None;
+                        }
+                        state = new_state;
+                    }
+                }
+                // Check cancellation and stopped state immediately after reacquiring lock from wait
+                if cancel_flag.load(Ordering::SeqCst) {
+                    state.stopped = true;
+                    cvar_ref.notify_all();
+                    return None;
+                }
+                if state.stopped || state.error.is_some() {
+                    return None;
+                }
             }
-        }
-
-        if children_in_dir == 0 && current_url == remote_url {
-            let snippet_len = body.len().min(400);
-            log(&format!(
-                "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
-                &body[..snippet_len]
-            ));
-        } else {
-            log(&format!(
-                "   -> Found {} file(s) and {} subfolder(s) in {}\n",
-                new_files, new_dirs, display_folder
-            ));
         }
     }
 
-    let file_count = all_items.iter().filter(|i| !i.is_dir).count();
-    let dir_count = all_items.iter().filter(|i| i.is_dir).count();
+    impl<'a> Drop for WorkerGuard<'a> {
+        fn drop(&mut self) {
+            let mut state = self.state_ref.lock().unwrap_or_else(|p| {
+                eprintln!("[webdav scan] Mutex poisoned during worker drop; recovering state.");
+                p.into_inner()
+            });
+            state.active_workers = state.active_workers.saturating_sub(1);
+            if std::thread::panicking() {
+                state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
+                state.stopped = true;
+            }
+            self.cvar_ref.notify_all();
+        }
+    }
+
+    let state_mutex = Mutex::new(ScanState {
+        queue: initial_queue,
+        active_workers: 0,
+        visited: initial_visited,
+        seen_items: HashSet::new(),
+        all_items: Vec::new(),
+        scanned_count: 0,
+        error: None,
+        stopped: false,
+    });
+    let cvar = Condvar::new();
+
+    let (log_tx, log_rx) = mpsc::channel::<String>();
+
+    std::thread::scope(|s| {
+        for _ in 0..num_workers {
+            let worker_log_tx = log_tx.clone();
+            let worker_remote_origin = remote_origin.clone();
+            let state_ref = &state_mutex;
+            let cvar_ref = &cvar;
+
+            s.spawn(move || {
+                let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    loop {
+                        let (guard, current_url, scan_idx) = match WorkerGuard::acquire(
+                            state_ref,
+                            cvar_ref,
+                            cancel_flag,
+                        ) {
+                            Some(triple) => triple,
+                            None => return,
+                        };
+
+                        let rel_folder = relative_item_path(remote_url, &current_url);
+                        let display_folder = if rel_folder.is_empty() {
+                            "/ (root)".to_string()
+                        } else {
+                            rel_folder
+                        };
+
+                        let _ = worker_log_tx.send(format!(
+                            "[{}] Scanning directory: {}...\n",
+                            scan_idx, display_folder
+                        ));
+
+                        // Check cancellation before issuing directory listing network request
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.stopped = true;
+                            return;
+                        }
+
+                        let list_res = client.list(&current_url, "1");
+
+                        // Check cancellation immediately after blocking network I/O returns to abort before parsing response body
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.stopped = true;
+                            return;
+                        }
+
+                        let res = match list_res {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                                state.error = Some(format!("List request failed for {}: {}", current_url, e));
+                                state.stopped = true;
+                                return;
+                            }
+                        };
+
+                        let status = res.status();
+                        if !status.is_success() && status.as_u16() != 207 {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            if scan_idx == 1 && status.as_u16() == 404 {
+                                let _ = worker_log_tx.send(
+                                    "Remote directory does not exist yet (404); starting with empty listing.\n"
+                                        .to_string(),
+                                );
+                                state.stopped = true;
+                                return;
+                            }
+                            state.error = Some(format!("Server returned HTTP {} for {}", status, current_url));
+                            state.stopped = true;
+                            return;
+                        }
+
+                        let body = res.text().unwrap_or_default();
+                        let items = parse_propfind_xml(&body);
+
+                        let mut children_in_dir = 0;
+                        let mut new_dirs = 0;
+                        let mut new_files = 0;
+
+                        let mut discovered_sub_urls = Vec::new();
+                        let mut discovered_items = Vec::new();
+
+                        for item in items {
+                            let rel = relative_item_path(&current_url, &item.href);
+                            if rel.is_empty() {
+                                // Skips current collection directory itself
+                                continue;
+                            }
+                            if !is_safe_relative_path(&rel) {
+                                continue;
+                            }
+
+                            children_in_dir += 1;
+                            if item.is_dir {
+                                new_dirs += 1;
+                                let sub_url = resolve_item_url(&current_url, &item.href);
+                                if let Ok(parsed_sub) = rustydav::prelude::Url::parse(&sub_url) {
+                                    if parsed_sub.origin() == worker_remote_origin {
+                                        let rel_from_root = relative_item_path(remote_url, &sub_url);
+                                        if !rel_from_root.is_empty() && is_safe_relative_path(&rel_from_root) {
+                                            if validate_webdav_url(&sub_url).is_ok() {
+                                                discovered_sub_urls.push(sub_url);
+                                            }
+                                        }
+                                    }
+                                }
+                                discovered_items.push(item);
+                            } else {
+                                new_files += 1;
+                                discovered_items.push(item);
+                            }
+                        }
+
+                        if children_in_dir == 0 && current_url == remote_url {
+                            let snippet_len = body.len().min(400);
+                            let _ = worker_log_tx.send(format!(
+                                "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
+                                &body[..snippet_len]
+                            ));
+                        } else {
+                            let _ = worker_log_tx.send(format!(
+                                "   -> Found {} file(s) and {} subfolder(s) in {}\n",
+                                new_files, new_dirs, display_folder
+                            ));
+                        }
+
+                        {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            if state.stopped || state.error.is_some() {
+                                return;
+                            }
+
+                            for item in discovered_items {
+                                let key = (item.is_dir, item.href.clone());
+                                if state.seen_items.insert(key) {
+                                    state.all_items.push(item);
+                                }
+                            }
+
+                            for sub_url in discovered_sub_urls {
+                                let sub_key = sub_url.trim_end_matches('/').to_ascii_lowercase();
+                                if !state.visited.contains(&sub_key) {
+                                    if state.visited.len() >= MAX_SCANNED_DIRS_LIMIT {
+                                        state.error = Some(format!(
+                                            "Directory traversal limit reached ({} folders). Aborting scan for security.",
+                                            MAX_SCANNED_DIRS_LIMIT
+                                        ));
+                                        state.stopped = true;
+                                        return;
+                                    }
+                                    state.visited.insert(sub_key);
+                                    state.queue.push_back(sub_url);
+                                }
+                            }
+                        }
+                        drop(guard);
+                    }
+                }));
+
+                if run_result.is_err() {
+                    let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                    if state.error.is_none() {
+                        state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
+                    }
+                    state.stopped = true;
+                    cvar_ref.notify_all();
+                }
+            });
+        }
+
+        drop(log_tx);
+
+        while let Ok(msg) = log_rx.recv() {
+            log(&msg);
+        }
+    });
+
+    let mut state = state_mutex.into_inner().unwrap_or_else(|p| p.into_inner());
+
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err("Operation canceled by user.".to_string());
+    }
+
+    if let Some(err) = state.error {
+        return Err(err);
+    }
+
+    state.all_items.sort_by(|a, b| a.href.cmp(&b.href));
+
+    if is_cache_enabled() {
+        save_remote_cache(remote_url, auth_user, &state.all_items);
+    }
+
+    let file_count = state.all_items.iter().filter(|i| !i.is_dir).count();
+    let dir_count = state.all_items.iter().filter(|i| i.is_dir).count();
     log(&format!(
         "\nScan complete: {} file(s) and {} subdirector(ies) discovered across {} folder(s).\n\n",
-        file_count, dir_count, scanned_count
+        file_count, dir_count, state.scanned_count
     ));
 
-    Ok(all_items)
+    Ok(state.all_items)
+
 }
 
 /// Extracts modification time from std::fs::Metadata as UNIX timestamp (seconds).
@@ -846,6 +1528,23 @@ pub fn execute_webdav_action<F>(
     remote_url: &str,
     local_dir: &Path,
     cancel_flag: &AtomicBool,
+    log: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str),
+{
+    execute_webdav_action_with_options(client, action, remote_url, local_dir, cancel_flag, None, None, log)
+}
+
+/// Executes a native WebDAV action with custom options (such as scan concurrency and auth context) and streams logs.
+pub fn execute_webdav_action_with_options<F>(
+    client: &rustydav::client::Client,
+    action: &str,
+    remote_url: &str,
+    local_dir: &Path,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
+    auth_user: Option<&str>,
     mut log: F,
 ) -> Result<(), String>
 where
@@ -855,7 +1554,9 @@ where
     match action {
         "ls" => {
             log(&format!("Listing remote files in {}...\n", remote_url));
-            let items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let items = list_remote_recursive_with_concurrency_and_log(
+                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
+            )?;
             let mut count = 0;
             let mut total_size = 0;
             for item in &items {
@@ -916,7 +1617,9 @@ where
                 local_files.len(),
                 remote_url
             ));
-            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let remote_items = list_remote_recursive_with_concurrency_and_log(
+                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
+            )?;
             let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
             for item in remote_items {
                 if item.is_dir {
@@ -1020,6 +1723,12 @@ where
                     .map_err(|e| format!("Upload failed for {}: {}", rel_str, e))?;
                 if res.status().is_success() {
                     copied_count += 1;
+                    if is_cache_enabled() {
+                        let mtime = std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|m| get_metadata_mtime(&m));
+                        update_remote_cache_item(remote_url, auth_user, &rel_str, size, mtime);
+                    }
                     log(&format!(
                         "[{}/{}] Copied: {} ({} bytes){}\n",
                         current_num, total_to_upload, rel_str, size, checksum_str
@@ -1041,7 +1750,9 @@ where
             let is_dry = action == "get-dry";
             let with_checksum = action == "get-checksum";
             log(&format!("Listing remote files in {}...\n", remote_url));
-            let items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let items = list_remote_recursive_with_concurrency_and_log(
+                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
+            )?;
             let files_to_download: Vec<(&WebdavItem, String)> = items
                 .iter()
                 .filter(|item| !item.is_dir)
@@ -1188,7 +1899,9 @@ where
         }
         "check" => {
             log(&format!("Comparing local files with remote in {}...\n", remote_url));
-            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let remote_items = list_remote_recursive_with_concurrency_and_log(
+                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
+            )?;
             let mut remote_map: HashMap<String, u64> = HashMap::new();
             for item in remote_items {
                 if item.is_dir {
@@ -1241,7 +1954,9 @@ where
             let mut local_set: HashSet<String> = HashSet::new();
 
             log(&format!("Querying remote files in {} to detect changes...\n", remote_url));
-            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let remote_items = list_remote_recursive_with_concurrency_and_log(
+                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
+            )?;
             let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
             for item in &remote_items {
                 if item.is_dir {
@@ -1308,6 +2023,12 @@ where
                     .put(file, &file_url)
                     .map_err(|e| format!("Upload error: {}", e))?;
                 if res.status().is_success() {
+                    if is_cache_enabled() {
+                        let mtime = std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|m| get_metadata_mtime(&m));
+                        update_remote_cache_item(remote_url, auth_user, &rel, size, mtime);
+                    }
                     log(&format!("[{}/{}] Synced: {} ({} bytes)\n", current_num, total_to_upload, rel, size));
                     uploaded += 1;
                 }
@@ -1326,6 +2047,9 @@ where
                     let file_url = resolve_item_url(remote_url, &item.href);
                     let del_res = client.delete(&file_url);
                     if del_res.is_ok() {
+                        if is_cache_enabled() {
+                            remove_remote_cache_item(remote_url, auth_user, &rel);
+                        }
                         log(&format!("Deleted remote file not in local: {}\n", rel));
                         deleted += 1;
                     }
@@ -1747,4 +2471,84 @@ mod tests {
         assert_eq!(computed, direct);
         let _ = std::fs::remove_file(&temp_file);
     }
+
+    #[test]
+    fn test_get_scan_concurrency_defaults() {
+        assert_eq!(DEFAULT_SCAN_CONCURRENCY, 6);
+        assert_eq!(MAX_SCAN_CONCURRENCY, 64);
+        assert_eq!(MAX_SCANNED_DIRS_LIMIT, 10_000);
+        let concurrency = get_scan_concurrency();
+        assert!(concurrency >= 1 && concurrency <= MAX_SCAN_CONCURRENCY);
+    }
+
+    #[test]
+    fn test_remote_cache_lifecycle() {
+        let temp_cache = std::env::temp_dir().join(format!("scs_cache_test_{}.json", std::process::id()));
+        std::env::set_var("WEBDAV_CACHE_FILE", &temp_cache);
+
+        let test_url = "https://example.com/remote/files/";
+        let alice_user = Some("alice");
+        let bob_user = Some("bob");
+
+        let items = vec![
+            WebdavItem::new("https://example.com/remote/files/doc.pdf", false, 4096),
+            WebdavItem::new("https://example.com/remote/files/.gitignore", false, 128),
+        ];
+
+        // Save under alice
+        save_remote_cache(test_url, alice_user, &items);
+        let loaded_alice = load_remote_cache(test_url, alice_user).expect("Cache should load alice's items");
+        assert_eq!(loaded_alice.len(), 2);
+        assert_eq!(loaded_alice[0].size, 4096);
+        // Hidden files like .gitignore must be preserved
+        assert!(loaded_alice.iter().any(|i| i.href.ends_with(".gitignore")));
+
+        // Multi-credential isolation: Bob querying the same URL should find NO cached items
+        let loaded_bob = load_remote_cache(test_url, bob_user);
+        assert!(loaded_bob.is_none(), "Bob should not see Alice's cached items");
+
+        // Update item in alice's cache
+        update_remote_cache_item(test_url, alice_user, "doc.pdf", 8192, Some(12345678));
+        let updated = load_remote_cache(test_url, alice_user).unwrap();
+        let doc = updated.iter().find(|i| i.href.ends_with("doc.pdf")).unwrap();
+        assert_eq!(doc.size, 8192);
+        assert_eq!(doc.mtime, Some(12345678));
+
+        // Remove item from alice's cache
+        remove_remote_cache_item(test_url, alice_user, "doc.pdf");
+        let after_removal = load_remote_cache(test_url, alice_user).unwrap();
+        assert_eq!(after_removal.len(), 1);
+        assert!(after_removal[0].href.ends_with(".gitignore"));
+
+        // Path traversal rejection in cache
+        let malicious_items = vec![
+            WebdavItem::new("https://example.com/remote/files/../../etc/passwd", false, 100),
+            WebdavItem::new("https://example.com/remote/files/%2e%2e/shadow", false, 100),
+            WebdavItem::new("https://example.com/remote/files/valid.txt", false, 200),
+        ];
+        save_remote_cache(test_url, alice_user, &malicious_items);
+        let safe_loaded = load_remote_cache(test_url, alice_user).unwrap();
+        assert_eq!(safe_loaded.len(), 1);
+        assert_eq!(safe_loaded[0].size, 200);
+
+        // Invalid rel_path updates and removals are safely ignored
+        update_remote_cache_item(test_url, alice_user, "../malicious", 500, None);
+        remove_remote_cache_item(test_url, alice_user, "../malicious");
+        let still_safe = load_remote_cache(test_url, alice_user).unwrap();
+        assert_eq!(still_safe.len(), 1);
+
+        // Verify traversal sequence helper
+        assert!(has_traversal_sequence("../secret"));
+        assert!(has_traversal_sequence("foo/../bar"));
+        assert!(has_traversal_sequence("foo/%2e%2e/bar"));
+        assert!(has_traversal_sequence("foo\\bar"));
+        assert!(!has_traversal_sequence(".gitignore"));
+        assert!(!has_traversal_sequence(".env"));
+        assert!(!has_traversal_sequence("subdir/.hidden_file"));
+
+        clear_remote_cache().unwrap();
+        assert!(!temp_cache.exists());
+        std::env::remove_var("WEBDAV_CACHE_FILE");
+    }
 }
+
