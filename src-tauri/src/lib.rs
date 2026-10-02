@@ -165,6 +165,12 @@ fn cancel_webdav_action(state: tauri::State<'_, WebdavState>) -> Result<(), Stri
     Ok(())
 }
 
+/// Runs a native WebDAV action (e.g. "put", "get", "sync", "list").
+///
+/// Parameters:
+/// - `concurrency`: Optional number of worker threads for parallel remote directory traversal (1..64).
+///   When `None`, defaults to 6 (`DEFAULT_SCAN_CONCURRENCY`).
+/// - `username`: Optional authenticated username, used for credential-scoped cache partitioning.
 #[tauri::command]
 async fn run_webdav_action(
     app: tauri::AppHandle,
@@ -174,6 +180,7 @@ async fn run_webdav_action(
     subdir: String,
     target_subdir: Option<String>,
     username: Option<String>,
+    concurrency: Option<usize>,
 ) -> Result<(), String> {
     use tauri::Emitter;
 
@@ -199,6 +206,12 @@ async fn run_webdav_action(
         (String::new(), String::new())
     };
 
+    let auth_user = if user.is_empty() {
+        None
+    } else {
+        Some(user.clone())
+    };
+
     let client = rustydav::client::Client::init(&user, &pass);
     let app_handle = app.clone();
 
@@ -206,17 +219,26 @@ async fn run_webdav_action(
         let emit_log = move |msg: &str| {
             let _ = app_handle.emit("webdav-log", msg);
         };
-        webdav::execute_webdav_action(
+        webdav::execute_webdav_action_with_options(
             &client,
             &action,
             &remote_url,
             &local_path,
             &cancel_flag,
+            concurrency,
+            auth_user.as_deref(),
             emit_log,
         )
     })
     .await
     .map_err(|e| format!("Task execution error: {}", e))?
+}
+
+/// Clears the WebDAV remote directory listing cache.
+/// Returns Ok(()) if the cache was deleted or did not exist.
+#[tauri::command]
+fn clear_webdav_cache() -> Result<(), String> {
+    webdav::clear_remote_cache()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -272,8 +294,10 @@ pub fn run() {
             delete_credentials,
             verify_webdav,
             cancel_webdav_action,
-            run_webdav_action
+            run_webdav_action,
+            clear_webdav_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

@@ -8,6 +8,7 @@ export interface RcloneSettings {
   username: string;
   selectedSubdir: string;
   targetSubdir: string;
+  scanConcurrency: number;
 }
 
 export type RcloneActionType = 'put' | 'get' | 'put-dry' | 'get-dry' | 'put-checksum' | 'get-checksum' | 'ls' | 'lsd' | 'check' | 'sync';
@@ -37,6 +38,7 @@ export async function loadSettings(): Promise<RcloneSettings> {
     username: s.username,
     selectedSubdir: s.selectedSubdir,
     targetSubdir: s.targetSubdir,
+    scanConcurrency: s.scanConcurrency,
   };
 }
 
@@ -130,6 +132,7 @@ export function useRcloneExecution(
         subdir: settings.selectedSubdir,
         targetSubdir: settings.targetSubdir || undefined,
         username: settings.username || undefined,
+        concurrency: settings.scanConcurrency,
       });
 
       log(`\nWebDAV operation finished successfully.\n`);
