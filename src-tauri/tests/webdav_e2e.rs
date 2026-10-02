@@ -1,11 +1,34 @@
 use scs_rclient_lib::webdav::{
     build_file_url, collect_local_files, compute_sha256, execute_webdav_action,
-    list_remote_recursive, parse_propfind_xml, relative_item_path,
-    verify_webdav_auth,
+    list_remote_recursive, parse_propfind_xml, parse_webdav_date, relative_item_path,
+    resolve_item_url, should_upload_file, verify_webdav_auth,
 };
 use std::collections::HashSet;
 use std::fs;
 use std::sync::atomic::AtomicBool;
+
+#[test]
+fn test_incremental_upload_decision_matrix() {
+    // 1. Different sizes -> must always upload
+    assert!(should_upload_file(100, Some(1000), 200, Some(1000)));
+    assert!(should_upload_file(100, None, 200, None));
+
+    // 2. Same size, local file newer than remote + 1s -> must upload
+    assert!(should_upload_file(100, Some(1005), 100, Some(1000)));
+
+    // 3. Same size, local file older or within 1s margin -> skip (already up-to-date)
+    assert!(!should_upload_file(100, Some(1000), 100, Some(1000)));
+    assert!(!should_upload_file(100, Some(1001), 100, Some(1000)));
+    assert!(!should_upload_file(100, Some(990), 100, Some(1000)));
+
+    // 4. Date parsing integration
+    let remote_date = parse_webdav_date("Mon, 28 Sep 2026 13:45:09 GMT").unwrap();
+    let local_newer = remote_date + 60;
+    let local_older = remote_date - 60;
+    assert!(should_upload_file(500, Some(local_newer), 500, Some(remote_date)));
+    assert!(!should_upload_file(500, Some(local_older), 500, Some(remote_date)));
+    assert!(!should_upload_file(500, Some(remote_date), 500, Some(remote_date)));
+}
 
 #[test]
 fn test_xml_parsing_robustness() {
@@ -269,6 +292,70 @@ fn test_live_copyparty_e2e_full_roundtrip() {
         log_output
     );
 
+    // 3b. INCREMENTAL PUT TEST: Second PUT without modifying files -> must skip all up-to-date files
+    log_output.clear();
+    let put2_res = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_sync_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(put2_res.is_ok(), "Second PUT failed: {:?}", put2_res);
+    assert!(
+        log_output.contains("0 file(s) to upload") || log_output.contains("0 file(s) copied"),
+        "Second PUT must skip all files and upload 0: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("7 file(s) up to date") || log_output.contains("all files up to date"),
+        "Second PUT should report all 7 files up to date: {}",
+        log_output
+    );
+
+    // 3c. Modify index.html content and add new_file.txt -> PUT should only upload those 2 files
+    let extra_file_path = local_sync_dir.join("new_file.txt");
+    fs::write(&extra_file_path, "Brand new file").unwrap();
+    fs::write(
+        &index_path,
+        "<html><head><title>Updated Course Homepage</title></head><body><h1>Welcome updated</h1></body></html>",
+    )
+    .unwrap();
+
+    log_output.clear();
+    let put3_res = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_sync_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(put3_res.is_ok(), "Incremental PUT failed: {:?}", put3_res);
+    assert!(
+        log_output.contains("Copied: new_file.txt"),
+        "Incremental PUT must copy new_file.txt: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("Copied: index.html"),
+        "Incremental PUT must copy modified index.html: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("2 file(s) to upload"),
+        "Incremental PUT should report 2 files to upload: {}",
+        log_output
+    );
+
+    // Clean up extra file and restore original index.html
+    fs::remove_file(&extra_file_path).unwrap();
+    let del_extra_url = build_file_url(&base_url, "new_file.txt");
+    let _ = client.delete(&del_extra_url);
+    fs::write(&index_path, index_content).unwrap();
+    let _ = execute_webdav_action(&client, "put", &base_url, &local_sync_dir, &cancel_flag, |_| {});
+
     // 4. Execute LS (Verify listing finds files recursively across depths 1, 2, 3)
     log_output.clear();
     let ls_res = execute_webdav_action(
@@ -468,5 +555,161 @@ fn test_live_copyparty_e2e_full_roundtrip() {
     assert!(remote_paths.contains("css/themes/dark/style.css"));
     assert!(remote_paths.contains(".gemini/settings.json"));
 
+    // Clean up remote files created in full roundtrip test
+    if let Ok(items) = list_remote_recursive(&client, &base_url, &cancel_flag) {
+        for item in items {
+            let rel = relative_item_path(&base_url, &item.href);
+            if !rel.is_empty() {
+                let file_url = resolve_item_url(&base_url, &item.href);
+                let _ = client.delete(&file_url);
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&tmp_test_dir);
+}
+
+#[test]
+fn test_live_copyparty_incremental_put_timestamp_differentiation() {
+    let base_url = match std::env::var("TEST_WEBDAV_URL") {
+        Ok(url) => format!("{}/incremental_test/", url.trim_end_matches('/')),
+        Err(_) => {
+            eprintln!("TEST_WEBDAV_URL not set, skipping live incremental test");
+            return;
+        }
+    };
+    let user = std::env::var("TEST_WEBDAV_USER").unwrap_or_else(|_| "testuser".into());
+    let pass = std::env::var("TEST_WEBDAV_PASS").unwrap_or_else(|_| "testpass".into());
+
+    let client = rustydav::client::Client::init(&user, &pass);
+    let cancel_flag = AtomicBool::new(false);
+    let mut log_output = String::new();
+
+    // Ensure remote test collection starts clean
+    let _ = client.delete(&base_url);
+    let _ = client.mkcol(&base_url);
+
+    let tmp_test_dir = std::env::temp_dir().join(format!(
+        "scs_inc_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let local_sync_dir = tmp_test_dir.join("local");
+    fs::create_dir_all(&local_sync_dir).unwrap();
+
+    let file_a = local_sync_dir.join("doc_a.txt");
+    let file_b = local_sync_dir.join("doc_b.txt");
+    let file_c = local_sync_dir.join("sub").join("doc_c.txt");
+    fs::create_dir_all(file_c.parent().unwrap()).unwrap();
+
+    fs::write(&file_a, "alpha-content").unwrap();
+    fs::write(&file_b, "beta-content").unwrap();
+    fs::write(&file_c, "gamma-content").unwrap();
+
+    // 1. Initial PUT: all 3 files are brand new -> all 3 must be copied
+    log_output.clear();
+    let res = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_sync_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(res.is_ok(), "Initial PUT failed: {:?}", res);
+    assert!(log_output.contains("Copied: doc_a.txt"), "Must copy doc_a.txt: {}", log_output);
+    assert!(log_output.contains("Copied: doc_b.txt"), "Must copy doc_b.txt: {}", log_output);
+    assert!(log_output.contains("Copied: sub/doc_c.txt"), "Must copy sub/doc_c.txt: {}", log_output);
+    assert!(log_output.contains("3 file(s) to upload"), "Must report 3 to upload: {}", log_output);
+
+    // 2. Immediate Second PUT: no changes -> all 3 files must be skipped as up to date!
+    log_output.clear();
+    let res2 = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_sync_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(res2.is_ok(), "Second PUT failed: {:?}", res2);
+    assert!(log_output.contains("3 file(s) up to date"), "Must report 3 up to date: {}", log_output);
+    assert!(log_output.contains("0 file(s) to upload"), "Must report 0 to upload: {}", log_output);
+    assert!(!log_output.contains("Copied: doc_a.txt"), "Must not re-copy doc_a: {}", log_output);
+
+    // 3. Dry-run PUT (put-dry): verify dry-run logs skip notices for up to date files
+    log_output.clear();
+    let dry_res = execute_webdav_action(
+        &client,
+        "put-dry",
+        &base_url,
+        &local_sync_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(dry_res.is_ok(), "Dry-run PUT failed: {:?}", dry_res);
+    assert!(log_output.contains("3 file(s) up to date"), "Dry run must detect 3 up to date: {}", log_output);
+
+    // 4. Modify doc_a.txt with SAME size (13 bytes) but NEWER timestamp (simulate editing file without changing length)
+    // Sleep 2.1s so local filesystem timestamp advances past remote mtime (which has 1-second resolution)
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    fs::write(&file_a, "ALPHA-CONTENT").unwrap();
+
+    log_output.clear();
+    let res3 = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_sync_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(res3.is_ok(), "PUT with newer timestamp failed: {:?}", res3);
+    assert!(log_output.contains("1 file(s) to upload"), "Must report exactly 1 to upload: {}", log_output);
+    assert!(log_output.contains("2 file(s) up to date"), "Must report 2 up to date: {}", log_output);
+    assert!(log_output.contains("Copied: doc_a.txt"), "Must copy modified doc_a: {}", log_output);
+    assert!(!log_output.contains("Copied: doc_b.txt"), "Must not copy unchanged doc_b: {}", log_output);
+    assert!(!log_output.contains("Copied: sub/doc_c.txt"), "Must not copy unchanged sub/doc_c: {}", log_output);
+
+    // 5. Modify doc_b.txt with DIFFERENT size
+    fs::write(&file_b, "beta-content-extended-with-extra-text").unwrap();
+
+    log_output.clear();
+    let res4 = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_sync_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(res4.is_ok(), "PUT with size change failed: {:?}", res4);
+    assert!(log_output.contains("1 file(s) to upload"), "Must report 1 to upload: {}", log_output);
+    assert!(log_output.contains("2 file(s) up to date"), "Must report 2 up to date: {}", log_output);
+    assert!(log_output.contains("Copied: doc_b.txt"), "Must copy size-changed doc_b: {}", log_output);
+
+    // 6. Add brand new file doc_d.txt
+    let file_d = local_sync_dir.join("doc_d.txt");
+    fs::write(&file_d, "delta-content-brand-new").unwrap();
+
+    log_output.clear();
+    let res5 = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_sync_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(res5.is_ok(), "PUT with new file failed: {:?}", res5);
+    assert!(log_output.contains("1 file(s) to upload"), "Must report 1 to upload: {}", log_output);
+    assert!(log_output.contains("3 file(s) up to date"), "Must report 3 up to date: {}", log_output);
+    assert!(log_output.contains("Copied: doc_d.txt"), "Must copy brand new doc_d: {}", log_output);
+
+    // Cleanup remote test directory & local files
+    let _ = client.delete(&base_url);
     let _ = fs::remove_dir_all(&tmp_test_dir);
 }

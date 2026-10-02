@@ -7,6 +7,32 @@ pub struct WebdavItem {
     pub href: String,
     pub is_dir: bool,
     pub size: u64,
+    pub mtime: Option<u64>,
+}
+
+/// Parses a WebDAV date string into a UNIX timestamp (seconds since epoch).
+pub fn parse_webdav_date(date_str: &str) -> Option<u64> {
+    let s = date_str.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // 1. Standard HTTP-date / RFC 2822 (e.g. "Mon, 28 Sep 2026 13:45:09 GMT")
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+        return Some(dt.timestamp().max(0) as u64);
+    }
+    // 2. ISO 8601 / RFC 3339 (e.g. "2026-09-28T13:45:09Z")
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp().max(0) as u64);
+    }
+    // 3. RFC 850 format (e.g. "Monday, 28-Sep-26 13:45:09 GMT")
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%A, %d-%b-%y %H:%M:%S GMT") {
+        return Some(dt.and_utc().timestamp().max(0) as u64);
+    }
+    // 4. asctime format (e.g. "Mon Sep 28 13:45:09 2026")
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%a %b %e %H:%M:%S %Y") {
+        return Some(dt.and_utc().timestamp().max(0) as u64);
+    }
+    None
 }
 
 /// Parses the WebDAV PROPFIND XML response into WebdavItem records.
@@ -20,10 +46,12 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
     let mut in_resourcetype = false;
     let mut in_getcontentlength = false;
     let mut in_iscollection = false;
+    let mut in_getlastmodified = false;
 
     let mut current_href = String::new();
     let mut current_is_dir = false;
     let mut current_size: u64 = 0;
+    let mut current_mtime: Option<u64> = None;
 
     let mut buf = Vec::new();
 
@@ -37,6 +65,7 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                     current_href.clear();
                     current_is_dir = false;
                     current_size = 0;
+                    current_mtime = None;
                 } else if in_response && name.eq_ignore_ascii_case(b"href") {
                     in_href = true;
                 } else if in_response && name.eq_ignore_ascii_case(b"resourcetype") {
@@ -45,6 +74,8 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                     current_is_dir = true;
                 } else if in_response && name.eq_ignore_ascii_case(b"getcontentlength") {
                     in_getcontentlength = true;
+                } else if in_response && name.eq_ignore_ascii_case(b"getlastmodified") {
+                    in_getlastmodified = true;
                 } else if in_response
                     && (name.eq_ignore_ascii_case(b"iscollection")
                         || name.eq_ignore_ascii_case(b"isfolder"))
@@ -68,6 +99,10 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                     if let Ok(text) = e.unescape() {
                         current_size = text.trim().parse::<u64>().unwrap_or(0);
                     }
+                } else if in_getlastmodified {
+                    if let Ok(text) = e.unescape() {
+                        current_mtime = parse_webdav_date(&text);
+                    }
                 } else if in_iscollection {
                     if let Ok(text) = e.unescape() {
                         let val = text.trim();
@@ -85,6 +120,10 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                 } else if in_getcontentlength {
                     if let Ok(text) = std::str::from_utf8(e.as_ref()) {
                         current_size = text.trim().parse::<u64>().unwrap_or(0);
+                    }
+                } else if in_getlastmodified {
+                    if let Ok(text) = std::str::from_utf8(e.as_ref()) {
+                        current_mtime = parse_webdav_date(text);
                     }
                 } else if in_iscollection {
                     if let Ok(text) = std::str::from_utf8(e.as_ref()) {
@@ -107,6 +146,7 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                             href: clean_href.to_string(),
                             is_dir,
                             size: current_size,
+                            mtime: current_mtime,
                         });
                     }
                 } else if name.eq_ignore_ascii_case(b"href") {
@@ -115,6 +155,8 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                     in_resourcetype = false;
                 } else if name.eq_ignore_ascii_case(b"getcontentlength") {
                     in_getcontentlength = false;
+                } else if name.eq_ignore_ascii_case(b"getlastmodified") {
+                    in_getlastmodified = false;
                 } else if name.eq_ignore_ascii_case(b"iscollection")
                     || name.eq_ignore_ascii_case(b"isfolder")
                 {
@@ -278,6 +320,7 @@ pub fn ensure_remote_parent_dirs(
     remote_url: &str,
     rel_path: &str,
 ) {
+    let _ = client.mkcol(remote_url);
     let parts: Vec<&str> = rel_path.split('/').collect();
     if parts.len() <= 1 {
         return;
@@ -393,6 +436,10 @@ where
 
         let status = res.status();
         if !status.is_success() && status.as_u16() != 207 {
+            if scanned_count == 1 && status.as_u16() == 404 {
+                log("Remote directory does not exist yet (404); starting with empty listing.\n");
+                return Ok(all_items);
+            }
             return Err(format!("Server returned HTTP {} for {}", status, current_url));
         }
 
@@ -448,8 +495,17 @@ where
     Ok(all_items)
 }
 
-/// Walks a local directory recursively and returns (path, rel_path, size).
-pub fn collect_local_files(dir: &Path) -> Vec<(PathBuf, String, u64)> {
+/// Extracts modification time from std::fs::Metadata as UNIX timestamp (seconds).
+pub fn get_metadata_mtime(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+}
+
+/// Walks a local directory recursively and returns (path, rel_path, size, mtime).
+pub fn collect_local_files_with_mtime(dir: &Path) -> Vec<(PathBuf, String, u64, Option<u64>)> {
     let mut files = Vec::new();
     if !dir.exists() || !dir.is_dir() {
         return files;
@@ -464,8 +520,10 @@ pub fn collect_local_files(dir: &Path) -> Vec<(PathBuf, String, u64)> {
                 } else if path.is_file() {
                     if let Ok(rel) = path.strip_prefix(dir) {
                         let rel_str = rel.to_string_lossy().replace('\\', "/");
-                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                        files.push((path, rel_str, size));
+                        let meta = entry.metadata().ok();
+                        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                        let mtime = meta.as_ref().and_then(get_metadata_mtime);
+                        files.push((path, rel_str, size, mtime));
                     }
                 }
             }
@@ -473,6 +531,40 @@ pub fn collect_local_files(dir: &Path) -> Vec<(PathBuf, String, u64)> {
     }
     files.sort_by(|a, b| a.1.cmp(&b.1));
     files
+}
+
+/// Walks a local directory recursively and returns (path, rel_path, size).
+pub fn collect_local_files(dir: &Path) -> Vec<(PathBuf, String, u64)> {
+    collect_local_files_with_mtime(dir)
+        .into_iter()
+        .map(|(p, r, s, _)| (p, r, s))
+        .collect()
+}
+
+/// Determines whether a local file needs to be uploaded based on remote existence, file size, and timestamps.
+///
+/// Returns true if:
+/// - File does not exist on remote.
+/// - File sizes differ.
+/// - File sizes match, but local file was modified after the remote file (with a 1-second margin for rounding).
+pub fn should_upload_file(
+    local_size: u64,
+    local_mtime: Option<u64>,
+    remote_size: u64,
+    remote_mtime: Option<u64>,
+) -> bool {
+    if local_size != remote_size {
+        return true;
+    }
+    match (local_mtime, remote_mtime) {
+        (Some(l_time), Some(r_time)) => {
+            // Local file is considered newer if its mtime is strictly greater than
+            // remote mtime + 1s (to avoid false positives due to HTTP-date 1-second rounding).
+            l_time > r_time + 1
+        }
+        // If timestamps are not both available, but sizes match, consider it up-to-date
+        _ => false,
+    }
 }
 
 /// Computes SHA256 checksum formatted as hex string.
@@ -570,28 +662,83 @@ where
             let is_dry = action == "put-dry";
             let with_checksum = action == "put-checksum";
             log(&format!("Reading local files in {}...\n", local_dir.display()));
-            let local_files = collect_local_files(local_dir);
+            let local_files = collect_local_files_with_mtime(local_dir);
             if local_files.is_empty() {
                 log("No local files found to copy.\n");
                 return Ok(());
             }
+
             log(&format!(
-                "Found {} local file(s). Starting upload...\n",
-                local_files.len()
+                "Found {} local file(s). Querying remote files in {} to detect changes...\n",
+                local_files.len(),
+                remote_url
             ));
-            for (path, rel_str, size) in local_files {
+            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
+            for item in remote_items {
+                if item.is_dir {
+                    continue;
+                }
+                let rel = relative_item_path(remote_url, &item.href);
+                if !rel.is_empty() {
+                    remote_map.insert(rel, (item.size, item.mtime));
+                }
+            }
+
+            let mut files_to_upload = Vec::new();
+            let mut skipped_count = 0;
+
+            for (path, rel_str, local_size, local_mtime) in local_files {
+                let needs_upload = match remote_map.get(&rel_str) {
+                    None => true,
+                    Some((rem_size, rem_mtime)) => {
+                        should_upload_file(local_size, local_mtime, *rem_size, *rem_mtime)
+                    }
+                };
+
+                if needs_upload {
+                    files_to_upload.push((path, rel_str, local_size));
+                } else {
+                    skipped_count += 1;
+                    if is_dry {
+                        log(&format!(
+                            "NOTICE: {}: Up to date (matches remote {} bytes), skipping\n",
+                            rel_str, local_size
+                        ));
+                    }
+                }
+            }
+
+            let total_to_upload = files_to_upload.len();
+            log(&format!(
+                "Scan complete: {} file(s) up to date, {} file(s) to upload.\n\n",
+                skipped_count, total_to_upload
+            ));
+
+            if total_to_upload == 0 {
+                log("All files are already up to date on remote.\n\nPut operation finished: 0 file(s) copied, all files up to date.\n");
+                return Ok(());
+            }
+
+            let mut copied_count = 0;
+            for (idx, (path, rel_str, size)) in files_to_upload.into_iter().enumerate() {
                 if cancel_flag.load(Ordering::SeqCst) {
                     log("Operation canceled by user.\n");
                     return Ok(());
                 }
+                let current_num = idx + 1;
                 let file_url = build_file_url(remote_url, &rel_str);
                 if is_dry {
                     log(&format!(
-                        "NOTICE: {}: Skipped copy (dry run, {} bytes)\n",
-                        rel_str, size
+                        "[{}/{}] NOTICE: {}: Would copy (new or modified, {} bytes)\n",
+                        current_num, total_to_upload, rel_str, size
                     ));
                     continue;
                 }
+                log(&format!(
+                    "[{}/{}] Uploading: {} ({} bytes)...\n",
+                    current_num, total_to_upload, rel_str, size
+                ));
                 ensure_remote_parent_dirs(client, remote_url, &rel_str);
                 let bytes = std::fs::read(&path)
                     .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
@@ -604,19 +751,22 @@ where
                     .put(bytes, &file_url)
                     .map_err(|e| format!("Upload failed for {}: {}", rel_str, e))?;
                 if res.status().is_success() {
+                    copied_count += 1;
                     log(&format!(
-                        "Copied: {} ({} bytes){}\n",
-                        rel_str, size, checksum_str
+                        "[{}/{}] Copied: {} ({} bytes){}\n",
+                        current_num, total_to_upload, rel_str, size, checksum_str
                     ));
                 } else {
                     log(&format!(
-                        "ERROR: Failed to copy {}: HTTP {}\n",
-                        rel_str,
-                        res.status()
+                        "[{}/{}] ERROR: Failed to copy {}: HTTP {}\n",
+                        current_num, total_to_upload, rel_str, res.status()
                     ));
                 }
             }
-            log("\nPut operation finished.\n");
+            log(&format!(
+                "\nPut operation finished: {} file(s) copied, {} file(s) skipped (already up to date).\n",
+                copied_count, skipped_count
+            ));
             Ok(())
         }
         "get" | "get-dry" | "get-checksum" => {
@@ -688,6 +838,13 @@ where
                 }
                 std::fs::write(&target_file, &bytes)
                     .map_err(|e| format!("Failed to write {}: {}", target_file.display(), e))?;
+                if let Some(mtime_sec) = item.mtime {
+                    if let Ok(file) = std::fs::File::open(&target_file) {
+                        let sys_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_sec);
+                        let times = std::fs::FileTimes::new().set_modified(sys_time);
+                        let _ = file.set_times(times);
+                    }
+                }
                 let checksum_str = if with_checksum {
                     format!(" (sha256: {})", compute_sha256(&bytes))
                 } else {
@@ -761,15 +918,47 @@ where
                 local_dir.display(),
                 remote_url
             ));
-            let local_files = collect_local_files(local_dir);
+            let local_files = collect_local_files_with_mtime(local_dir);
             let mut local_set: HashSet<String> = HashSet::new();
+
+            log(&format!("Querying remote files in {} to detect changes...\n", remote_url));
+            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
+            for item in &remote_items {
+                if item.is_dir {
+                    continue;
+                }
+                let rel = relative_item_path(remote_url, &item.href);
+                if !rel.is_empty() {
+                    remote_map.insert(rel, (item.size, item.mtime));
+                }
+            }
+
+            let mut files_to_upload = Vec::new();
+            let mut skipped_count = 0;
+            for (path, rel_str, local_size, local_mtime) in local_files {
+                local_set.insert(rel_str.clone());
+                let needs_upload = match remote_map.get(&rel_str) {
+                    None => true,
+                    Some((rem_size, rem_mtime)) => {
+                        should_upload_file(local_size, local_mtime, *rem_size, *rem_mtime)
+                    }
+                };
+                if needs_upload {
+                    files_to_upload.push((path, rel_str, local_size));
+                } else {
+                    skipped_count += 1;
+                }
+            }
+
+            let total_to_upload = files_to_upload.len();
             let mut uploaded = 0;
-            for (path, rel, size) in local_files {
+            for (idx, (path, rel, size)) in files_to_upload.into_iter().enumerate() {
                 if cancel_flag.load(Ordering::SeqCst) {
                     log("Operation canceled by user.\n");
                     return Ok(());
                 }
-                local_set.insert(rel.clone());
+                let current_num = idx + 1;
                 let file_url = build_file_url(remote_url, &rel);
                 ensure_remote_parent_dirs(client, remote_url, &rel);
                 let bytes = std::fs::read(&path)
@@ -778,11 +967,10 @@ where
                     .put(bytes, &file_url)
                     .map_err(|e| format!("Upload error: {}", e))?;
                 if res.status().is_success() {
-                    log(&format!("Synced: {} ({} bytes)\n", rel, size));
+                    log(&format!("[{}/{}] Synced: {} ({} bytes)\n", current_num, total_to_upload, rel, size));
                     uploaded += 1;
                 }
             }
-            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
             let mut deleted = 0;
             for item in remote_items {
                 if item.is_dir {
@@ -803,8 +991,8 @@ where
                 }
             }
             log(&format!(
-                "\nSync complete: {} synced, {} remote files removed.\n",
-                uploaded, deleted
+                "\nSync complete: {} synced, {} skipped (already up to date), {} remote files removed.\n",
+                uploaded, skipped_count, deleted
             ));
             Ok(())
         }
@@ -1075,5 +1263,54 @@ mod tests {
         assert!(!items[4].is_dir);
         assert_eq!(items[4].size, 3952509);
         assert_eq!(relative_item_path(base, &items[4].href), "Unit03_MATH1060DE_S26.docx");
+
+        // Verify mtime parsing on items
+        assert!(items[2].mtime.is_some());
+        assert!(items[3].mtime.is_some());
+        assert!(items[4].mtime.is_some());
+    }
+
+    #[test]
+    fn test_parse_webdav_date() {
+        // Standard RFC 2822 / RFC 1123 HTTP-date
+        let parsed = parse_webdav_date("Wed, 24 Jun 2026 13:09:15 GMT");
+        assert!(parsed.is_some());
+        assert!(parsed.unwrap() > 0);
+
+        // Another RFC 2822 date
+        let parsed2 = parse_webdav_date("Mon, 28 Sep 2026 13:45:09 GMT");
+        assert!(parsed2.is_some());
+        assert!(parsed2.unwrap() > parsed.unwrap());
+
+        // ISO 8601 / RFC 3339 format
+        let parsed_iso = parse_webdav_date("2026-09-28T13:45:09Z");
+        assert!(parsed_iso.is_some());
+        assert_eq!(parsed_iso.unwrap(), parsed2.unwrap());
+
+        // Invalid or empty date
+        assert!(parse_webdav_date("").is_none());
+        assert!(parse_webdav_date("invalid date string").is_none());
+    }
+
+    #[test]
+    fn test_should_upload_file() {
+        // 1. Different sizes -> must upload regardless of timestamps
+        assert!(should_upload_file(100, Some(1000), 200, Some(1000)));
+        assert!(should_upload_file(100, None, 200, None));
+
+        // 2. Matching sizes, but local file is newer than remote mtime + 1s -> must upload
+        assert!(should_upload_file(100, Some(1005), 100, Some(1000)));
+
+        // 3. Matching sizes, local file is older or equal -> skip (false)
+        assert!(!should_upload_file(100, Some(1000), 100, Some(1000)));
+        assert!(!should_upload_file(100, Some(999), 100, Some(1000)));
+
+        // 4. Matching sizes, local file is only 1s ahead (within rounding margin) -> skip (false)
+        assert!(!should_upload_file(100, Some(1001), 100, Some(1000)));
+
+        // 5. Matching sizes, timestamps missing -> skip (false)
+        assert!(!should_upload_file(100, None, 100, Some(1000)));
+        assert!(!should_upload_file(100, Some(1000), 100, None));
+        assert!(!should_upload_file(100, None, 100, None));
     }
 }
