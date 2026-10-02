@@ -128,18 +128,35 @@ jobs:
             exit 1
           fi
 
+          # Transient 503s and cold starts are common on this endpoint. A gating
+          # check must not fail a pull request on a single blip, so retry inside
+          # the 14 minute job budget: 3 attempts of 210s plus 15s/30s backoff.
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
           CURL_EXIT=0
-          HTTP_STATUS=$(curl -s -S -w "%{http_code}" --max-time 120 -o /tmp/ai_review_response.json \
-            https://integrate.api.nvidia.com/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $NVIDIA_API_KEY" \
-            --data-binary @/tmp/ai_review_payload.json) || CURL_EXIT=$?
-
-          echo "NVIDIA NIM response HTTP status: $HTTP_STATUS (curl exit: $CURL_EXIT)"
+          HTTP_STATUS=0
+          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+            CURL_EXIT=0
+            HTTP_STATUS=$(curl -s -S -w "%{http_code}" --max-time 210 -o /tmp/ai_review_response.json \
+              https://integrate.api.nvidia.com/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $NVIDIA_API_KEY" \
+              --data-binary @/tmp/ai_review_payload.json) || CURL_EXIT=$?
+            echo "NVIDIA NIM attempt $ATTEMPT/$MAX_ATTEMPTS: HTTP $HTTP_STATUS (curl exit: $CURL_EXIT)"
+            if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_STATUS" -eq 200 ]; then
+              break
+            fi
+            if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+              BACKOFF=$((ATTEMPT * 15))
+              echo "retrying in ${BACKOFF}s."
+              sleep "$BACKOFF"
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+          done
 
           if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_STATUS" -ne 200 ]; then
-            echo "::warning::NVIDIA NIM API request failed (curl exit $CURL_EXIT, HTTP $HTTP_STATUS)."
-            ERR_MSG="upstream NVIDIA NIM API request failed (HTTP $HTTP_STATUS, curl exit $CURL_EXIT)."
+            echo "::warning::NVIDIA NIM API request failed after $MAX_ATTEMPTS attempt(s) (curl exit $CURL_EXIT, HTTP $HTTP_STATUS)."
+            ERR_MSG="upstream NVIDIA NIM API request failed after $MAX_ATTEMPTS attempt(s) (HTTP $HTTP_STATUS, curl exit $CURL_EXIT)."
             if [ -s /tmp/ai_review_response.json ]; then
               ERR_MSG="$ERR_MSG response: $(cat /tmp/ai_review_response.json)"
             fi
