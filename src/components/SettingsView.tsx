@@ -4,7 +4,6 @@ import {
   getScanConcurrency,
   setScanConcurrency,
   clearWebDAVCache,
-  clampScanConcurrency,
   parseAndClampScanConcurrency,
   DEFAULT_SCAN_CONCURRENCY,
   MIN_SCAN_CONCURRENCY,

@@ -294,6 +294,9 @@ pub fn load_remote_cache(remote_url: &str) -> Option<Vec<WebdavItem>> {
 
     let mut valid_items = Vec::with_capacity(entry.items.len());
     for item in &entry.items {
+        if item.href.contains("../") || item.href.contains("..\\") || item.href.contains('\\') {
+            continue;
+        }
         let rel = relative_item_path(remote_url, &item.href);
         if !rel.is_empty() && !is_safe_relative_path(&rel) {
             continue;
@@ -306,7 +309,7 @@ pub fn load_remote_cache(remote_url: &str) -> Option<Vec<WebdavItem>> {
 
 /// Saves remote items to the local cache file for remote_url.
 ///
-/// Filters out any item with an unsafe relative path to prevent cache poisoning.
+/// Filters out any item with an unsafe relative path or traversal sequence to prevent cache poisoning.
 /// Note: Cached listings are keyed by normalized remote collection URL.
 /// If switching credentials or access permissions for the same URL, invoke `clear_remote_cache()`
 /// or click the 'Clear Cache' button under Settings to invalidate prior cached listings.
@@ -321,6 +324,9 @@ pub fn save_remote_cache(remote_url: &str, items: &[WebdavItem]) {
 
     let mut safe_items = Vec::with_capacity(items.len());
     for item in items {
+        if item.href.contains("../") || item.href.contains("..\\") || item.href.contains('\\') {
+            continue;
+        }
         let rel = relative_item_path(remote_url, &item.href);
         if rel.is_empty() || is_safe_relative_path(&rel) {
             safe_items.push(item.clone());
