@@ -76,6 +76,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check for Sibling Failures
+        id: check-failures
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: node scripts/ai-code-review.mjs check-failures
+
       - name: Fetch Pinned Security Audit Skill
         run: |
           set -euo pipefail
