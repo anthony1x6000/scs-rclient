@@ -275,7 +275,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
   const selectedPage = selectedItem ? Math.floor(filteredItems.indexOf(selectedItem) / pageSize) : -1;
 
   return (
-    <div className="relative inline-block" onBlur={handleBlur} ref={containerRef}>
+    <div className="relative inline-block min-w-0 max-w-full" onBlur={handleBlur} ref={containerRef}>
       <label className="sr-only" htmlFor="scs-subdir-search">
         Sync subdirectory
       </label>
@@ -294,7 +294,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
           aria-activedescendant={
             highlight >= 0 ? `scs-opt-${highlight}` : undefined
           }
-          className="text-5xl text-gray-300 cursor-text bg-transparent border-none outline-none w-full placeholder:text-gray-500"
+          className="text-5xl text-gray-300 cursor-text bg-transparent border-none outline-none w-full min-w-0 placeholder:text-gray-500"
         />
       ) : (
         <button
@@ -312,7 +312,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
               ? `Sync subdirectory: ${selectedItem}. Activate to change.`
               : "Select sync subdirectory"
           }
-          className="text-5xl text-gray-300 lowercase cursor-pointer text-left max-w-[28vw] truncate"
+          className="text-5xl text-gray-300 lowercase cursor-pointer text-left truncate max-w-full"
           title={selectedItem || "select"}
         >
           {selectedItem || "select"}
