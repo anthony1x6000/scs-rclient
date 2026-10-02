@@ -14,7 +14,7 @@ export const STORE_KEYS = {
 
 export const DEFAULT_SCAN_CONCURRENCY = 6;
 export const MIN_SCAN_CONCURRENCY = 1;
-export const MAX_SCAN_CONCURRENCY = 16;
+export const MAX_SCAN_CONCURRENCY = 64;
 
 interface WrappedValue<T> {
   value: T;

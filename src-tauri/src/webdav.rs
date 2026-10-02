@@ -9,7 +9,7 @@ pub const DEFAULT_MAX_FILE_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
 /// Default concurrency level for remote Depth: 1 folder scanning.
 pub const DEFAULT_SCAN_CONCURRENCY: usize = 6;
 /// Maximum concurrency level for remote Depth: 1 folder scanning to prevent overwhelming the server.
-pub const MAX_SCAN_CONCURRENCY: usize = 16;
+pub const MAX_SCAN_CONCURRENCY: usize = 64;
 /// Safety limit on the number of traversed directories to guard against recursive symlink bombs / infinite trees.
 pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
 
@@ -2364,7 +2364,7 @@ mod tests {
     #[test]
     fn test_get_scan_concurrency_defaults() {
         assert_eq!(DEFAULT_SCAN_CONCURRENCY, 6);
-        assert_eq!(MAX_SCAN_CONCURRENCY, 16);
+        assert_eq!(MAX_SCAN_CONCURRENCY, 64);
         assert_eq!(MAX_SCANNED_DIRS_LIMIT, 10_000);
         let concurrency = get_scan_concurrency();
         assert!(concurrency >= 1 && concurrency <= MAX_SCAN_CONCURRENCY);

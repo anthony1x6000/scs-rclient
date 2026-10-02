@@ -133,7 +133,7 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
           max={MAX_SCAN_CONCURRENCY}
           value={concurrencyDraft}
           onChange={(e) => handleConcurrencyChange(e.target.value)}
-          title="Number of concurrent scanning threads (1–16)"
+          title="Number of concurrent scanning threads (1–64)"
           className="w-14 px-1.5 py-1 text-xs text-center border border-white/20 bg-black/40 text-white rounded outline-none focus:border-white/60 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
         />
       </div>
