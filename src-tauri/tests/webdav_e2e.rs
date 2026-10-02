@@ -110,6 +110,39 @@ fn test_url_encoding_for_spaces() {
 }
 
 #[test]
+fn test_iis_depth_infinity_degradation_detected() {
+    // When IIS restricts Depth: infinity, it returns only the root collection.
+    // parse_propfind_xml parses it, but child items filter must detect 0 children
+    // so list_remote_recursive does not falsely claim success and instead falls back to Depth: 1.
+    let base = "https://courselinkdav.desire2learn.com/content/enforced/1052175-dev_asteve18/";
+    let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+    <D:multistatus xmlns:D="DAV:">
+        <D:Response>
+            <D:Href>/content/enforced/1052175-dev_asteve18/</D:Href>
+            <D:PropStat>
+                <D:Prop>
+                    <D:ResourceType><D:Collection/></D:ResourceType>
+                </D:Prop>
+                <D:Status>HTTP/1.1 200 OK</D:Status>
+            </D:PropStat>
+        </D:Response>
+    </D:multistatus>"#;
+
+    let items = parse_propfind_xml(xml);
+    assert_eq!(items.len(), 1);
+    assert!(items[0].is_dir);
+
+    let rel = relative_item_path(base, &items[0].href);
+    assert_eq!(rel, "", "Root collection must have empty relative path");
+
+    let child_count = items
+        .iter()
+        .filter(|i| !relative_item_path(base, &i.href).is_empty())
+        .count();
+    assert_eq!(child_count, 0, "No child items found in Depth: 0 response");
+}
+
+#[test]
 fn test_live_copyparty_e2e_full_roundtrip() {
     let base_url = match std::env::var("TEST_WEBDAV_URL") {
         Ok(v) if !v.trim().is_empty() => v,
