@@ -282,6 +282,12 @@ pub fn is_safe_relative_path(path: &str) -> bool {
     if p.is_absolute() {
         return false;
     }
+    for part in trimmed.split('/') {
+        let part_trimmed = part.trim();
+        if part_trimmed.is_empty() || part_trimmed == "." || part_trimmed == ".." {
+            return false;
+        }
+    }
     for comp in p.components() {
         match comp {
             std::path::Component::Normal(_) => {}
