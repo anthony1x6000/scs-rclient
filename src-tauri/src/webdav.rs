@@ -320,6 +320,7 @@ pub fn ensure_remote_parent_dirs(
     remote_url: &str,
     rel_path: &str,
 ) {
+    let _ = client.mkcol(remote_url);
     let parts: Vec<&str> = rel_path.split('/').collect();
     if parts.len() <= 1 {
         return;
@@ -435,6 +436,10 @@ where
 
         let status = res.status();
         if !status.is_success() && status.as_u16() != 207 {
+            if scanned_count == 1 && status.as_u16() == 404 {
+                log("Remote directory does not exist yet (404); starting with empty listing.\n");
+                return Ok(all_items);
+            }
             return Err(format!("Server returned HTTP {} for {}", status, current_url));
         }
 

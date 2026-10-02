@@ -561,7 +561,7 @@ fn test_live_copyparty_e2e_full_roundtrip() {
 #[test]
 fn test_live_copyparty_incremental_put_timestamp_differentiation() {
     let base_url = match std::env::var("TEST_WEBDAV_URL") {
-        Ok(url) => format!("{}incremental_test/", url.trim_end_matches('/')),
+        Ok(url) => format!("{}/incremental_test/", url.trim_end_matches('/')),
         Err(_) => {
             eprintln!("TEST_WEBDAV_URL not set, skipping live incremental test");
             return;
@@ -573,6 +573,10 @@ fn test_live_copyparty_incremental_put_timestamp_differentiation() {
     let client = rustydav::client::Client::init(&user, &pass);
     let cancel_flag = AtomicBool::new(false);
     let mut log_output = String::new();
+
+    // Ensure remote test collection starts clean
+    let _ = client.delete(&base_url);
+    let _ = client.mkcol(&base_url);
 
     let tmp_test_dir = std::env::temp_dir().join(format!(
         "scs_inc_test_{}_{}",
@@ -639,12 +643,9 @@ fn test_live_copyparty_incremental_put_timestamp_differentiation() {
     assert!(log_output.contains("3 file(s) up to date"), "Dry run must detect 3 up to date: {}", log_output);
 
     // 4. Modify doc_a.txt with SAME size (13 bytes) but NEWER timestamp (simulate editing file without changing length)
-    // "alpha-content" (13 bytes) -> "ALPHA-CONTENT" (13 bytes)
+    // Sleep 2.1s so local filesystem timestamp advances past remote mtime (which has 1-second resolution)
+    std::thread::sleep(std::time::Duration::from_millis(2100));
     fs::write(&file_a, "ALPHA-CONTENT").unwrap();
-    let f = fs::File::open(&file_a).unwrap();
-    let advanced_time = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
-    let _ = f.set_times(fs::FileTimes::new().set_modified(advanced_time));
-    drop(f);
 
     log_output.clear();
     let res3 = execute_webdav_action(
