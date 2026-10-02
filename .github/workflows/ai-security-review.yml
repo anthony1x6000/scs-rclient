@@ -9,12 +9,8 @@ name: AI Security Review
 #   the same engine ai-code-review.yml uses. This workflow only supplies the
 #   pinned skill, the diff, the pr discussion, and the security-specific prompt
 #   knobs, so no reviewer logic is forked here.
-# - GATING: the AI Code Review workflow merges only after every sibling check on
-#   the commit passes; its wait-checks filter drops only names containing
-#   "ai code review". This job is deliberately named "AI Security Review Agent"
-#   so it is treated as a sibling gate: a pending or failing security review
-#   blocks the auto-merge with no edit to ai-code-review.yml. Renaming this job
-#   to contain "ai code review" silently removes that gate.
+# - GATING: This job is named "AI Security Review Agent". If it passes, it exits
+#   0 with an APPROVE verdict. If it finds security issues, it exits non-zero.
 # - SECRET/MODEL: same NVIDIA_NIM_KEY secret and same model as the code review.
 #
 # SECURITY: the diff and every discussion comment are untrusted input. The
@@ -80,28 +76,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Wait for Other PR Checks to Pass
-        id: wait-checks
+      - name: Check for Sibling Failures
+        id: check-failures
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           CURRENT_RUN_ID: ${{ github.run_id }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          # A gate that cannot open must end red. Exiting green with the review
-          # skipped reads as "ai reviewed and approved" on the checks list, which
-          # is a false signal; red is honest that no review was produced.
-          if node scripts/ai-code-review.mjs wait-checks; then
-            echo "passed=true" >> $GITHUB_OUTPUT
-          else
-            echo "passed=false" >> $GITHUB_OUTPUT
-            echo "::error title=ai security review skipped::other PR checks did not pass, so no ai security review was produced. the failing checks are listed above; fix or re-run them, then re-run this workflow."
-            exit 1
-          fi
+        run: node scripts/ai-code-review.mjs check-failures
 
       - name: Fetch Pinned Security Audit Skill
-        if: steps.wait-checks.outputs.passed == 'true'
         run: |
           set -euo pipefail
           rm -rf /tmp/security-audit-skill
@@ -121,7 +105,6 @@ jobs:
           git -C /tmp/security-audit-skill log -1 --format='%H %s'
 
       - name: Build Security Skill and Guidelines
-        if: steps.wait-checks.outputs.passed == 'true'
         run: |
           set -euo pipefail
           # One combined skill file for the shared engine: the upstream
@@ -149,7 +132,6 @@ jobs:
           echo "skill file $(wc -c < "$SKILL_FILE") bytes, guidelines $(wc -c < "$EXTRA_GUIDELINES_FILE") bytes."
 
       - name: Extract and Filter Source Diff
-        if: steps.wait-checks.outputs.passed == 'true'
         id: diff
         env:
           BASE_REF: ${{ github.base_ref || 'main' }}
@@ -208,7 +190,6 @@ jobs:
           fi
 
       - name: Collect PR Discussion and Excluded Summary
-        if: steps.wait-checks.outputs.passed == 'true'
         id: thread
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -230,10 +211,10 @@ jobs:
               --jq '"# pr title\n" + .title + "\n\n# pr body\n" + (.body // "")' \
               >> "$EXTRA_CONTEXT_FILE" || true
             gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" --paginate \
-              --jq '.[] | "\n# comment by @\(.user.login)\n" + (.body // "")' \
+              --jq '.[] | select(.user.login != "github-actions[bot]" and .user.login != "github-actions") | "\n# comment by @\(.user.login)\n" + (.body // "")' \
               >> "$EXTRA_CONTEXT_FILE" || true
             gh api "repos/$REPO/pulls/$PR_NUMBER/comments?per_page=100" --paginate \
-              --jq '.[] | "\n# review comment by @\(.user.login) on \(.path):\(.line // .original_line // 0)\n" + (.body // "")' \
+              --jq '.[] | select(.user.login != "github-actions[bot]" and .user.login != "github-actions") | "\n# review comment by @\(.user.login) on \(.path):\(.line // .original_line // 0)\n" + (.body // "")' \
               >> "$EXTRA_CONTEXT_FILE" || true
           else
             echo "not a pull request; no discussion to collect."
@@ -255,7 +236,7 @@ jobs:
           fi
 
       - name: Post Comment When Nothing To Audit
-        if: steps.wait-checks.outputs.passed == 'true' && steps.diff.outputs.has_diff == 'false' && steps.thread.outputs.has_context == 'false'
+        if: steps.diff.outputs.has_diff == 'false' && steps.thread.outputs.has_context == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -272,11 +253,11 @@ jobs:
           gh pr comment "$PR_NUMBER" --body-file "$COMMENT_FILE"
 
       - name: Prepare Security Review Payload
-        if: steps.wait-checks.outputs.passed == 'true' && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
+        if: steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true'
         run: node scripts/ai-code-review.mjs prepare-payload
 
       - name: Call Security Review Agent
-        if: steps.wait-checks.outputs.passed == 'true' && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
+        if: steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true'
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_NIM_KEY }}
         run: |
@@ -322,15 +303,13 @@ jobs:
           fi
 
       - name: Post Security Review Comment and Verdict
-        if: steps.wait-checks.outputs.passed == 'true' && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
+        if: steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           # The shared engine posts the comment, strips bold and emoji, parses
           # the verdict, and exits non-zero unless it is an explicit APPROVE.
-          # ai-code-review's wait-checks reads this check's conclusion, so that
-          # exit code is the merge gate.
           if node scripts/ai-code-review.mjs post-comment; then
             exit 0
           fi
