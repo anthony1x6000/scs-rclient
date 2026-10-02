@@ -109,16 +109,40 @@ fn decode_percent(s: &str) -> String {
     String::from_utf8_lossy(&result).to_string()
 }
 
+/// Resolves an item's href against the base URL, handling absolute URLs,
+/// absolute paths (/...), and relative paths.
+pub fn resolve_item_url(base_url: &str, item_href: &str) -> String {
+    if let Ok(base) = rustydav::prelude::Url::parse(base_url) {
+        if let Ok(joined) = base.join(item_href) {
+            let mut s = joined.to_string();
+            if item_href.ends_with('/') && !s.ends_with('/') {
+                s.push('/');
+            }
+            return s;
+        }
+    }
+    let clean_base = base_url.trim_end_matches('/');
+    let clean_href = item_href.trim_start_matches('/');
+    format!("{}/{}", clean_base, clean_href)
+}
+
 /// Computes the item path relative to the collection URL.
 pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
-    let decoded_href = decode_percent(item_href);
-    let url_parsed = rustydav::prelude::Url::parse(base_url);
-    let base_path = match &url_parsed {
-        Ok(u) => decode_percent(u.path()),
-        Err(_) => base_url.to_string(),
+    let resolved_url_str = resolve_item_url(base_url, item_href);
+    let resolved_url = match rustydav::prelude::Url::parse(&resolved_url_str) {
+        Ok(u) => u,
+        Err(_) => return decode_percent(item_href).trim_matches('/').to_string(),
     };
+    let base_url_parsed = match rustydav::prelude::Url::parse(base_url) {
+        Ok(u) => u,
+        Err(_) => return decode_percent(item_href).trim_matches('/').to_string(),
+    };
+
+    let base_path = decode_percent(base_url_parsed.path());
+    let item_path = decode_percent(resolved_url.path());
+
     let trimmed_base = base_path.trim_end_matches('/');
-    let trimmed_item = decoded_href.trim_end_matches('/');
+    let trimmed_item = item_path.trim_end_matches('/');
 
     if trimmed_item == trimmed_base {
         return String::new();
@@ -142,11 +166,121 @@ pub fn build_remote_url(base_url: &str, subdir: &str) -> String {
     }
 }
 
-/// Builds the URL for a specific file under a collection.
+/// Builds the URL for a specific file under a collection, ensuring proper percent-encoding.
 pub fn build_file_url(collection_url: &str, rel_path: &str) -> String {
+    if let Ok(mut base) = rustydav::prelude::Url::parse(collection_url) {
+        let ok = if let Ok(mut segments) = base.path_segments_mut() {
+            segments.pop_if_empty();
+            for part in rel_path.split('/') {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    segments.push(trimmed);
+                }
+            }
+            true
+        } else {
+            false
+        };
+        if ok {
+            return base.to_string();
+        }
+    }
     let clean_col = collection_url.trim_end_matches('/');
     let clean_rel = rel_path.trim_start_matches('/');
     format!("{}/{}", clean_col, clean_rel)
+}
+
+/// Ensures all parent collections exist for a relative file path prior to PUT.
+pub fn ensure_remote_parent_dirs(
+    client: &rustydav::client::Client,
+    remote_url: &str,
+    rel_path: &str,
+) {
+    let parts: Vec<&str> = rel_path.split('/').collect();
+    if parts.len() <= 1 {
+        return;
+    }
+    let mut current_rel = String::new();
+    for part in &parts[..parts.len() - 1] {
+        if !current_rel.is_empty() {
+            current_rel.push('/');
+        }
+        current_rel.push_str(part);
+        let dir_url = format!("{}/", build_file_url(remote_url, &current_rel));
+        // MKCOL creates the folder; 201 Created or 405 Method Not Allowed (already exists) are expected
+        let _ = client.mkcol(&dir_url);
+    }
+}
+
+/// Recursively lists remote WebDAV items under remote_url.
+/// First attempts Depth: infinity. If the server rejects Depth: infinity (e.g. 403 Forbidden or 400 Bad Request),
+/// it falls back to breadth-first traversal using Depth: 1.
+pub fn list_remote_recursive(
+    client: &rustydav::client::Client,
+    remote_url: &str,
+    cancel_flag: &AtomicBool,
+) -> Result<Vec<WebdavItem>, String> {
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err("Operation canceled by user.".to_string());
+    }
+
+    // Try Depth: infinity first
+    if let Ok(res) = client.list(remote_url, "infinity") {
+        let status = res.status();
+        if status.is_success() || status.as_u16() == 207 {
+            let body = res.text().unwrap_or_default();
+            let items = parse_propfind_xml(&body);
+            if !items.is_empty() {
+                return Ok(items);
+            }
+        }
+    }
+
+    // Fallback: BFS traversal with Depth: 1
+    let mut queue = vec![remote_url.to_string()];
+    let mut visited = HashSet::new();
+    let mut all_items = Vec::new();
+
+    visited.insert(remote_url.trim_end_matches('/').to_string());
+
+    while let Some(current_url) = queue.pop() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Err("Operation canceled by user.".to_string());
+        }
+
+        let res = client
+            .list(&current_url, "1")
+            .map_err(|e| format!("List request failed for {}: {}", current_url, e))?;
+
+        let status = res.status();
+        if !status.is_success() && status.as_u16() != 207 {
+            return Err(format!("Server returned HTTP {} for {}", status, current_url));
+        }
+
+        let body = res.text().unwrap_or_default();
+        let items = parse_propfind_xml(&body);
+
+        for item in items {
+            let rel = relative_item_path(&current_url, &item.href);
+            if rel.is_empty() {
+                // Skips current collection directory itself
+                continue;
+            }
+
+            if item.is_dir {
+                let sub_url = resolve_item_url(&current_url, &item.href);
+                let sub_key = sub_url.trim_end_matches('/').to_string();
+                if visited.insert(sub_key) {
+                    queue.push(sub_url);
+                }
+                all_items.push(item);
+            } else {
+                all_items.push(item);
+            }
+        }
+    }
+
+    Ok(all_items)
 }
 
 /// Walks a local directory recursively and returns (path, rel_path, size).
@@ -221,14 +355,7 @@ where
     match action {
         "ls" => {
             log(&format!("Listing remote files in {}...\n", remote_url));
-            let res = client
-                .list(remote_url, "1")
-                .map_err(|e| format!("List request failed: {}", e))?;
-            if !res.status().is_success() && res.status().as_u16() != 207 {
-                return Err(format!("Server returned HTTP {}", res.status()));
-            }
-            let body = res.text().unwrap_or_default();
-            let items = parse_propfind_xml(&body);
+            let items = list_remote_recursive(client, remote_url, cancel_flag)?;
             let mut count = 0;
             let mut total_size = 0;
             for item in &items {
@@ -300,6 +427,7 @@ where
                     ));
                     continue;
                 }
+                ensure_remote_parent_dirs(client, remote_url, &rel_str);
                 let bytes = std::fs::read(&path)
                     .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
                 let checksum_str = if with_checksum {
@@ -330,12 +458,9 @@ where
             let is_dry = action == "get-dry";
             let with_checksum = action == "get-checksum";
             log(&format!("Listing remote files in {}...\n", remote_url));
-            let res = client
-                .list(remote_url, "infinity")
-                .or_else(|_| client.list(remote_url, "1"))
-                .map_err(|e| format!("List request failed: {}", e))?;
-            let body = res.text().unwrap_or_default();
-            let items = parse_propfind_xml(&body);
+            let items = list_remote_recursive(client, remote_url, cancel_flag)?;
+            let mut count = 0;
+            let mut total_bytes = 0;
             for item in &items {
                 if item.is_dir {
                     continue;
@@ -353,11 +478,12 @@ where
                         "NOTICE: {}: Skipped copy (dry run, {} bytes)\n",
                         rel, item.size
                     ));
+                    count += 1;
                     continue;
                 }
-                let file_url = build_file_url(remote_url, &rel);
+                let download_url = resolve_item_url(remote_url, &item.href);
                 let get_res = client
-                    .get(&file_url)
+                    .get(&download_url)
                     .map_err(|e| format!("Download failed for {}: {}", rel, e))?;
                 if !get_res.status().is_success() {
                     log(&format!(
@@ -383,6 +509,8 @@ where
                 } else {
                     String::new()
                 };
+                count += 1;
+                total_bytes += bytes.len();
                 log(&format!(
                     "Downloaded: {} ({} bytes){}\n",
                     rel,
@@ -390,16 +518,15 @@ where
                     checksum_str
                 ));
             }
-            log("\nGet operation finished.\n");
+            log(&format!(
+                "\nGet operation finished: {} file(s) downloaded ({} bytes).\n",
+                count, total_bytes
+            ));
             Ok(())
         }
         "check" => {
             log(&format!("Comparing local files with remote in {}...\n", remote_url));
-            let res = client
-                .list(remote_url, "1")
-                .map_err(|e| format!("List request failed: {}", e))?;
-            let body = res.text().unwrap_or_default();
-            let remote_items = parse_propfind_xml(&body);
+            let remote_items = list_remote_recursive(client, remote_url, cancel_flag)?;
             let mut remote_map: HashMap<String, u64> = HashMap::new();
             for item in remote_items {
                 if item.is_dir {
@@ -458,6 +585,7 @@ where
                 }
                 local_set.insert(rel.clone());
                 let file_url = build_file_url(remote_url, &rel);
+                ensure_remote_parent_dirs(client, remote_url, &rel);
                 let bytes = std::fs::read(&path)
                     .map_err(|e| format!("Read error {}: {}", path.display(), e))?;
                 let res = client
@@ -468,11 +596,7 @@ where
                     uploaded += 1;
                 }
             }
-            let res = client
-                .list(remote_url, "1")
-                .map_err(|e| format!("List request failed: {}", e))?;
-            let body = res.text().unwrap_or_default();
-            let remote_items = parse_propfind_xml(&body);
+            let remote_items = list_remote_recursive(client, remote_url, cancel_flag)?;
             let mut deleted = 0;
             for item in remote_items {
                 if item.is_dir {
@@ -484,7 +608,7 @@ where
                         log("Operation canceled by user.\n");
                         return Ok(());
                     }
-                    let file_url = build_file_url(remote_url, &rel);
+                    let file_url = resolve_item_url(remote_url, &item.href);
                     let del_res = client.delete(&file_url);
                     if del_res.is_ok() {
                         log(&format!("Deleted remote file not in local: {}\n", rel));
@@ -541,10 +665,43 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_item_url() {
+        let base = "https://example.com/remote.php/webdav/folder/";
+        assert_eq!(
+            resolve_item_url(base, "/remote.php/webdav/folder/file.txt"),
+            "https://example.com/remote.php/webdav/folder/file.txt"
+        );
+        assert_eq!(
+            resolve_item_url(base, "sub/file.txt"),
+            "https://example.com/remote.php/webdav/folder/sub/file.txt"
+        );
+        assert_eq!(
+            resolve_item_url(base, "https://example.com/remote.php/webdav/folder/file.txt"),
+            "https://example.com/remote.php/webdav/folder/file.txt"
+        );
+    }
+
+    #[test]
     fn test_relative_item_path() {
         let base = "https://example.com/remote.php/webdav/folder/";
         assert_eq!(relative_item_path(base, "/remote.php/webdav/folder/"), "");
         assert_eq!(relative_item_path(base, "/remote.php/webdav/folder/file.txt"), "file.txt");
         assert_eq!(relative_item_path(base, "/remote.php/webdav/folder/sub/data.csv"), "sub/data.csv");
+        assert_eq!(relative_item_path(base, "https://example.com/remote.php/webdav/folder/sub/data.csv"), "sub/data.csv");
+        assert_eq!(relative_item_path(base, "/remote.php/webdav/folder/my%20folder/file%201.txt"), "my folder/file 1.txt");
+
+        let root_base = "http://localhost:3923/";
+        assert_eq!(relative_item_path(root_base, "/"), "");
+        assert_eq!(relative_item_path(root_base, "/file.txt"), "file.txt");
+        assert_eq!(relative_item_path(root_base, "http://localhost:3923/"), "");
+        assert_eq!(relative_item_path(root_base, "http://localhost:3923/file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn test_build_file_url_spaces() {
+        let base = "http://localhost:3923/docs/";
+        let url = build_file_url(base, "my folder/my file.txt");
+        assert_eq!(url, "http://localhost:3923/docs/my%20folder/my%20file.txt");
+        assert!(rustydav::prelude::Url::parse(&url).is_ok());
     }
 }
