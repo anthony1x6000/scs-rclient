@@ -100,12 +100,15 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
 
   const handleConcurrencyChange = (raw: string) => {
     setConcurrencyDraft(raw);
-    const parsed = parseInt(raw, 10);
-    if (!isNaN(parsed)) {
-      const clamped = clampScanConcurrency(parsed);
-      setSavedIndicator("");
-      if (concurrencyDebounceRef.current) clearTimeout(concurrencyDebounceRef.current);
-      concurrencyDebounceRef.current = setTimeout(() => void persistConcurrency(clamped), 400);
+    const trimmed = raw.trim();
+    if (trimmed !== "") {
+      const parsed = parseInt(trimmed, 10);
+      if (!isNaN(parsed)) {
+        const clamped = clampScanConcurrency(parsed);
+        setSavedIndicator("");
+        if (concurrencyDebounceRef.current) clearTimeout(concurrencyDebounceRef.current);
+        concurrencyDebounceRef.current = setTimeout(() => void persistConcurrency(clamped), 400);
+      }
     }
   };
 

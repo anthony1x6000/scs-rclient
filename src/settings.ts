@@ -110,7 +110,6 @@ export async function setSubdirectories(items: string[]): Promise<void> {
 }
 
 export function clampScanConcurrency(threads: number): number {
-  if (isNaN(threads)) return DEFAULT_SCAN_CONCURRENCY;
   return Math.min(Math.max(Math.trunc(threads), MIN_SCAN_CONCURRENCY), MAX_SCAN_CONCURRENCY);
 }
 
