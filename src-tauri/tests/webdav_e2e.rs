@@ -1,6 +1,6 @@
 use scs_rclient_lib::webdav::{
     build_file_url, collect_local_files, compute_sha256, execute_webdav_action,
-    list_remote_recursive, parse_propfind_xml, relative_item_path, resolve_item_url,
+    list_remote_recursive, parse_propfind_xml, relative_item_path,
     verify_webdav_auth,
 };
 use std::collections::HashSet;
@@ -280,27 +280,40 @@ fn test_live_copyparty_e2e_full_roundtrip() {
         |msg| log_output.push_str(msg),
     );
     assert!(ls_res.is_ok(), "LS action failed: {:?}", ls_res);
-    assert!(log_output.contains(".gitignore"), "LS must include .gitignore");
-    assert!(log_output.contains("index.html"), "LS must include index.html");
+    assert!(
+        log_output.contains(".gitignore"),
+        "LS must include .gitignore; actual output:\n{}",
+        log_output
+    );
+    assert!(
+        log_output.contains("index.html"),
+        "LS must include index.html; actual output:\n{}",
+        log_output
+    );
     assert!(
         log_output.contains("after quiz and survey.html"),
-        "LS must include spaces file"
+        "LS must include spaces file; actual output:\n{}",
+        log_output
     );
     assert!(
         log_output.contains("Unit03_MATH1060DE_S26.docx"),
-        "LS must include docx file"
+        "LS must include docx file; actual output:\n{}",
+        log_output
     );
     assert!(
         log_output.contains("Assets/icons/banner.png"),
-        "LS must include depth 2 file Assets/icons/banner.png"
+        "LS must include depth 2 file Assets/icons/banner.png; actual output:\n{}",
+        log_output
     );
     assert!(
         log_output.contains("css/themes/dark/style.css"),
-        "LS must include depth 3 file css/themes/dark/style.css"
+        "LS must include depth 3 file css/themes/dark/style.css; actual output:\n{}",
+        log_output
     );
     assert!(
         log_output.contains(".gemini/settings.json"),
-        "LS must include hidden dir file .gemini/settings.json"
+        "LS must include hidden dir file .gemini/settings.json; actual output:\n{}",
+        log_output
     );
 
     // 5. Execute LSD (Verify directory listing)
