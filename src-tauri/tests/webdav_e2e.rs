@@ -1,7 +1,7 @@
 use scs_rclient_lib::webdav::{
     build_file_url, collect_local_files, compute_sha256, execute_webdav_action,
     list_remote_recursive, parse_propfind_xml, parse_webdav_date, relative_item_path,
-    should_upload_file, verify_webdav_auth,
+    resolve_item_url, should_upload_file, verify_webdav_auth,
 };
 use std::collections::HashSet;
 use std::fs;
