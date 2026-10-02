@@ -78,10 +78,15 @@ example: `tldr: diff update ai review action, switch model to nemotron, remove d
 format findings: `<file>:L<line>: <sev>: <problem>. <fix>.`
 
 severity levels:
-- critical: blocks merge. Malicious code, security vulnerability, data loss, fatal runtime crash.
-- required: blocks merge. Logic bug, unhandled exception, breaking API change without migration.
-- optional: suggestion. Non-blocking improvement or pattern optimization.
-- nit: minor cleanup.
+- critical: blocks merge. Malicious code, confirmed exploitable vulnerability, data loss, secret leakage.
+- required: blocks merge. Concrete, reproducible runtime bug, regression, or broken error handling.
+  Must NOT be used for:
+  * Platform environment design (e.g. standard desktop user profile directory permissions vs custom Win32 DACLs).
+  * Defensive-in-depth suggestions where data is already sanitized upstream.
+  * Questioning compile-time guarantees (e.g. Send/Sync in Rust) that CI compiler already verifies.
+  * Demanding secret/password hashes in cache keys (scoping cache by username is the standard pattern; credentials are kept in OS keychain).
+- optional: suggestion. Non-blocking improvement, defense-in-depth suggestion, or pattern optimization.
+- nit: minor cleanup, documentation polish, or cosmetic feedback.
 
 if no defects found, output: `no critical or required issues found.`
 
