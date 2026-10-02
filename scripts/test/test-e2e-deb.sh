@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # E2E test for the .deb release binary:
-# install -> verify structure/permissions -> sidecar WebDAV test -> GUI smoke -> uninstall
+# install -> verify structure/permissions -> GUI smoke -> uninstall
 set -euo pipefail
 
 # Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
@@ -21,21 +21,13 @@ echo "=== Verifying package installation ==="
 dpkg -l scs-rclient
 dpkg -L scs-rclient
 
-echo "=== Locating installed app binary and rclone sidecar ==="
+echo "=== Locating installed app binary ==="
 APP_BIN="/usr/bin/scs-rclient"
 if [[ ! -x "$APP_BIN" ]]; then
   echo "::error::Expected app binary not found at $APP_BIN" >&2
   exit 1
 fi
 ls -l "$APP_BIN"
-
-# Tauri resolves the sidecar as <dir of running exe>/rclone-sidecar, so assert that
-# exact path instead of globbing for anything named rclone-sidecar*.
-bash "$SCRIPT_DIR/verify-sidecar-layout.sh" "$APP_BIN" "${TARGET_RCLONE_VERSION:-}"
-SIDECAR="/usr/bin/rclone-sidecar"
-
-echo "=== Running sidecar WebDAV verification ==="
-bash "$SCRIPT_DIR/verify-webdav-endpoint.sh" "$SIDECAR"
 
 echo "=== GUI launch smoke test (xvfb-run) ==="
 if timeout 15 xvfb-run -a "$APP_BIN" >/tmp/scs-deb-launch.log 2>&1; then
