@@ -14,15 +14,13 @@ interface ActionDef {
 }
 
 const ACTIONS: ActionDef[] = [
-  { id: "put-dry", label: "Put --dry-run (copy local to remote)", preview: true },
-  { id: "get-dry", label: "Get --dry-run (copy remote to local)", preview: true },
-  { id: "put", label: "Put (copy local to remote)" },
-  { id: "get", label: "Get (copy remote to local)" },
-  { id: "put-checksum", label: "Put --checksum (hash check local to remote)" },
-  { id: "get-checksum", label: "Get --checksum (hash check remote to local)" },
-  { id: "ls", label: "List files in remote (ls)", preview: true },
-  { id: "lsd", label: "List directories in remote (lsd)", preview: true },
-  { id: "check", label: "Check difference (check)", preview: true },
+  { id: "put", label: "Upload (Local → Remote)" },
+  { id: "get", label: "Download (Remote → Local)" },
+  { id: "put-dry", label: "Preview Upload (Dry Run)", preview: true },
+  { id: "get-dry", label: "Preview Download (Dry Run)", preview: true },
+  { id: "check", label: "Compare Local vs Remote", preview: true },
+  { id: "ls", label: "List Remote Files", preview: true },
+  { id: "lsd", label: "List Remote Folders", preview: true },
 ];
 
 export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsProps) {
@@ -50,7 +48,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
       return;
     }
     if (!previewOk) {
-      onLog("Sync blocked: run a --dry-run, check, or ls preview successfully first.\n");
+      onLog("Sync blocked: run a preview (Compare, List, or Dry Run) successfully first.\n");
       return;
     }
     setSyncArmed(false);
@@ -83,8 +81,8 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
             {syncArmed
               ? previewOk
                 ? "Sync will DELETE remote files missing locally. Click again to confirm."
-                : "Run a --dry-run / check / ls preview first, then click again to arm sync"
-              : "Sync (overwrite remote)"}
+                : "Run a preview (Compare, List, or Dry Run) first, then click again to arm sync"
+              : "Sync (Mirror Local to Remote)"}
           </button>
         </li>
       </ul>
