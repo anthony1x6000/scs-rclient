@@ -65,9 +65,12 @@ function App() {
 
       <div className="bottom-0 absolute p-2 w-[100%] text-white flex flex-col gap-4 overflow-hidden">
         <div className="p-2 font-['Roboto'] font-light">
-          <div className="text-nowrap">
+          <div className="flex items-baseline justify-between gap-4 w-full min-w-0">
             <Dropdown onSelect={setSelectedSubdir} />
-            <div className="inline italic">
+            <div
+              className="italic truncate shrink-[9999] min-w-0 ml-auto"
+              title="a subdirectory of your WebDAV drive"
+            >
               a subdirectory of your WebDAV drive
             </div>
           </div>
