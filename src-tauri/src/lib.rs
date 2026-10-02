@@ -181,9 +181,12 @@ async fn run_webdav_action(
     let cancel_flag = state.cancel_flag.clone();
 
     let mount_dir_str = get_mount_dir(app.clone(), target_subdir)?;
-    let local_path = match join_contained(std::path::Path::new(&mount_dir_str), &subdir) {
-        Ok(p) => p,
-        Err(_) => std::path::Path::new(&mount_dir_str).join(&subdir),
+    let base_mount = std::path::Path::new(&mount_dir_str);
+    let trimmed_subdir = subdir.trim();
+    let local_path = if trimmed_subdir.is_empty() || trimmed_subdir == "." {
+        base_mount.to_path_buf()
+    } else {
+        join_contained(base_mount, trimmed_subdir)?
     };
 
     let remote_url = webdav::build_remote_url(&base_url, &subdir);
