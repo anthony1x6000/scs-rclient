@@ -201,7 +201,7 @@ function preparePayload() {
     "4. style invariants: plain text only. Never use bold markdown asterisks (**). Never use emojis.",
     "5. review structure:",
     "   - tldr: write top-level summary in /caveman mode (1-3 sentences, drop articles, drop filler, ultra-compressed, exact facts, pattern: [thing] [action] [reason]. [status].).",
-    "   - findings: format findings as <file>:L<line>: <sev>: <problem>. <fix>. where <sev> is: critical (exploitable vulnerabilities, secret leakage), required (broken code, runtime bugs, regression), optional (refactor suggestion, non-blocking improvement), or nit (style, comment, doc polish). If no defects, output 'no critical or required issues found.'",
+    "   - findings: format findings as <file>:L<line>: <sev>: <problem>. <fix>. where <sev> is: critical (exploitable vulnerabilities, secret leakage), required (concrete reproducible runtime bugs, regressions, or unhandled exceptions; not platform environment design, compile-time assertions, or defense-in-depth suggestions), optional (defense-in-depth, refactor suggestion, non-blocking improvement), or nit (style, comment, doc polish). If no defects, output 'no critical or required issues found.'",
     "   - verdict: end review with explicit verdict on its own line: verdict: APPROVE or verdict: REQUEST CHANGES. Issue verdict: REQUEST CHANGES ONLY when critical or required defects are present. If findings are only optional suggestions or nits, issue verdict: APPROVE."
   ];
 
