@@ -20,14 +20,15 @@ cat <<EOF > "$CONF_FILE"
 p: $UPSTREAM_PORT
 dav-rt
 dav-auth
+ed
 q
 
 [/$COURSE_DIR]
 $MOCK_DIR/$COURSE_DIR
 accs:
-  rwda: testuser
+  rwda.: testuser
 flags:
-  rw,d,daw
+  rw,d,daw,dots
 
 [accounts]
 testuser: testpass
@@ -48,7 +49,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== Launching Copyparty backend server on port $UPSTREAM_PORT ==="
-python3 -m copyparty -c "$CONF_FILE" > /tmp/copyparty-test.log 2>&1 &
+python3 -m copyparty -c "$CONF_FILE" -ed > /tmp/copyparty-test.log 2>&1 &
 SERVER_PID=$!
 
 READY=0
