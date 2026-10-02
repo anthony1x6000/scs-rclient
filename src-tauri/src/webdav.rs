@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,6 +19,7 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
     let mut in_href = false;
     let mut in_resourcetype = false;
     let mut in_getcontentlength = false;
+    let mut in_iscollection = false;
 
     let mut current_href = String::new();
     let mut current_is_dir = false;
@@ -30,54 +31,94 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(ref e)) => {
                 let local = e.local_name();
-                match local.as_ref() {
-                    b"response" => {
-                        in_response = true;
-                        current_href.clear();
-                        current_is_dir = false;
-                        current_size = 0;
-                    }
-                    b"href" if in_response => in_href = true,
-                    b"resourcetype" if in_response => in_resourcetype = true,
-                    b"collection" if in_resourcetype => current_is_dir = true,
-                    b"getcontentlength" if in_response => in_getcontentlength = true,
-                    _ => {}
+                let name = local.as_ref();
+                if name.eq_ignore_ascii_case(b"response") {
+                    in_response = true;
+                    current_href.clear();
+                    current_is_dir = false;
+                    current_size = 0;
+                } else if in_response && name.eq_ignore_ascii_case(b"href") {
+                    in_href = true;
+                } else if in_response && name.eq_ignore_ascii_case(b"resourcetype") {
+                    in_resourcetype = true;
+                } else if in_resourcetype && name.eq_ignore_ascii_case(b"collection") {
+                    current_is_dir = true;
+                } else if in_response && name.eq_ignore_ascii_case(b"getcontentlength") {
+                    in_getcontentlength = true;
+                } else if in_response
+                    && (name.eq_ignore_ascii_case(b"iscollection")
+                        || name.eq_ignore_ascii_case(b"isfolder"))
+                {
+                    in_iscollection = true;
                 }
             }
             Ok(quick_xml::events::Event::Empty(ref e)) => {
                 let local = e.local_name();
-                if local.as_ref() == b"collection" && in_resourcetype {
+                let name = local.as_ref();
+                if in_resourcetype && name.eq_ignore_ascii_case(b"collection") {
                     current_is_dir = true;
                 }
             }
             Ok(quick_xml::events::Event::Text(ref e)) => {
                 if in_href {
                     if let Ok(text) = e.unescape() {
-                        current_href = text.to_string();
+                        current_href.push_str(&text);
                     }
                 } else if in_getcontentlength {
                     if let Ok(text) = e.unescape() {
                         current_size = text.trim().parse::<u64>().unwrap_or(0);
                     }
+                } else if in_iscollection {
+                    if let Ok(text) = e.unescape() {
+                        let val = text.trim();
+                        if val == "1" || val.eq_ignore_ascii_case("true") {
+                            current_is_dir = true;
+                        }
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::CData(ref e)) => {
+                if in_href {
+                    if let Ok(text) = std::str::from_utf8(e.as_ref()) {
+                        current_href.push_str(text);
+                    }
+                } else if in_getcontentlength {
+                    if let Ok(text) = std::str::from_utf8(e.as_ref()) {
+                        current_size = text.trim().parse::<u64>().unwrap_or(0);
+                    }
+                } else if in_iscollection {
+                    if let Ok(text) = std::str::from_utf8(e.as_ref()) {
+                        let val = text.trim();
+                        if val == "1" || val.eq_ignore_ascii_case("true") {
+                            current_is_dir = true;
+                        }
+                    }
                 }
             }
             Ok(quick_xml::events::Event::End(ref e)) => {
                 let local = e.local_name();
-                match local.as_ref() {
-                    b"response" => {
-                        in_response = false;
-                        if !current_href.is_empty() {
-                            items.push(WebdavItem {
-                                href: current_href.clone(),
-                                is_dir: current_is_dir,
-                                size: current_size,
-                            });
-                        }
+                let name = local.as_ref();
+                if name.eq_ignore_ascii_case(b"response") {
+                    in_response = false;
+                    let clean_href = current_href.trim();
+                    if !clean_href.is_empty() {
+                        let is_dir = current_is_dir || clean_href.ends_with('/');
+                        items.push(WebdavItem {
+                            href: clean_href.to_string(),
+                            is_dir,
+                            size: current_size,
+                        });
                     }
-                    b"href" => in_href = false,
-                    b"resourcetype" => in_resourcetype = false,
-                    b"getcontentlength" => in_getcontentlength = false,
-                    _ => {}
+                } else if name.eq_ignore_ascii_case(b"href") {
+                    in_href = false;
+                } else if name.eq_ignore_ascii_case(b"resourcetype") {
+                    in_resourcetype = false;
+                } else if name.eq_ignore_ascii_case(b"getcontentlength") {
+                    in_getcontentlength = false;
+                } else if name.eq_ignore_ascii_case(b"iscollection")
+                    || name.eq_ignore_ascii_case(b"isfolder")
+                {
+                    in_iscollection = false;
                 }
             }
             Ok(quick_xml::events::Event::Eof) => break,
@@ -97,7 +138,9 @@ fn decode_percent(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16) {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 result.push(byte);
                 i += 3;
                 continue;
@@ -112,8 +155,13 @@ fn decode_percent(s: &str) -> String {
 /// Resolves an item's href against the base URL, handling absolute URLs,
 /// absolute paths (/...), and relative paths.
 pub fn resolve_item_url(base_url: &str, item_href: &str) -> String {
+    let safe_href = if item_href.contains(' ') {
+        item_href.replace(' ', "%20")
+    } else {
+        item_href.to_string()
+    };
     if let Ok(base) = rustydav::prelude::Url::parse(base_url) {
-        if let Ok(joined) = base.join(item_href) {
+        if let Ok(joined) = base.join(&safe_href) {
             let mut s = joined.to_string();
             if item_href.ends_with('/') && !s.ends_with('/') {
                 s.push('/');
@@ -122,7 +170,7 @@ pub fn resolve_item_url(base_url: &str, item_href: &str) -> String {
         }
     }
     let clean_base = base_url.trim_end_matches('/');
-    let clean_href = item_href.trim_start_matches('/');
+    let clean_href = safe_href.trim_start_matches('/');
     format!("{}/{}", clean_base, clean_href)
 }
 
@@ -144,15 +192,49 @@ pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
     let trimmed_base = base_path.trim_end_matches('/');
     let trimmed_item = item_path.trim_end_matches('/');
 
-    if trimmed_item == trimmed_base {
+    // 1. Exact match (case-insensitive) - collection root itself
+    if trimmed_item.eq_ignore_ascii_case(trimmed_base) {
         return String::new();
     }
 
-    if let Some(rel) = trimmed_item.strip_prefix(trimmed_base) {
-        rel.trim_start_matches('/').to_string()
-    } else {
-        trimmed_item.rsplit('/').next().unwrap_or("").to_string()
+    // 2. Direct prefix match (case-insensitive)
+    if trimmed_item.len() > trimmed_base.len() {
+        let (prefix, suffix) = trimmed_item.split_at(trimmed_base.len());
+        if prefix.eq_ignore_ascii_case(trimmed_base)
+            && (suffix.starts_with('/') || trimmed_base.is_empty())
+        {
+            return suffix.trim_start_matches('/').to_string();
+        }
     }
+
+    // 3. Substring match for base path in item path
+    if !trimmed_base.is_empty() {
+        let lower_item = trimmed_item.to_ascii_lowercase();
+        let lower_base = trimmed_base.to_ascii_lowercase();
+        if let Some(idx) = lower_item.find(&lower_base) {
+            let after = &trimmed_item[idx + trimmed_base.len()..];
+            let rel = after.trim_start_matches('/');
+            if !rel.is_empty() {
+                return rel.to_string();
+            }
+        }
+    }
+
+    // 4. Substring match on last segment of base path (e.g. course code)
+    let last_seg = trimmed_base.rsplit('/').next().unwrap_or("");
+    if !last_seg.is_empty() {
+        let lower_item = trimmed_item.to_ascii_lowercase();
+        let lower_seg = format!("/{}", last_seg.to_ascii_lowercase());
+        if let Some(idx) = lower_item.find(&lower_seg) {
+            let after = &trimmed_item[idx + lower_seg.len()..];
+            let rel = after.trim_start_matches('/');
+            if !rel.is_empty() {
+                return rel.to_string();
+            }
+        }
+    }
+
+    trimmed_item.rsplit('/').next().unwrap_or("").to_string()
 }
 
 /// Builds the canonical remote collection URL with trailing slash.
@@ -213,40 +295,97 @@ pub fn ensure_remote_parent_dirs(
 }
 
 /// Recursively lists remote WebDAV items under remote_url.
-/// First attempts Depth: infinity. If the server rejects Depth: infinity (e.g. 403 Forbidden or 400 Bad Request),
+/// First attempts Depth: infinity. If Depth: infinity fails, returns HTTP error,
+/// or returns 0 child items (e.g. server restricts Depth: infinity to Depth: 0),
 /// it falls back to breadth-first traversal using Depth: 1.
 pub fn list_remote_recursive(
     client: &rustydav::client::Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
 ) -> Result<Vec<WebdavItem>, String> {
+    list_remote_recursive_with_log(client, remote_url, cancel_flag, |_| {})
+}
+
+/// Recursively lists remote WebDAV items under remote_url with streamed diagnostic logs.
+pub fn list_remote_recursive_with_log<F>(
+    client: &rustydav::client::Client,
+    remote_url: &str,
+    cancel_flag: &AtomicBool,
+    mut log: F,
+) -> Result<Vec<WebdavItem>, String>
+where
+    F: FnMut(&str),
+{
     if cancel_flag.load(Ordering::SeqCst) {
         return Err("Operation canceled by user.".to_string());
     }
 
     // Try Depth: infinity first
-    if let Ok(res) = client.list(remote_url, "infinity") {
-        let status = res.status();
-        if status.is_success() || status.as_u16() == 207 {
-            let body = res.text().unwrap_or_default();
-            let items = parse_propfind_xml(&body);
-            if !items.is_empty() {
-                return Ok(items);
+    log(&format!(
+        "Querying remote server with Depth: infinity for {}...\n",
+        remote_url
+    ));
+    match client.list(remote_url, "infinity") {
+        Ok(res) => {
+            let status = res.status();
+            if status.is_success() || status.as_u16() == 207 {
+                let body = res.text().unwrap_or_default();
+                let items = parse_propfind_xml(&body);
+                // Depth: infinity is only accepted if it returned child items (not just the root collection itself)
+                let child_count = items
+                    .iter()
+                    .filter(|i| !relative_item_path(remote_url, &i.href).is_empty())
+                    .count();
+                if child_count > 0 {
+                    log(&format!(
+                        "Server returned {} items via Depth: infinity.\n",
+                        child_count
+                    ));
+                    return Ok(items);
+                } else {
+                    log("Depth: infinity returned 0 child items (server likely restricts Depth: infinity). Falling back to Depth: 1 traversal...\n");
+                }
+            } else {
+                log(&format!(
+                    "Server responded with HTTP {} for Depth: infinity. Falling back to Depth: 1 traversal...\n",
+                    status
+                ));
             }
+        }
+        Err(e) => {
+            log(&format!(
+                "Depth: infinity request failed ({}). Falling back to Depth: 1 traversal...\n",
+                e
+            ));
         }
     }
 
-    // Fallback: BFS traversal with Depth: 1
-    let mut queue = vec![remote_url.to_string()];
+    // Fallback: Breadth-First-Search traversal using Depth: 1
+    log("Scanning directories using Depth: 1...\n");
+    let mut queue = VecDeque::new();
+    queue.push_back(remote_url.to_string());
     let mut visited = HashSet::new();
     let mut all_items = Vec::new();
 
-    visited.insert(remote_url.trim_end_matches('/').to_string());
+    visited.insert(remote_url.trim_end_matches('/').to_ascii_lowercase());
 
-    while let Some(current_url) = queue.pop() {
+    let mut scanned_count = 0;
+    while let Some(current_url) = queue.pop_front() {
         if cancel_flag.load(Ordering::SeqCst) {
             return Err("Operation canceled by user.".to_string());
         }
+
+        scanned_count += 1;
+        let rel_folder = relative_item_path(remote_url, &current_url);
+        let display_folder = if rel_folder.is_empty() {
+            "/ (root)"
+        } else {
+            &rel_folder
+        };
+        log(&format!(
+            "[{}] Scanning directory: {}...\n",
+            scanned_count, display_folder
+        ));
 
         let res = client
             .list(&current_url, "1")
@@ -260,6 +399,9 @@ pub fn list_remote_recursive(
         let body = res.text().unwrap_or_default();
         let items = parse_propfind_xml(&body);
 
+        let mut children_in_dir = 0;
+        let mut new_dirs = 0;
+        let mut new_files = 0;
         for item in items {
             let rel = relative_item_path(&current_url, &item.href);
             if rel.is_empty() {
@@ -267,18 +409,41 @@ pub fn list_remote_recursive(
                 continue;
             }
 
+            children_in_dir += 1;
             if item.is_dir {
+                new_dirs += 1;
                 let sub_url = resolve_item_url(&current_url, &item.href);
-                let sub_key = sub_url.trim_end_matches('/').to_string();
+                let sub_key = sub_url.trim_end_matches('/').to_ascii_lowercase();
                 if visited.insert(sub_key) {
-                    queue.push(sub_url);
+                    queue.push_back(sub_url);
                 }
                 all_items.push(item);
             } else {
+                new_files += 1;
                 all_items.push(item);
             }
         }
+
+        if children_in_dir == 0 && current_url == remote_url {
+            let snippet_len = body.len().min(400);
+            log(&format!(
+                "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
+                &body[..snippet_len]
+            ));
+        } else {
+            log(&format!(
+                "   -> Found {} file(s) and {} subfolder(s) in {}\n",
+                new_files, new_dirs, display_folder
+            ));
+        }
     }
+
+    let file_count = all_items.iter().filter(|i| !i.is_dir).count();
+    let dir_count = all_items.iter().filter(|i| i.is_dir).count();
+    log(&format!(
+        "\nScan complete: {} file(s) and {} subdirector(ies) discovered across {} folder(s).\n\n",
+        file_count, dir_count, scanned_count
+    ));
 
     Ok(all_items)
 }
@@ -355,7 +520,7 @@ where
     match action {
         "ls" => {
             log(&format!("Listing remote files in {}...\n", remote_url));
-            let items = list_remote_recursive(client, remote_url, cancel_flag)?;
+            let items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
             let mut count = 0;
             let mut total_size = 0;
             for item in &items {
@@ -458,36 +623,55 @@ where
             let is_dry = action == "get-dry";
             let with_checksum = action == "get-checksum";
             log(&format!("Listing remote files in {}...\n", remote_url));
-            let items = list_remote_recursive(client, remote_url, cancel_flag)?;
+            let items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let files_to_download: Vec<(&WebdavItem, String)> = items
+                .iter()
+                .filter(|item| !item.is_dir)
+                .filter_map(|item| {
+                    let rel = relative_item_path(remote_url, &item.href);
+                    if rel.is_empty() {
+                        None
+                    } else {
+                        Some((item, rel))
+                    }
+                })
+                .collect();
+
+            let total_files = files_to_download.len();
+            log(&format!(
+                "Starting download of {} file(s)...\n\n",
+                total_files
+            ));
+
             let mut count = 0;
             let mut total_bytes = 0;
-            for item in &items {
-                if item.is_dir {
-                    continue;
-                }
-                let rel = relative_item_path(remote_url, &item.href);
-                if rel.is_empty() {
-                    continue;
-                }
+            for (idx, (item, rel)) in files_to_download.iter().enumerate() {
+                let current_num = idx + 1;
                 if cancel_flag.load(Ordering::SeqCst) {
                     log("Operation canceled by user.\n");
                     return Ok(());
                 }
                 if is_dry {
                     log(&format!(
-                        "NOTICE: {}: Skipped copy (dry run, {} bytes)\n",
-                        rel, item.size
+                        "[{}/{}] NOTICE: {}: Skipped copy (dry run, {} bytes)\n",
+                        current_num, total_files, rel, item.size
                     ));
                     count += 1;
                     continue;
                 }
+                log(&format!(
+                    "[{}/{}] Downloading: {} ({} bytes)...\n",
+                    current_num, total_files, rel, item.size
+                ));
                 let download_url = resolve_item_url(remote_url, &item.href);
                 let get_res = client
                     .get(&download_url)
                     .map_err(|e| format!("Download failed for {}: {}", rel, e))?;
                 if !get_res.status().is_success() {
                     log(&format!(
-                        "ERROR: Failed to download {}: HTTP {}\n",
+                        "[{}/{}] ERROR: Failed to download {}: HTTP {}\n",
+                        current_num,
+                        total_files,
                         rel,
                         get_res.status()
                     ));
@@ -496,7 +680,7 @@ where
                 let bytes = get_res
                     .bytes()
                     .map_err(|e| format!("Failed to read response bytes: {}", e))?;
-                let target_file = local_dir.join(&rel);
+                let target_file = local_dir.join(rel);
                 if let Some(parent) = target_file.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
                         format!("Failed to create directory {}: {}", parent.display(), e)
@@ -512,7 +696,9 @@ where
                 count += 1;
                 total_bytes += bytes.len();
                 log(&format!(
-                    "Downloaded: {} ({} bytes){}\n",
+                    "[{}/{}] Downloaded: {} ({} bytes){}\n",
+                    current_num,
+                    total_files,
                     rel,
                     bytes.len(),
                     checksum_str
@@ -526,7 +712,7 @@ where
         }
         "check" => {
             log(&format!("Comparing local files with remote in {}...\n", remote_url));
-            let remote_items = list_remote_recursive(client, remote_url, cancel_flag)?;
+            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
             let mut remote_map: HashMap<String, u64> = HashMap::new();
             for item in remote_items {
                 if item.is_dir {
@@ -596,7 +782,7 @@ where
                     uploaded += 1;
                 }
             }
-            let remote_items = list_remote_recursive(client, remote_url, cancel_flag)?;
+            let remote_items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
             let mut deleted = 0;
             for item in remote_items {
                 if item.is_dir {
@@ -703,5 +889,191 @@ mod tests {
         let url = build_file_url(base, "my folder/my file.txt");
         assert_eq!(url, "http://localhost:3923/docs/my%20folder/my%20file.txt");
         assert!(rustydav::prelude::Url::parse(&url).is_ok());
+    }
+
+    #[test]
+    fn test_parse_propfind_iis_cases_and_cdata() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+        <D:multistatus xmlns:D="DAV:">
+            <D:Response>
+                <D:Href><![CDATA[/content/enforced/1052175-dev_asteve18/]]></D:Href>
+                <D:PropStat>
+                    <D:Prop>
+                        <D:ResourceType><D:Collection/></D:ResourceType>
+                        <D:iscollection>1</D:iscollection>
+                    </D:Prop>
+                    <D:Status>HTTP/1.1 200 OK</D:Status>
+                </D:PropStat>
+            </D:Response>
+            <D:Response>
+                <D:Href>/content/enforced/1052175-dev_asteve18/lecture1.pdf</D:Href>
+                <D:PropStat>
+                    <D:Prop>
+                        <D:GetContentLength>54321</D:GetContentLength>
+                        <D:ResourceType/>
+                        <D:iscollection>0</D:iscollection>
+                    </D:Prop>
+                    <D:Status>HTTP/1.1 200 OK</D:Status>
+                </D:PropStat>
+            </D:Response>
+            <D:Response>
+                <D:Href>/content/enforced/1052175-dev_asteve18/assignments/</D:Href>
+                <D:PropStat>
+                    <D:Prop>
+                        <D:isfolder>true</D:isfolder>
+                    </D:Prop>
+                    <D:Status>HTTP/1.1 200 OK</D:Status>
+                </D:PropStat>
+            </D:Response>
+        </D:multistatus>"#;
+
+        let items = parse_propfind_xml(xml);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].href, "/content/enforced/1052175-dev_asteve18/");
+        assert!(items[0].is_dir);
+        assert_eq!(items[1].href, "/content/enforced/1052175-dev_asteve18/lecture1.pdf");
+        assert!(!items[1].is_dir);
+        assert_eq!(items[1].size, 54321);
+        assert_eq!(items[2].href, "/content/enforced/1052175-dev_asteve18/assignments/");
+        assert!(items[2].is_dir);
+    }
+
+    #[test]
+    fn test_relative_item_path_case_insensitivity_and_ports() {
+        let base = "https://courselinkdav.desire2learn.com/content/enforced/1052175-dev_asteve18/";
+
+        // 1. Root collection matches case-insensitively
+        assert_eq!(
+            relative_item_path(base, "/Content/Enforced/1052175-dev_asteve18/"),
+            ""
+        );
+
+        // 2. File with mixed case prefix
+        assert_eq!(
+            relative_item_path(base, "/Content/Enforced/1052175-dev_asteve18/syllabus.pdf"),
+            "syllabus.pdf"
+        );
+
+        // 3. Nested file with mixed case
+        assert_eq!(
+            relative_item_path(
+                base,
+                "/Content/Enforced/1052175-dev_asteve18/Week 1/Lecture Notes.pdf"
+            ),
+            "Week 1/Lecture Notes.pdf"
+        );
+
+        // 4. Server href containing explicit port :443
+        assert_eq!(
+            relative_item_path(
+                base,
+                "https://courselinkdav.desire2learn.com:443/content/enforced/1052175-dev_asteve18/exam.pdf"
+            ),
+            "exam.pdf"
+        );
+    }
+
+    #[test]
+    fn test_parse_propfind_d2l_brightspace_real_response() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+        <d:response>
+                <d:href><![CDATA[/content/enforced/1052175-dev_asteve18/]]></d:href>
+                <d:propstat>
+                        <d:prop>
+                                <d:getlastmodified>Mon, 28 Sep 2026 13:45:09 GMT</d:getlastmodified>
+                                <d:resourcetype>
+                                        <d:collection/>
+                                </d:resourcetype>
+                                <d:supportedlock/>
+                        </d:prop>
+                        <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+        </d:response>
+        <d:response>
+                <d:href><![CDATA[/content/enforced/1052175-dev_asteve18/.gemini/]]></d:href>
+                <d:propstat>
+                        <d:prop>
+                                <d:getlastmodified>Wed, 24 Jun 2026 13:10:24 GMT</d:getlastmodified>
+                                <d:resourcetype>
+                                        <d:collection/>
+                                </d:resourcetype>
+                                <d:supportedlock/>
+                        </d:prop>
+                        <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+        </d:response>
+        <d:response>
+                <d:href><![CDATA[/content/enforced/1052175-dev_asteve18/.gitignore]]></d:href>
+                <d:propstat>
+                        <d:prop>
+                                <d:getcontentlength>197</d:getcontentlength>
+                                <d:getlastmodified>Wed, 24 Jun 2026 13:09:15 GMT</d:getlastmodified>
+                                <d:resourcetype/>
+                                <d:getcontenttype>application/octet-stream</d:getcontenttype>
+                                <d:supportedlock/>
+                        </d:prop>
+                        <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+        </d:response>
+        <d:response>
+                <d:href><![CDATA[/content/enforced/1052175-dev_asteve18/after%20quiz%20and%20survey.html]]></d:href>
+                <d:propstat>
+                        <d:prop>
+                                <d:getcontentlength>120</d:getcontentlength>
+                                <d:getlastmodified>Mon, 28 Sep 2026 13:45:09 GMT</d:getlastmodified>
+                                <d:resourcetype/>
+                                <d:getcontenttype>text/html</d:getcontenttype>
+                                <d:supportedlock/>
+                        </d:prop>
+                        <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+        </d:response>
+        <d:response>
+                <d:href><![CDATA[/content/enforced/1052175-dev_asteve18/Unit03_MATH1060DE_S26.docx]]></d:href>
+                <d:propstat>
+                        <d:prop>
+                                <d:getcontentlength>3952509</d:getcontentlength>
+                                <d:getlastmodified>Tue, 07 Jul 2026 18:13:47 GMT</d:getlastmodified>
+                                <d:resourcetype/>
+                                <d:getcontenttype>application/vnd.openxmlformats-officedocument.wordprocessingml.document</d:getcontenttype>
+                                <d:supportedlock/>
+                        </d:prop>
+                        <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+        </d:response>
+</d:multistatus>"#;
+
+        let base = "https://courselinkdav.desire2learn.com/content/enforced/1052175-dev_asteve18/";
+        let items = parse_propfind_xml(xml);
+        assert_eq!(items.len(), 5);
+
+        // Item 0: Root collection
+        assert_eq!(items[0].href, "/content/enforced/1052175-dev_asteve18/");
+        assert!(items[0].is_dir);
+        assert_eq!(relative_item_path(base, &items[0].href), "");
+
+        // Item 1: .gemini/ directory
+        assert_eq!(items[1].href, "/content/enforced/1052175-dev_asteve18/.gemini/");
+        assert!(items[1].is_dir);
+        assert_eq!(relative_item_path(base, &items[1].href), ".gemini");
+
+        // Item 2: .gitignore file
+        assert_eq!(items[2].href, "/content/enforced/1052175-dev_asteve18/.gitignore");
+        assert!(!items[2].is_dir);
+        assert_eq!(items[2].size, 197);
+        assert_eq!(relative_item_path(base, &items[2].href), ".gitignore");
+
+        // Item 3: after quiz and survey.html (percent-encoded in CDATA)
+        assert_eq!(items[3].href, "/content/enforced/1052175-dev_asteve18/after%20quiz%20and%20survey.html");
+        assert!(!items[3].is_dir);
+        assert_eq!(items[3].size, 120);
+        assert_eq!(relative_item_path(base, &items[3].href), "after quiz and survey.html");
+
+        // Item 4: Unit03_MATH1060DE_S26.docx (large file size)
+        assert_eq!(items[4].href, "/content/enforced/1052175-dev_asteve18/Unit03_MATH1060DE_S26.docx");
+        assert!(!items[4].is_dir);
+        assert_eq!(items[4].size, 3952509);
+        assert_eq!(relative_item_path(base, &items[4].href), "Unit03_MATH1060DE_S26.docx");
     }
 }
