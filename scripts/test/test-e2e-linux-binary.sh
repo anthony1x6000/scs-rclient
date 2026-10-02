@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# E2E test for the standalone Linux release binary + sidecar pair.
+# E2E test for the standalone Linux release binary.
 set -euo pipefail
 
 # Prevent ambient RCLONE_VERSION from colliding with rclone's boolean --version flag
@@ -7,9 +7,6 @@ unset RCLONE_VERSION
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_BIN="${APP_BIN:-src-tauri/target/release/scs-rclient}"
-# This is the name the app actually resolves at runtime, not the bundler's
-# triple-suffixed input name (rclone-sidecar-x86_64-unknown-linux-gnu).
-SIDECAR="${SIDECAR:-src-tauri/target/release/rclone-sidecar}"
 
 if [[ ! -f "$APP_BIN" ]]; then
   echo "::error::App binary not found: $APP_BIN" >&2
@@ -17,14 +14,6 @@ if [[ ! -f "$APP_BIN" ]]; then
 fi
 
 chmod +x "$APP_BIN"
-
-echo "=== Verifying the app finds its sidecar next to itself ==="
-bash "$SCRIPT_DIR/verify-sidecar-layout.sh" "$APP_BIN" "${TARGET_RCLONE_VERSION:-}"
-chmod +x "$SIDECAR"
-ls -l "$APP_BIN" "$SIDECAR"
-
-echo "=== Running sidecar WebDAV verification ==="
-bash "$SCRIPT_DIR/verify-webdav-endpoint.sh" "$SIDECAR"
 
 echo "=== GUI launch smoke test (xvfb-run) ==="
 if timeout 15 xvfb-run -a "$APP_BIN" >/tmp/scs-binary-launch.log 2>&1; then

@@ -21,14 +21,6 @@ modules:
     buildsystem: simple
     build-commands:
       - install -Dm755 src-tauri/target/release/scs-rclient /app/bin/scs-rclient
-      # The app looks for "rclone-sidecar" next to its own executable: Tauri drops
-      # both the "binaries/" prefix and the target-triple suffix configured in
-      # bundle.externalBin. Installing the tripled name (or a binaries/ copy) makes
-      # the packaged app report "No usable rclone binary found".
-      - install -Dm755 src-tauri/target/release/rclone-sidecar /app/bin/rclone-sidecar
-      # Kept deliberately as a PATH fallback so users can still run rclone from a
-      # shell inside the sandbox (and so scripts can call `--command=rclone`).
-      - ln -sf /app/bin/rclone-sidecar /app/bin/rclone
       - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/online.anthonyis.scs-rclient.png
       - install -Dm644 .github/flatpak/online.anthonyis.scs-rclient.desktop /app/share/applications/online.anthonyis.scs-rclient.desktop
       - install -Dm644 .github/flatpak/online.anthonyis.scs-rclient.metainfo.xml /app/share/metainfo/online.anthonyis.scs-rclient.metainfo.xml

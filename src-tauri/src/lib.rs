@@ -228,7 +228,6 @@ pub fn run() {
     tauri::Builder::default()
         .manage(WebdavState { cancel_flag })
         .plugin(tauri_plugin_store::Builder::default().build())
-        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             // Ensure ~/Documents/scs-rclient exists on startup
             if let Ok(docs_dir) = app.path().document_dir() {
