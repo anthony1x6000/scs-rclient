@@ -169,7 +169,7 @@ pub fn build_remote_url(base_url: &str, subdir: &str) -> String {
 /// Builds the URL for a specific file under a collection, ensuring proper percent-encoding.
 pub fn build_file_url(collection_url: &str, rel_path: &str) -> String {
     if let Ok(mut base) = rustydav::prelude::Url::parse(collection_url) {
-        if let Ok(mut segments) = base.path_segments_mut() {
+        let ok = if let Ok(mut segments) = base.path_segments_mut() {
             segments.pop_if_empty();
             for part in rel_path.split('/') {
                 let trimmed = part.trim();
@@ -177,6 +177,11 @@ pub fn build_file_url(collection_url: &str, rel_path: &str) -> String {
                     segments.push(trimmed);
                 }
             }
+            true
+        } else {
+            false
+        };
+        if ok {
             return base.to_string();
         }
     }
