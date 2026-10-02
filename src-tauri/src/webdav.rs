@@ -369,10 +369,23 @@ where
 
     visited.insert(remote_url.trim_end_matches('/').to_ascii_lowercase());
 
+    let mut scanned_count = 0;
     while let Some(current_url) = queue.pop_front() {
         if cancel_flag.load(Ordering::SeqCst) {
             return Err("Operation canceled by user.".to_string());
         }
+
+        scanned_count += 1;
+        let rel_folder = relative_item_path(remote_url, &current_url);
+        let display_folder = if rel_folder.is_empty() {
+            "/ (root)"
+        } else {
+            &rel_folder
+        };
+        log(&format!(
+            "[{}] Scanning directory: {}...\n",
+            scanned_count, display_folder
+        ));
 
         let res = client
             .list(&current_url, "1")
@@ -387,6 +400,8 @@ where
         let items = parse_propfind_xml(&body);
 
         let mut children_in_dir = 0;
+        let mut new_dirs = 0;
+        let mut new_files = 0;
         for item in items {
             let rel = relative_item_path(&current_url, &item.href);
             if rel.is_empty() {
@@ -396,6 +411,7 @@ where
 
             children_in_dir += 1;
             if item.is_dir {
+                new_dirs += 1;
                 let sub_url = resolve_item_url(&current_url, &item.href);
                 let sub_key = sub_url.trim_end_matches('/').to_ascii_lowercase();
                 if visited.insert(sub_key) {
@@ -403,6 +419,7 @@ where
                 }
                 all_items.push(item);
             } else {
+                new_files += 1;
                 all_items.push(item);
             }
         }
@@ -413,14 +430,19 @@ where
                 "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
                 &body[..snippet_len]
             ));
+        } else {
+            log(&format!(
+                "   -> Found {} file(s) and {} subfolder(s) in {}\n",
+                new_files, new_dirs, display_folder
+            ));
         }
     }
 
     let file_count = all_items.iter().filter(|i| !i.is_dir).count();
     let dir_count = all_items.iter().filter(|i| i.is_dir).count();
     log(&format!(
-        "Scan complete: {} file(s) and {} subdirector(ies) discovered.\n\n",
-        file_count, dir_count
+        "\nScan complete: {} file(s) and {} subdirector(ies) discovered across {} folder(s).\n\n",
+        file_count, dir_count, scanned_count
     ));
 
     Ok(all_items)
@@ -602,35 +624,54 @@ where
             let with_checksum = action == "get-checksum";
             log(&format!("Listing remote files in {}...\n", remote_url));
             let items = list_remote_recursive_with_log(client, remote_url, cancel_flag, &mut log)?;
+            let files_to_download: Vec<(&WebdavItem, String)> = items
+                .iter()
+                .filter(|item| !item.is_dir)
+                .filter_map(|item| {
+                    let rel = relative_item_path(remote_url, &item.href);
+                    if rel.is_empty() {
+                        None
+                    } else {
+                        Some((item, rel))
+                    }
+                })
+                .collect();
+
+            let total_files = files_to_download.len();
+            log(&format!(
+                "Starting download of {} file(s)...\n\n",
+                total_files
+            ));
+
             let mut count = 0;
             let mut total_bytes = 0;
-            for item in &items {
-                if item.is_dir {
-                    continue;
-                }
-                let rel = relative_item_path(remote_url, &item.href);
-                if rel.is_empty() {
-                    continue;
-                }
+            for (idx, (item, rel)) in files_to_download.iter().enumerate() {
+                let current_num = idx + 1;
                 if cancel_flag.load(Ordering::SeqCst) {
                     log("Operation canceled by user.\n");
                     return Ok(());
                 }
                 if is_dry {
                     log(&format!(
-                        "NOTICE: {}: Skipped copy (dry run, {} bytes)\n",
-                        rel, item.size
+                        "[{}/{}] NOTICE: {}: Skipped copy (dry run, {} bytes)\n",
+                        current_num, total_files, rel, item.size
                     ));
                     count += 1;
                     continue;
                 }
+                log(&format!(
+                    "[{}/{}] Downloading: {} ({} bytes)...\n",
+                    current_num, total_files, rel, item.size
+                ));
                 let download_url = resolve_item_url(remote_url, &item.href);
                 let get_res = client
                     .get(&download_url)
                     .map_err(|e| format!("Download failed for {}: {}", rel, e))?;
                 if !get_res.status().is_success() {
                     log(&format!(
-                        "ERROR: Failed to download {}: HTTP {}\n",
+                        "[{}/{}] ERROR: Failed to download {}: HTTP {}\n",
+                        current_num,
+                        total_files,
                         rel,
                         get_res.status()
                     ));
@@ -639,7 +680,7 @@ where
                 let bytes = get_res
                     .bytes()
                     .map_err(|e| format!("Failed to read response bytes: {}", e))?;
-                let target_file = local_dir.join(&rel);
+                let target_file = local_dir.join(rel);
                 if let Some(parent) = target_file.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
                         format!("Failed to create directory {}: {}", parent.display(), e)
@@ -655,7 +696,9 @@ where
                 count += 1;
                 total_bytes += bytes.len();
                 log(&format!(
-                    "Downloaded: {} ({} bytes){}\n",
+                    "[{}/{}] Downloaded: {} ({} bytes){}\n",
+                    current_num,
+                    total_files,
                     rel,
                     bytes.len(),
                     checksum_str
