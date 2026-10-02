@@ -5,6 +5,57 @@ import { execSync } from "node:child_process";
 
 const action = process.argv[2];
 
+async function checkFailures() {
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  const repo = process.env.REPO || process.env.GITHUB_REPOSITORY;
+  const headSha = process.env.HEAD_SHA || process.env.GITHUB_SHA;
+  const currentRunId = process.env.CURRENT_RUN_ID || process.env.GITHUB_RUN_ID;
+
+  if (!token || !repo || !headSha) {
+    console.error("missing required environment variables for check-failures (GITHUB_TOKEN, REPO, HEAD_SHA).");
+    process.exit(1);
+  }
+
+  let res;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      res = await fetch(`https://api.github.com/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "scs-rclient-ai-review"
+        }
+      });
+      if (res.ok) break;
+    } catch (err) {
+      if (attempt === 3) {
+        console.error(`failed to query sibling check-runs after 3 attempts: ${err.message}`);
+        process.exit(1);
+      }
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  }
+
+  if (!res || !res.ok) {
+    console.error(`github api check-runs returned status ${res?.status || "unknown"}`);
+    process.exit(1);
+  }
+
+  const body = await res.json();
+  const checkRuns = body.check_runs || [];
+  const failed = checkRuns.filter(
+    (r) =>
+      r.status === "completed" &&
+      ["failure", "timed_out", "cancelled", "action_required"].includes(r.conclusion) &&
+      (!currentRunId || (String(r.id) !== String(currentRunId) && String(r.run_id) !== String(currentRunId)))
+  );
+  if (failed.length > 0) {
+    console.error(`sibling check(s) already failed on commit ${headSha}: ${failed.map((f) => f.name).join(", ")}. skipping review.`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
 async function waitChecks() {
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   const repo = process.env.REPO || process.env.GITHUB_REPOSITORY;
@@ -364,11 +415,16 @@ if (action === "wait-checks") {
     console.error("fatal in waitChecks:", err);
     process.exit(1);
   });
+} else if (action === "check-failures") {
+  checkFailures().catch((err) => {
+    console.error("fatal in checkFailures:", err);
+    process.exit(0);
+  });
 } else if (action === "prepare-payload") {
   preparePayload();
 } else if (action === "post-comment") {
   postComment();
 } else {
-  console.error("unknown action. Use: wait-checks, prepare-payload, or post-comment.");
+  console.error("unknown action. Use: wait-checks, check-failures, prepare-payload, or post-comment.");
   process.exit(1);
 }

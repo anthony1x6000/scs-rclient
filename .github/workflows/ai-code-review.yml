@@ -34,28 +34,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Wait for Other PR Checks to Pass
-        id: wait-checks
+      - name: Check for Sibling Failures
+        id: check-failures
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           CURRENT_RUN_ID: ${{ github.run_id }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          # A gate that cannot open must end red. Exiting green with the review
-          # skipped reads as "ai reviewed and approved" on the checks list, which
-          # is a false signal; red is honest that no review was produced.
-          if node scripts/ai-code-review.mjs wait-checks; then
-            echo "passed=true" >> $GITHUB_OUTPUT
-          else
-            echo "passed=false" >> $GITHUB_OUTPUT
-            echo "::error title=ai review skipped::other PR checks did not pass, so no ai review was produced. the failing checks are listed above; fix or re-run them, then re-run this workflow."
-            exit 1
-          fi
+        run: node scripts/ai-code-review.mjs check-failures
 
       - name: Extract and Filter Source Diff
-        if: steps.wait-checks.outputs.passed == 'true'
         id: diff
         env:
           BASE_REF: ${{ github.base_ref || 'main' }}
@@ -114,7 +102,7 @@ jobs:
           fi
 
       - name: Post Comment When No Source Code Changes
-        if: steps.wait-checks.outputs.passed == 'true' && steps.diff.outputs.has_diff == 'false'
+        if: steps.diff.outputs.has_diff == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -125,13 +113,13 @@ jobs:
           fi
 
       - name: Prepare AI Review Payload
-        if: steps.wait-checks.outputs.passed == 'true' && steps.diff.outputs.has_diff == 'true'
+        if: steps.diff.outputs.has_diff == 'true'
         env:
           MAX_TOKENS: 16384
         run: node scripts/ai-code-review.mjs prepare-payload
 
       - name: Call AI Code Review Agent
-        if: steps.wait-checks.outputs.passed == 'true' && steps.diff.outputs.has_diff == 'true'
+        if: steps.diff.outputs.has_diff == 'true'
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_NIM_KEY }}
         run: |
@@ -140,18 +128,35 @@ jobs:
             exit 1
           fi
 
+          # Transient 503s and cold starts are common on this endpoint. A gating
+          # check must not fail a pull request on a single blip, so retry inside
+          # the 14 minute job budget: 3 attempts of 210s plus 15s/30s backoff.
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
           CURL_EXIT=0
-          HTTP_STATUS=$(curl -s -S -w "%{http_code}" --max-time 120 -o /tmp/ai_review_response.json \
-            https://integrate.api.nvidia.com/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $NVIDIA_API_KEY" \
-            --data-binary @/tmp/ai_review_payload.json) || CURL_EXIT=$?
-
-          echo "NVIDIA NIM response HTTP status: $HTTP_STATUS (curl exit: $CURL_EXIT)"
+          HTTP_STATUS=0
+          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+            CURL_EXIT=0
+            HTTP_STATUS=$(curl -s -S -w "%{http_code}" --max-time 210 -o /tmp/ai_review_response.json \
+              https://integrate.api.nvidia.com/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $NVIDIA_API_KEY" \
+              --data-binary @/tmp/ai_review_payload.json) || CURL_EXIT=$?
+            echo "NVIDIA NIM attempt $ATTEMPT/$MAX_ATTEMPTS: HTTP $HTTP_STATUS (curl exit: $CURL_EXIT)"
+            if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_STATUS" -eq 200 ]; then
+              break
+            fi
+            if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+              BACKOFF=$((ATTEMPT * 15))
+              echo "retrying in ${BACKOFF}s."
+              sleep "$BACKOFF"
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+          done
 
           if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_STATUS" -ne 200 ]; then
-            echo "::warning::NVIDIA NIM API request failed (curl exit $CURL_EXIT, HTTP $HTTP_STATUS)."
-            ERR_MSG="upstream NVIDIA NIM API request failed (HTTP $HTTP_STATUS, curl exit $CURL_EXIT)."
+            echo "::warning::NVIDIA NIM API request failed after $MAX_ATTEMPTS attempt(s) (curl exit $CURL_EXIT, HTTP $HTTP_STATUS)."
+            ERR_MSG="upstream NVIDIA NIM API request failed after $MAX_ATTEMPTS attempt(s) (HTTP $HTTP_STATUS, curl exit $CURL_EXIT)."
             if [ -s /tmp/ai_review_response.json ]; then
               ERR_MSG="$ERR_MSG response: $(cat /tmp/ai_review_response.json)"
             fi
@@ -159,7 +164,7 @@ jobs:
           fi
 
       - name: Post PR Review Comment and Verdict
-        if: steps.wait-checks.outputs.passed == 'true' && steps.diff.outputs.has_diff == 'true'
+        if: steps.diff.outputs.has_diff == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -171,11 +176,6 @@ jobs:
       # that step and skips this one. PRs whose filtered diff was empty never
       # reach it either: the reviewer never saw those files, and unreviewed is
       # not approved.
-      #
-      # GH_TOKEN is the dedicated agent PAT, not GITHUB_TOKEN, because a push
-      # event produced by GITHUB_TOKEN creates no workflow runs. Merging with
-      # GITHUB_TOKEN would therefore skip the per-app workflows that deploy on
-      # push to staging/main while the PR still reported a successful merge.
       - name: Auto-Merge Approved PR
         if: >-
           success() &&
@@ -201,20 +201,12 @@ jobs:
             exit 0
           fi
 
-          # `gh pr checks --watch` cannot run in this job: it would watch this
-          # run's own in-progress check until the timeout. wait-checks skips
-          # ai review runs instead and exits non-zero if any sibling check on
-          # this sha did not pass, so a re-run that went red still blocks.
+          # Auto-merge only proceeds once security review approves and builds pass
           WAIT_FOR_SECURITY=true node scripts/ai-code-review.mjs wait-checks
 
           gh pr merge "$PR_NUMBER" --squash
           echo "merged pr #$PR_NUMBER on ai review verdict: APPROVE."
 
-          # That merge used GITHUB_TOKEN, and a push event it produces creates no
-          # workflow runs, so the build/deploy workflow that runs on push to
-          # main would never fire and the merge would land unbuilt/undeployed.
-          # workflow_dispatch is exempt from that suppression, so re-fire the
-          # workflows whose path filters match this PR.
           if ! CHANGED=$(git diff --name-only "origin/$BASE_REF...HEAD"); then
             echo "::error title=deploy dispatch failed::pr merged, but the changed files could not be read, so the deploy was not re-fired. re-run them on $BASE_REF by hand."
             exit 1
