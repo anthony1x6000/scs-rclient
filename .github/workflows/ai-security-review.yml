@@ -38,7 +38,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     name: AI Security Review Agent
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     env:
       # Pinned upstream skill. To bump: fetch the exact commit, confirm the tree,
@@ -256,14 +256,14 @@ jobs:
 
           # Transient 503s and cold starts are common on this endpoint. A gating
           # check must not fail a pull request on a single blip, so retry inside
-          # the 10 minute job budget: 3 attempts of 120s plus 15s/30s backoff.
+          # the 14 minute job budget: 3 attempts of 210s plus 15s/30s backoff.
           MAX_ATTEMPTS=3
           ATTEMPT=1
           CURL_EXIT=0
           HTTP_STATUS=0
           while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
             CURL_EXIT=0
-            HTTP_STATUS=$(curl -s -S -w "%{http_code}" --max-time 120 -o "$RESPONSE_FILE" \
+            HTTP_STATUS=$(curl -s -S -w "%{http_code}" --max-time 210 -o "$RESPONSE_FILE" \
               https://integrate.api.nvidia.com/v1/chat/completions \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer $NVIDIA_API_KEY" \

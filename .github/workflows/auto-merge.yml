@@ -2,7 +2,7 @@ name: Auto-Merge
 
 on:
   workflow_run:
-    workflows: ["Tauri Build"]
+    workflows: ["Tauri Build", "AI Code Review", "AI Security Review"]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -23,6 +23,7 @@ jobs:
     if: >-
       (github.event_name == 'workflow_dispatch') ||
       (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
        github.event.workflow_run.pull_requests[0] != null)
     runs-on: ubuntu-latest
     timeout-minutes: 5

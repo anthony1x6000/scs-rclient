@@ -373,64 +373,52 @@ async function checkAndMerge() {
 
   console.log(`evaluating auto-merge criteria for PR #${prNumber} on ${repo} at commit ${headSha}...`);
 
-  // 1. Verify PR head commit matches HEAD_SHA
+  // 1. Verify PR head commit matches HEAD_SHA via gh api
   let pr;
   try {
-    const res = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": "scs-rclient-auto-merge"
-      }
+    const raw = execSync(`gh api "repos/${repo}/pulls/${prNumber}"`, {
+      encoding: "utf8",
+      env: { ...process.env, GH_TOKEN: token }
     });
-    if (!res.ok) {
-      console.error(`failed to fetch PR #${prNumber}: HTTP ${res.status}`);
-      process.exit(1);
-    }
-    pr = await res.json();
+    pr = JSON.parse(raw);
   } catch (err) {
-    console.error("error fetching PR:", err.message);
+    console.error("error fetching PR via gh api:", err.message);
     process.exit(1);
   }
 
-  if (pr.head.sha !== headSha) {
-    console.log(`PR head sha moved (${pr.head.sha} != ${headSha}). Skipping merge.`);
+  if (pr.head?.sha !== headSha) {
+    console.log(`PR head sha moved (${pr.head?.sha} != ${headSha}). Skipping merge.`);
     process.exit(0);
   }
 
-  // 2. Query check runs for headSha
+  // 2. Query check runs for headSha via gh api
   let checkRuns = [];
   try {
-    const res = await fetch(`https://api.github.com/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": "scs-rclient-auto-merge"
-      }
+    const raw = execSync(`gh api "repos/${repo}/commits/${headSha}/check-runs?per_page=100"`, {
+      encoding: "utf8",
+      env: { ...process.env, GH_TOKEN: token }
     });
-    if (!res.ok) {
-      console.error(`failed to fetch check-runs: HTTP ${res.status}`);
-      process.exit(1);
-    }
-    const body = await res.json();
-    checkRuns = body.check_runs || [];
+    const parsed = JSON.parse(raw);
+    checkRuns = parsed.check_runs || [];
   } catch (err) {
-    console.error("error fetching check runs:", err.message);
+    console.error("error fetching check runs via gh api:", err.message);
     process.exit(1);
   }
 
-  // 3. Find AI Code Review and AI Security Review checks
+  // 3. Find AI Code Review and AI Security Review checks from GitHub Actions app
   const codeReviewCheck = checkRuns.find((r) => {
-    const name = (r.name || "").toLowerCase();
-    return name.includes("ai code review") || name.includes("ai-code-review");
+    const name = r.name || "";
+    const isApp = r.app?.slug === "github-actions";
+    return isApp && (name === "AI Code Review Agent" || name.toLowerCase().includes("ai code review"));
   });
   const securityReviewCheck = checkRuns.find((r) => {
-    const name = (r.name || "").toLowerCase();
-    return name.includes("ai security review") || name.includes("ai-security-review");
+    const name = r.name || "";
+    const isApp = r.app?.slug === "github-actions";
+    return isApp && (name === "AI Security Review Agent" || name.toLowerCase().includes("ai security review"));
   });
 
   if (!codeReviewCheck) {
-    console.log("AI Code Review check not found. Skipping auto-merge.");
+    console.log("AI Code Review check not found. Checks pending; skipping auto-merge.");
     process.exit(0);
   }
   if (codeReviewCheck.status !== "completed" || codeReviewCheck.conclusion !== "success") {
@@ -439,7 +427,7 @@ async function checkAndMerge() {
   }
 
   if (!securityReviewCheck) {
-    console.log("AI Security Review check not found. Skipping auto-merge.");
+    console.log("AI Security Review check not found. Checks pending; skipping auto-merge.");
     process.exit(0);
   }
   if (securityReviewCheck.status !== "completed" || securityReviewCheck.conclusion !== "success") {
@@ -468,12 +456,18 @@ async function checkAndMerge() {
 
   // 5. Merge PR
   console.log(`all criteria satisfied (builds, tests, AI code review, and AI security review passed). Merging PR #${prNumber}...`);
-  execSync(`gh pr merge "${prNumber}" --squash`, { stdio: "inherit" });
+  execSync(`gh pr merge "${prNumber}" --squash`, {
+    stdio: "inherit",
+    env: { ...process.env, GH_TOKEN: token }
+  });
   console.log(`successfully merged PR #${prNumber}.`);
 
   // 6. Trigger deploy/build workflow on baseRef
   try {
-    execSync(`gh workflow run tauri-build.yml --ref "${baseRef}"`, { stdio: "inherit" });
+    execSync(`gh workflow run tauri-build.yml --ref "${baseRef}"`, {
+      stdio: "inherit",
+      env: { ...process.env, GH_TOKEN: token }
+    });
     console.log(`re-fired tauri-build.yml on ${baseRef}.`);
   } catch (deployErr) {
     console.warn("warning: failed to re-fire tauri-build.yml:", deployErr.message);
