@@ -109,8 +109,24 @@ export async function setSubdirectories(items: string[]): Promise<void> {
   await setWrapped(STORE_KEYS.subdirectories, items);
 }
 
+/**
+ * Clamps the scan concurrency value to the supported range [MIN_SCAN_CONCURRENCY, MAX_SCAN_CONCURRENCY].
+ * Uses truncation toward zero matching Rust's integer clamping behavior.
+ */
 export function clampScanConcurrency(threads: number): number {
   return Math.min(Math.max(Math.trunc(threads), MIN_SCAN_CONCURRENCY), MAX_SCAN_CONCURRENCY);
+}
+
+/**
+ * Parses and clamps a string input into a valid scan concurrency integer.
+ * Returns null if the input is non-numeric or empty.
+ */
+export function parseAndClampScanConcurrency(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const parsed = parseInt(trimmed, 10);
+  if (isNaN(parsed)) return null;
+  return clampScanConcurrency(parsed);
 }
 
 export async function getScanConcurrency(): Promise<number> {
@@ -144,6 +160,10 @@ export async function loadAppSettings(): Promise<{
   return { baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency };
 }
 
+/**
+ * Clears the persistent WebDAV remote directory listing cache.
+ * Note: Clears all cached remote endpoint listings across the application.
+ */
 export async function clearWebDAVCache(): Promise<void> {
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("clear_webdav_cache");

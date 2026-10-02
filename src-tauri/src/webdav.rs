@@ -118,11 +118,11 @@ pub fn get_cache_ttl_secs() -> u64 {
 /// Returns the path to the WebDAV remote listing cache file.
 ///
 /// Security & Access Control:
-/// - On Unix/Linux/macOS: The cache directory is created with mode `0o700` and the cache file
+/// - Unix/Linux/macOS: The cache directory is created with mode `0o700` and the cache file
 ///   with mode `0o600`, strictly isolating access to the current user (CWE-200 / CWE-732).
-/// - On Windows: The cache file is placed within the user's `%LOCALAPPDATA%` or `%APPDATA%` directory,
-///   which is protected by Windows default user-profile DACLs (SYSTEM and current user only).
-///   If configured to run under a custom or shared path, access is governed by the ambient filesystem permissions.
+/// - Windows Limitation: On Windows, fine-grained DACLs are not manipulated via Win32 API.
+///   Instead, access control relies on the user-profile container DACL (`%LOCALAPPDATA%` or `%APPDATA%`),
+///   which natively grants access exclusively to the current user profile and SYSTEM.
 pub fn get_cache_file_path() -> PathBuf {
     if let Ok(custom) = std::env::var("WEBDAV_CACHE_FILE") {
         let p = PathBuf::from(custom);
@@ -171,7 +171,8 @@ pub fn get_cache_file_path() -> PathBuf {
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .collect();
 
-    // In fallback mode, create a user-private subdirectory (mode 0o700 on Unix) to prevent multi-user snooping
+    // In fallback mode when user profile / XDG environment variables are unavailable,
+    // create a private subdirectory with mode 0o700 on Unix to prevent world-readable snooping in /tmp.
     let private_subdir = std::env::temp_dir().join(format!("scs_rclient_cache_{}", safe_suffix));
     #[cfg(unix)]
     {
@@ -189,6 +190,13 @@ pub fn get_cache_file_path() -> PathBuf {
     private_subdir.join("webdav_cache.json")
 }
 
+/// Atomically writes content to the cache file using a temporary file and atomic rename.
+///
+/// Security & Access Control:
+/// - Unix/Linux/macOS: The parent directory is created with mode `0o700` and the temporary file
+///   with mode `0o600` before atomic rename, ensuring multi-user isolation on shared systems.
+/// - Windows Limitation: On Windows, fine-grained DACLs are not manipulated via Win32 API.
+///   Security isolation relies on the enclosing parent folder's DACL (e.g. `%LOCALAPPDATA%`).
 fn write_cache_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
@@ -297,6 +305,11 @@ pub fn load_remote_cache(remote_url: &str) -> Option<Vec<WebdavItem>> {
 }
 
 /// Saves remote items to the local cache file for remote_url.
+///
+/// Filters out any item with an unsafe relative path to prevent cache poisoning.
+/// Note: Cached listings are keyed by normalized remote collection URL.
+/// If switching credentials or access permissions for the same URL, invoke `clear_remote_cache()`
+/// or click the 'Clear Cache' button under Settings to invalidate prior cached listings.
 pub fn save_remote_cache(remote_url: &str, items: &[WebdavItem]) {
     let path = get_cache_file_path();
     let mut cache = read_cache_map(&path);
@@ -306,13 +319,21 @@ pub fn save_remote_cache(remote_url: &str, items: &[WebdavItem]) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    let mut safe_items = Vec::with_capacity(items.len());
+    for item in items {
+        let rel = relative_item_path(remote_url, &item.href);
+        if rel.is_empty() || is_safe_relative_path(&rel) {
+            safe_items.push(item.clone());
+        }
+    }
+
     let key = remote_url.trim_end_matches('/').to_ascii_lowercase();
     cache.insert(
         key,
         CachedRemoteListing {
             remote_url: remote_url.to_string(),
             timestamp: now,
-            items: items.to_vec(),
+            items: safe_items,
         },
     );
 
@@ -326,6 +347,9 @@ pub fn update_remote_cache_item(
     new_size: u64,
     new_mtime: Option<u64>,
 ) {
+    if !is_safe_relative_path(rel_path) {
+        return;
+    }
     let path = get_cache_file_path();
     let mut cache = read_cache_map(&path);
     if cache.is_empty() {
@@ -359,6 +383,9 @@ pub fn update_remote_cache_item(
 
 /// Removes an item from the remote cache after deletion.
 pub fn remove_remote_cache_item(remote_url: &str, rel_path: &str) {
+    if !is_safe_relative_path(rel_path) {
+        return;
+    }
     let path = get_cache_file_path();
     let mut cache = read_cache_map(&path);
     if cache.is_empty() {
@@ -1009,34 +1036,72 @@ where
     struct WorkerGuard<'a> {
         state_ref: &'a Mutex<ScanState>,
         cvar_ref: &'a Condvar,
-        active: bool,
     }
 
     impl<'a> WorkerGuard<'a> {
-        fn new(state_ref: &'a Mutex<ScanState>, cvar_ref: &'a Condvar) -> Self {
-            Self {
-                state_ref,
-                cvar_ref,
-                active: true,
+        fn acquire(
+            state_ref: &'a Mutex<ScanState>,
+            cvar_ref: &'a Condvar,
+            cancel_flag: &AtomicBool,
+        ) -> Option<(Self, String, usize)> {
+            let mut state = match state_ref.lock() {
+                Ok(s) => s,
+                Err(poisoned) => {
+                    let s = poisoned.into_inner();
+                    if s.stopped || s.error.is_some() {
+                        return None;
+                    }
+                    s
+                }
+            };
+            loop {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    state.stopped = true;
+                    cvar_ref.notify_all();
+                    return None;
+                }
+                if state.stopped || state.error.is_some() {
+                    return None;
+                }
+                if let Some(url) = state.queue.pop_front() {
+                    state.active_workers += 1;
+                    state.scanned_count += 1;
+                    let scan_idx = state.scanned_count;
+                    let guard = Self {
+                        state_ref,
+                        cvar_ref,
+                    };
+                    return Some((guard, url, scan_idx));
+                }
+                if state.active_workers == 0 {
+                    state.stopped = true;
+                    cvar_ref.notify_all();
+                    return None;
+                }
+                let res = cvar_ref.wait_timeout(state, Duration::from_millis(250));
+                match res {
+                    Ok((new_state, _)) => state = new_state,
+                    Err(poisoned) => {
+                        let (new_state, _) = poisoned.into_inner();
+                        if new_state.stopped || new_state.error.is_some() {
+                            return None;
+                        }
+                        state = new_state;
+                    }
+                }
             }
-        }
-
-        fn defuse(&mut self) {
-            self.active = false;
         }
     }
 
     impl<'a> Drop for WorkerGuard<'a> {
         fn drop(&mut self) {
-            if self.active {
-                let mut state = self.state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                state.active_workers = state.active_workers.saturating_sub(1);
-                if std::thread::panicking() {
-                    state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
-                    state.stopped = true;
-                }
-                self.cvar_ref.notify_all();
+            let mut state = self.state_ref.lock().unwrap_or_else(|p| p.into_inner());
+            state.active_workers = state.active_workers.saturating_sub(1);
+            if std::thread::panicking() {
+                state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
+                state.stopped = true;
             }
+            self.cvar_ref.notify_all();
         }
     }
 
@@ -1064,57 +1129,14 @@ where
             s.spawn(move || {
                 let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     loop {
-                        let next_task = {
-                            let mut state = match state_ref.lock() {
-                                Ok(s) => s,
-                                Err(poisoned) => {
-                                    let s = poisoned.into_inner();
-                                    if s.stopped || s.error.is_some() {
-                                        return;
-                                    }
-                                    s
-                                }
-                            };
-                            loop {
-                                if cancel_flag.load(Ordering::SeqCst) {
-                                    state.stopped = true;
-                                    cvar_ref.notify_all();
-                                    return;
-                                }
-                                if state.stopped || state.error.is_some() {
-                                    return;
-                                }
-                                if let Some(url) = state.queue.pop_front() {
-                                    state.active_workers += 1;
-                                    state.scanned_count += 1;
-                                    let scan_idx = state.scanned_count;
-                                    break Some((url, scan_idx));
-                                }
-                                if state.active_workers == 0 {
-                                    state.stopped = true;
-                                    cvar_ref.notify_all();
-                                    return;
-                                }
-                                let res = cvar_ref.wait_timeout(state, Duration::from_millis(250));
-                                match res {
-                                    Ok((new_state, _)) => state = new_state,
-                                    Err(poisoned) => {
-                                        let (new_state, _) = poisoned.into_inner();
-                                        if new_state.stopped || new_state.error.is_some() {
-                                            return;
-                                        }
-                                        state = new_state;
-                                    }
-                                }
-                            }
-                        };
-
-                        let (current_url, scan_idx) = match next_task {
-                            Some(t) => t,
+                        let (guard, current_url, scan_idx) = match WorkerGuard::acquire(
+                            state_ref,
+                            cvar_ref,
+                            cancel_flag,
+                        ) {
+                            Some(triple) => triple,
                             None => return,
                         };
-
-                        let mut guard = WorkerGuard::new(state_ref, cvar_ref);
 
                         let rel_folder = relative_item_path(remote_url, &current_url);
                         let display_folder = if rel_folder.is_empty() {
@@ -1131,7 +1153,6 @@ where
                         if cancel_flag.load(Ordering::SeqCst) {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
                             state.stopped = true;
-                            cvar_ref.notify_all();
                             return;
                         }
 
@@ -1140,7 +1161,6 @@ where
                         if cancel_flag.load(Ordering::SeqCst) {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
                             state.stopped = true;
-                            cvar_ref.notify_all();
                             return;
                         }
 
@@ -1150,7 +1170,6 @@ where
                                 let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
                                 state.error = Some(format!("List request failed for {}: {}", current_url, e));
                                 state.stopped = true;
-                                cvar_ref.notify_all();
                                 return;
                             }
                         };
@@ -1164,12 +1183,10 @@ where
                                         .to_string(),
                                 );
                                 state.stopped = true;
-                                cvar_ref.notify_all();
                                 return;
                             }
                             state.error = Some(format!("Server returned HTTP {} for {}", status, current_url));
                             state.stopped = true;
-                            cvar_ref.notify_all();
                             return;
                         }
 
@@ -1227,13 +1244,9 @@ where
                             ));
                         }
 
-                        guard.defuse();
                         {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                            state.active_workers = state.active_workers.saturating_sub(1);
-
                             if state.stopped || state.error.is_some() {
-                                cvar_ref.notify_all();
                                 return;
                             }
 
@@ -1253,16 +1266,14 @@ where
                                             MAX_SCANNED_DIRS_LIMIT
                                         ));
                                         state.stopped = true;
-                                        cvar_ref.notify_all();
                                         return;
                                     }
                                     state.visited.insert(sub_key);
                                     state.queue.push_back(sub_url);
                                 }
                             }
-
-                            cvar_ref.notify_all();
                         }
+                        drop(guard);
                     }
                 }));
 
@@ -2416,6 +2427,22 @@ mod tests {
         remove_remote_cache_item(test_url, "doc.pdf");
         let after_removal = load_remote_cache(test_url).unwrap();
         assert_eq!(after_removal.len(), 0);
+
+        // Path traversal rejection in cache
+        let malicious_items = vec![
+            WebdavItem::new("https://example.com/remote/files/../../etc/passwd", false, 100),
+            WebdavItem::new("https://example.com/remote/files/valid.txt", false, 200),
+        ];
+        save_remote_cache(test_url, &malicious_items);
+        let safe_loaded = load_remote_cache(test_url).unwrap();
+        assert_eq!(safe_loaded.len(), 1);
+        assert_eq!(safe_loaded[0].size, 200);
+
+        // Invalid rel_path updates and removals are safely ignored
+        update_remote_cache_item(test_url, "../malicious", 500, None);
+        remove_remote_cache_item(test_url, "../malicious");
+        let still_safe = load_remote_cache(test_url).unwrap();
+        assert_eq!(still_safe.len(), 1);
 
         clear_remote_cache().unwrap();
         assert!(!temp_cache.exists());

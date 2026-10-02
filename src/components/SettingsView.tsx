@@ -5,6 +5,7 @@ import {
   setScanConcurrency,
   clearWebDAVCache,
   clampScanConcurrency,
+  parseAndClampScanConcurrency,
   DEFAULT_SCAN_CONCURRENCY,
   MIN_SCAN_CONCURRENCY,
   MAX_SCAN_CONCURRENCY,
@@ -100,16 +101,19 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
 
   const handleConcurrencyChange = (raw: string) => {
     setConcurrencyDraft(raw);
-    const trimmed = raw.trim();
-    if (trimmed !== "") {
-      const parsed = parseInt(trimmed, 10);
-      if (!isNaN(parsed)) {
-        const clamped = clampScanConcurrency(parsed);
-        setSavedIndicator("");
-        if (concurrencyDebounceRef.current) clearTimeout(concurrencyDebounceRef.current);
-        concurrencyDebounceRef.current = setTimeout(() => void persistConcurrency(clamped), 400);
-      }
+    const clamped = parseAndClampScanConcurrency(raw);
+    if (clamped !== null) {
+      setSavedIndicator("");
+      if (concurrencyDebounceRef.current) clearTimeout(concurrencyDebounceRef.current);
+      concurrencyDebounceRef.current = setTimeout(() => void persistConcurrency(clamped), 400);
     }
+  };
+
+  const handleConcurrencyBlur = () => {
+    const clamped = parseAndClampScanConcurrency(String(concurrencyDraft));
+    const finalVal = clamped ?? DEFAULT_SCAN_CONCURRENCY;
+    setConcurrencyDraft(finalVal);
+    void persistConcurrency(finalVal);
   };
 
   return (
@@ -136,6 +140,7 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
           max={MAX_SCAN_CONCURRENCY}
           value={concurrencyDraft}
           onChange={(e) => handleConcurrencyChange(e.target.value)}
+          onBlur={handleConcurrencyBlur}
           title="Number of concurrent scanning threads (1–64)"
           className="w-14 px-1.5 py-1 text-xs text-center border border-white/20 bg-black/40 text-white rounded outline-none focus:border-white/60 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
         />
