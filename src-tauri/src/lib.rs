@@ -165,6 +165,9 @@ fn cancel_webdav_action(state: tauri::State<'_, WebdavState>) -> Result<(), Stri
     Ok(())
 }
 
+/// Runs a native WebDAV action (e.g. "put", "get", "sync", "list").
+/// `concurrency`: Optional number of worker threads for parallel remote directory traversal (1–16).
+/// When `None`, the default concurrency setting is used.
 #[tauri::command]
 async fn run_webdav_action(
     app: tauri::AppHandle,

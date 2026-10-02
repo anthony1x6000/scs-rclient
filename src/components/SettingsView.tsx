@@ -4,6 +4,7 @@ import {
   getScanConcurrency,
   setScanConcurrency,
   clearWebDAVCache,
+  clampScanConcurrency,
   DEFAULT_SCAN_CONCURRENCY,
   MIN_SCAN_CONCURRENCY,
   MAX_SCAN_CONCURRENCY,
@@ -101,9 +102,10 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
     setConcurrencyDraft(raw);
     const parsed = parseInt(raw, 10);
     if (!isNaN(parsed)) {
+      const clamped = clampScanConcurrency(parsed);
       setSavedIndicator("");
       if (concurrencyDebounceRef.current) clearTimeout(concurrencyDebounceRef.current);
-      concurrencyDebounceRef.current = setTimeout(() => void persistConcurrency(parsed), 400);
+      concurrencyDebounceRef.current = setTimeout(() => void persistConcurrency(clamped), 400);
     }
   };
 

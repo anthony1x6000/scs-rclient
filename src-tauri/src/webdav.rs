@@ -983,6 +983,40 @@ where
         stopped: bool,
     }
 
+    struct WorkerGuard<'a> {
+        state_ref: &'a Mutex<ScanState>,
+        cvar_ref: &'a Condvar,
+        active: bool,
+    }
+
+    impl<'a> WorkerGuard<'a> {
+        fn new(state_ref: &'a Mutex<ScanState>, cvar_ref: &'a Condvar) -> Self {
+            Self {
+                state_ref,
+                cvar_ref,
+                active: true,
+            }
+        }
+
+        fn defuse(&mut self) {
+            self.active = false;
+        }
+    }
+
+    impl<'a> Drop for WorkerGuard<'a> {
+        fn drop(&mut self) {
+            if self.active {
+                let mut state = self.state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                state.active_workers = state.active_workers.saturating_sub(1);
+                if std::thread::panicking() {
+                    state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
+                    state.stopped = true;
+                }
+                self.cvar_ref.notify_all();
+            }
+        }
+    }
+
     let state_mutex = Mutex::new(ScanState {
         queue: initial_queue,
         active_workers: 0,
@@ -1008,7 +1042,16 @@ where
                 let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     loop {
                         let next_task = {
-                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut state = match state_ref.lock() {
+                                Ok(s) => s,
+                                Err(poisoned) => {
+                                    let s = poisoned.into_inner();
+                                    if s.stopped || s.error.is_some() {
+                                        return;
+                                    }
+                                    s
+                                }
+                            };
                             loop {
                                 if cancel_flag.load(Ordering::SeqCst) {
                                     state.stopped = true;
@@ -1034,6 +1077,9 @@ where
                                     Ok((new_state, _)) => state = new_state,
                                     Err(poisoned) => {
                                         let (new_state, _) = poisoned.into_inner();
+                                        if new_state.stopped || new_state.error.is_some() {
+                                            return;
+                                        }
                                         state = new_state;
                                     }
                                 }
@@ -1044,6 +1090,8 @@ where
                             Some(t) => t,
                             None => return,
                         };
+
+                        let mut guard = WorkerGuard::new(state_ref, cvar_ref);
 
                         let rel_folder = relative_item_path(remote_url, &current_url);
                         let display_folder = if rel_folder.is_empty() {
@@ -1059,18 +1107,24 @@ where
 
                         if cancel_flag.load(Ordering::SeqCst) {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                            state.active_workers = state.active_workers.saturating_sub(1);
                             state.stopped = true;
                             cvar_ref.notify_all();
                             return;
                         }
 
                         let list_res = client.list(&current_url, "1");
+
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.stopped = true;
+                            cvar_ref.notify_all();
+                            return;
+                        }
+
                         let res = match list_res {
                             Ok(r) => r,
                             Err(e) => {
                                 let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                                state.active_workers = state.active_workers.saturating_sub(1);
                                 state.error = Some(format!("List request failed for {}: {}", current_url, e));
                                 state.stopped = true;
                                 cvar_ref.notify_all();
@@ -1081,7 +1135,6 @@ where
                         let status = res.status();
                         if !status.is_success() && status.as_u16() != 207 {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                            state.active_workers = state.active_workers.saturating_sub(1);
                             if scan_idx == 1 && status.as_u16() == 404 {
                                 let _ = worker_log_tx.send(
                                     "Remote directory does not exist yet (404); starting with empty listing.\n"
@@ -1151,6 +1204,7 @@ where
                             ));
                         }
 
+                        guard.defuse();
                         {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
                             state.active_workers = state.active_workers.saturating_sub(1);
@@ -1161,7 +1215,7 @@ where
                             }
 
                             for item in discovered_items {
-                                let key = (item.is_dir, item.href.trim_end_matches('/').to_ascii_lowercase());
+                                let key = (item.is_dir, item.href.clone());
                                 if state.seen_items.insert(key) {
                                     state.all_items.push(item);
                                 }
@@ -1169,8 +1223,8 @@ where
 
                             for sub_url in discovered_sub_urls {
                                 let sub_key = sub_url.trim_end_matches('/').to_ascii_lowercase();
-                                if state.visited.insert(sub_key) {
-                                    if state.visited.len() > MAX_SCANNED_DIRS_LIMIT {
+                                if !state.visited.contains(&sub_key) {
+                                    if state.visited.len() >= MAX_SCANNED_DIRS_LIMIT {
                                         state.error = Some(format!(
                                             "Directory traversal limit reached ({} folders). Aborting scan for security.",
                                             MAX_SCANNED_DIRS_LIMIT
@@ -1179,6 +1233,7 @@ where
                                         cvar_ref.notify_all();
                                         return;
                                     }
+                                    state.visited.insert(sub_key);
                                     state.queue.push_back(sub_url);
                                 }
                             }
@@ -1190,8 +1245,9 @@ where
 
                 if run_result.is_err() {
                     let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                    state.active_workers = state.active_workers.saturating_sub(1);
-                    state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
+                    if state.error.is_none() {
+                        state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
+                    }
                     state.stopped = true;
                     cvar_ref.notify_all();
                 }

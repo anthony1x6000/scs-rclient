@@ -109,16 +109,21 @@ export async function setSubdirectories(items: string[]): Promise<void> {
   await setWrapped(STORE_KEYS.subdirectories, items);
 }
 
+export function clampScanConcurrency(threads: number): number {
+  if (isNaN(threads)) return DEFAULT_SCAN_CONCURRENCY;
+  return Math.min(Math.max(Math.trunc(threads), MIN_SCAN_CONCURRENCY), MAX_SCAN_CONCURRENCY);
+}
+
 export async function getScanConcurrency(): Promise<number> {
   const val = await getWrapped<number>(STORE_KEYS.scanConcurrency);
   if (typeof val === "number" && !isNaN(val)) {
-    return Math.min(Math.max(Math.round(val), MIN_SCAN_CONCURRENCY), MAX_SCAN_CONCURRENCY);
+    return clampScanConcurrency(val);
   }
   return DEFAULT_SCAN_CONCURRENCY;
 }
 
 export async function setScanConcurrency(threads: number): Promise<void> {
-  const clamped = Math.min(Math.max(Math.round(threads), MIN_SCAN_CONCURRENCY), MAX_SCAN_CONCURRENCY);
+  const clamped = clampScanConcurrency(threads);
   await setWrapped(STORE_KEYS.scanConcurrency, clamped);
 }
 
