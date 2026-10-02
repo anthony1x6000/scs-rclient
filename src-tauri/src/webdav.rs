@@ -1,13 +1,69 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
+
+/// Retrieves maximum allowed WebDAV file size in bytes, configurable via MAX_WEBDAV_FILE_SIZE_BYTES.
+pub fn get_max_file_size() -> u64 {
+    std::env::var("MAX_WEBDAV_FILE_SIZE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_FILE_SIZE)
+}
+
+/// Computes SHA256 checksum of a file on disk by streaming chunks to avoid buffering large files in RAM.
+pub fn compute_file_sha256(path: &Path) -> Result<String, std::io::Error> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct WebdavItem {
     pub href: String,
     pub is_dir: bool,
     pub size: u64,
     pub mtime: Option<u64>,
+}
+
+impl WebdavItem {
+    /// Creates a new WebdavItem with optional mtime defaulted to None for backwards compatibility.
+    pub fn new(href: impl Into<String>, is_dir: bool, size: u64) -> Self {
+        Self {
+            href: href.into(),
+            is_dir,
+            size,
+            mtime: None,
+        }
+    }
+
+    /// Sets the optional mtime on WebdavItem.
+    pub fn with_mtime(mut self, mtime: Option<u64>) -> Self {
+        self.mtime = mtime;
+        self
+    }
+}
+
+impl Default for WebdavItem {
+    fn default() -> Self {
+        Self {
+            href: String::new(),
+            is_dir: false,
+            size: 0,
+            mtime: None,
+        }
+    }
 }
 
 /// Parses a WebDAV date string into a UNIX timestamp (seconds since epoch).
@@ -216,16 +272,71 @@ pub fn resolve_item_url(base_url: &str, item_href: &str) -> String {
     format!("{}/{}", clean_base, clean_href)
 }
 
+/// Checks whether a relative path segment is safe and free of directory traversal sequences.
+pub fn is_safe_relative_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.contains('\\') || trimmed.starts_with('/') {
+        return false;
+    }
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        return false;
+    }
+    for part in trimmed.split('/') {
+        let part_trimmed = part.trim();
+        if part_trimmed.is_empty() || part_trimmed == "." || part_trimmed == ".." {
+            return false;
+        }
+    }
+    for comp in p.components() {
+        match comp {
+            std::path::Component::Normal(_) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Safely joins a relative path to a base directory, rejecting any path traversal attempts.
+pub fn safe_join_path(base: &Path, rel: &str) -> Result<PathBuf, String> {
+    if !is_safe_relative_path(rel) {
+        return Err(format!("Unsafe relative path segment rejected: {}", rel));
+    }
+    let target = base.join(rel);
+    if let Ok(c_base) = base.canonicalize() {
+        let mut cur = target.as_path();
+        while let Some(parent) = cur.parent() {
+            if let Ok(c_parent) = parent.canonicalize() {
+                if !c_parent.starts_with(&c_base) {
+                    return Err(format!("Path traversal attempt detected: {}", rel));
+                }
+                break;
+            }
+            cur = parent;
+        }
+    }
+    Ok(target)
+}
+
+fn sanitize_relative_path(rel: &str) -> String {
+    let clean = rel.trim_start_matches('/');
+    if is_safe_relative_path(clean) {
+        clean.to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// Computes the item path relative to the collection URL.
 pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
     let resolved_url_str = resolve_item_url(base_url, item_href);
     let resolved_url = match rustydav::prelude::Url::parse(&resolved_url_str) {
         Ok(u) => u,
-        Err(_) => return decode_percent(item_href).trim_matches('/').to_string(),
+        Err(_) => return sanitize_relative_path(&decode_percent(item_href)),
     };
     let base_url_parsed = match rustydav::prelude::Url::parse(base_url) {
         Ok(u) => u,
-        Err(_) => return decode_percent(item_href).trim_matches('/').to_string(),
+        Err(_) => return sanitize_relative_path(&decode_percent(item_href)),
     };
 
     let base_path = decode_percent(base_url_parsed.path());
@@ -245,7 +356,7 @@ pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
         if prefix.eq_ignore_ascii_case(trimmed_base)
             && (suffix.starts_with('/') || trimmed_base.is_empty())
         {
-            return suffix.trim_start_matches('/').to_string();
+            return sanitize_relative_path(suffix);
         }
     }
 
@@ -257,7 +368,7 @@ pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
             let after = &trimmed_item[idx + trimmed_base.len()..];
             let rel = after.trim_start_matches('/');
             if !rel.is_empty() {
-                return rel.to_string();
+                return sanitize_relative_path(rel);
             }
         }
     }
@@ -271,12 +382,13 @@ pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
             let after = &trimmed_item[idx + lower_seg.len()..];
             let rel = after.trim_start_matches('/');
             if !rel.is_empty() {
-                return rel.to_string();
+                return sanitize_relative_path(rel);
             }
         }
     }
 
-    trimmed_item.rsplit('/').next().unwrap_or("").to_string()
+    let raw_rel = trimmed_item.rsplit('/').next().unwrap_or("");
+    sanitize_relative_path(raw_rel)
 }
 
 /// Builds the canonical remote collection URL with trailing slash.
@@ -314,16 +426,117 @@ pub fn build_file_url(collection_url: &str, rel_path: &str) -> String {
     format!("{}/{}", clean_col, clean_rel)
 }
 
+/// Validates a WebDAV URL against SSRF, internal networks, and insecure protocols.
+/// In production, requires HTTPS and blocks local/private/link-local addresses.
+pub fn validate_webdav_url(url_str: &str) -> Result<(), String> {
+    let allow_insecure = cfg!(test)
+        || std::env::var("ALLOW_INSECURE_WEBDAV").as_deref() == Ok("1")
+        || std::env::var("TEST_WEBDAV_URL").is_ok();
+    validate_webdav_url_internal(url_str, allow_insecure)
+}
+
+pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Result<(), String> {
+    let url = rustydav::prelude::Url::parse(url_str)
+        .map_err(|e| format!("Invalid WebDAV URL: {}", e))?;
+
+    let scheme = url.scheme().to_ascii_lowercase();
+    if scheme != "https" {
+        if scheme == "http" && allow_insecure {
+            // Permitted for tests or explicit development override
+        } else {
+            return Err("Insecure protocol: WebDAV requires HTTPS in production.".to_string());
+        }
+    }
+
+    if allow_insecure {
+        return Ok(());
+    }
+
+    let host = url.host_str().ok_or_else(|| "URL has no host.".to_string())?;
+    let lower_host = host.to_ascii_lowercase();
+
+    // Block localhost and internal domains
+    if lower_host == "localhost"
+        || lower_host.ends_with(".localhost")
+        || lower_host.ends_with(".local")
+        || lower_host.ends_with(".internal")
+        || lower_host.ends_with(".lan")
+    {
+        return Err("Access to internal/loopback hostname is blocked for security.".to_string());
+    }
+
+    // Check IP addresses for private / loopback / link-local / metadata ranges
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(ipv4) => {
+                if ipv4.is_loopback() {
+                    return Err("Access to loopback IP is blocked for security.".to_string());
+                }
+                if ipv4.is_link_local() {
+                    return Err("Access to link-local IP (cloud metadata) is blocked for security.".to_string());
+                }
+                if ipv4.is_private() {
+                    return Err("Access to private RFC 1918 IP is blocked for security.".to_string());
+                }
+                if ipv4.is_broadcast() || ipv4.is_unspecified() {
+                    return Err("Access to broadcast/unspecified IP is blocked for security.".to_string());
+                }
+                let octets = ipv4.octets();
+                // 100.64.0.0/10 Carrier-grade NAT
+                if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+                    return Err("Access to shared carrier-grade NAT IP is blocked for security.".to_string());
+                }
+            }
+            std::net::IpAddr::V6(ipv6) => {
+                if ipv6.is_loopback() {
+                    return Err("Access to loopback IPv6 is blocked for security.".to_string());
+                }
+                if ipv6.is_unspecified() {
+                    return Err("Access to unspecified IPv6 is blocked for security.".to_string());
+                }
+                let segments = ipv6.segments();
+                // fe80::/10 link-local
+                if (segments[0] & 0xffc0) == 0xfe80 {
+                    return Err("Access to link-local IPv6 is blocked for security.".to_string());
+                }
+                // fc00::/7 unique local address
+                if (segments[0] & 0xfe00) == 0xfc00 {
+                    return Err("Access to unique local IPv6 is blocked for security.".to_string());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Ensures all parent collections exist for a relative file path prior to PUT.
 pub fn ensure_remote_parent_dirs(
     client: &rustydav::client::Client,
     remote_url: &str,
     rel_path: &str,
-) {
-    let _ = client.mkcol(remote_url);
+) -> Result<(), String> {
+    validate_webdav_url(remote_url)?;
+
+    if !is_safe_relative_path(rel_path) {
+        return Err(format!("Unsafe relative path rejected: {}", rel_path));
+    }
+
+    let res = client.mkcol(remote_url);
+    if let Ok(r) = res {
+        let status = r.status().as_u16();
+        if status != 201 && status != 405 && status != 200 && status != 301 && status != 302 {
+            if status == 401 || status == 403 {
+                return Err(format!("MKCOL failed for {}: HTTP {}", remote_url, status));
+            }
+        }
+    } else if let Err(e) = res {
+        return Err(format!("MKCOL network error for {}: {}", remote_url, e));
+    }
+
     let parts: Vec<&str> = rel_path.split('/').collect();
     if parts.len() <= 1 {
-        return;
+        return Ok(());
     }
     let mut current_rel = String::new();
     for part in &parts[..parts.len() - 1] {
@@ -332,9 +545,17 @@ pub fn ensure_remote_parent_dirs(
         }
         current_rel.push_str(part);
         let dir_url = format!("{}/", build_file_url(remote_url, &current_rel));
-        // MKCOL creates the folder; 201 Created or 405 Method Not Allowed (already exists) are expected
-        let _ = client.mkcol(&dir_url);
+        let res = client
+            .mkcol(&dir_url)
+            .map_err(|e| format!("Failed to create folder {}: {}", dir_url, e))?;
+        let status = res.status().as_u16();
+        if status != 201 && status != 405 && status != 200 && status != 301 && status != 302 {
+            if status == 401 || status == 403 {
+                return Err(format!("Failed to create remote directory {}: HTTP {}", dir_url, status));
+            }
+        }
     }
+    Ok(())
 }
 
 /// Recursively lists remote WebDAV items under remote_url.
@@ -505,19 +726,39 @@ pub fn get_metadata_mtime(metadata: &std::fs::Metadata) -> Option<u64> {
 }
 
 /// Walks a local directory recursively and returns (path, rel_path, size, mtime).
+/// Skips symlinks to prevent directory traversal and arbitrary file disclosure.
 pub fn collect_local_files_with_mtime(dir: &Path) -> Vec<(PathBuf, String, u64, Option<u64>)> {
     let mut files = Vec::new();
     if !dir.exists() || !dir.is_dir() {
         return files;
     }
+    let canonical_base = match dir.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return files,
+    };
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current_dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&current_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() {
+                let symlink_meta = match entry.file_type() {
+                    Ok(ft) => {
+                        // Skip symlinks completely to prevent arbitrary file read and directory escaping
+                        if ft.is_symlink() {
+                            continue;
+                        }
+                        ft
+                    }
+                    Err(_) => continue,
+                };
+                if symlink_meta.is_dir() {
                     stack.push(path);
-                } else if path.is_file() {
+                } else if symlink_meta.is_file() {
+                    if let Ok(canonical_path) = path.canonicalize() {
+                        if !canonical_path.starts_with(&canonical_base) {
+                            continue;
+                        }
+                    }
                     if let Ok(rel) = path.strip_prefix(dir) {
                         let rel_str = rel.to_string_lossy().replace('\\', "/");
                         let meta = entry.metadata().ok();
@@ -577,6 +818,7 @@ pub fn compute_sha256(bytes: &[u8]) -> String {
 
 /// Verifies authentication by sending PROPFIND depth 0 to the URL.
 pub fn verify_webdav_auth(url: &str, username: &str, password: &str) -> Result<(), String> {
+    validate_webdav_url(url)?;
     let client = rustydav::client::Client::init(username, password);
     match client.list(url, "0") {
         Ok(res) => {
@@ -609,6 +851,7 @@ pub fn execute_webdav_action<F>(
 where
     F: FnMut(&str),
 {
+    validate_webdav_url(remote_url)?;
     match action {
         "ls" => {
             log(&format!("Listing remote files in {}...\n", remote_url));
@@ -721,12 +964,20 @@ where
             }
 
             let mut copied_count = 0;
+            let max_size = get_max_file_size();
             for (idx, (path, rel_str, size)) in files_to_upload.into_iter().enumerate() {
                 if cancel_flag.load(Ordering::SeqCst) {
                     log("Operation canceled by user.\n");
                     return Ok(());
                 }
                 let current_num = idx + 1;
+                if size > max_size {
+                    log(&format!(
+                        "[{}/{}] ERROR: File {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
+                        current_num, total_to_upload, rel_str, size, max_size
+                    ));
+                    continue;
+                }
                 let file_url = build_file_url(remote_url, &rel_str);
                 if is_dry {
                     log(&format!(
@@ -739,16 +990,33 @@ where
                     "[{}/{}] Uploading: {} ({} bytes)...\n",
                     current_num, total_to_upload, rel_str, size
                 ));
-                ensure_remote_parent_dirs(client, remote_url, &rel_str);
-                let bytes = std::fs::read(&path)
-                    .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+                if let Err(e) = ensure_remote_parent_dirs(client, remote_url, &rel_str) {
+                    log(&format!(
+                        "[{}/{}] ERROR: Failed creating remote directory for {}: {}\n",
+                        current_num, total_to_upload, rel_str, e
+                    ));
+                    continue;
+                }
+                let file = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        log(&format!(
+                            "[{}/{}] ERROR: Failed to open {}: {}\n",
+                            current_num, total_to_upload, path.display(), e
+                        ));
+                        continue;
+                    }
+                };
                 let checksum_str = if with_checksum {
-                    format!(" (sha256: {})", compute_sha256(&bytes))
+                    match compute_file_sha256(&path) {
+                        Ok(hash) => format!(" (sha256: {})", hash),
+                        Err(_) => String::new(),
+                    }
                 } else {
                     String::new()
                 };
                 let res = client
-                    .put(bytes, &file_url)
+                    .put(file, &file_url)
                     .map_err(|e| format!("Upload failed for {}: {}", rel_str, e))?;
                 if res.status().is_success() {
                     copied_count += 1;
@@ -779,7 +1047,7 @@ where
                 .filter(|item| !item.is_dir)
                 .filter_map(|item| {
                     let rel = relative_item_path(remote_url, &item.href);
-                    if rel.is_empty() {
+                    if rel.is_empty() || !is_safe_relative_path(&rel) {
                         None
                     } else {
                         Some((item, rel))
@@ -793,6 +1061,7 @@ where
                 total_files
             ));
 
+            let max_size = get_max_file_size();
             let mut count = 0;
             let mut total_bytes = 0;
             for (idx, (item, rel)) in files_to_download.iter().enumerate() {
@@ -800,6 +1069,13 @@ where
                 if cancel_flag.load(Ordering::SeqCst) {
                     log("Operation canceled by user.\n");
                     return Ok(());
+                }
+                if item.size > max_size {
+                    log(&format!(
+                        "[{}/{}] ERROR: Remote file {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
+                        current_num, total_files, rel, item.size, max_size
+                    ));
+                    continue;
                 }
                 if is_dry {
                     log(&format!(
@@ -813,6 +1089,26 @@ where
                     "[{}/{}] Downloading: {} ({} bytes)...\n",
                     current_num, total_files, rel, item.size
                 ));
+                let target_file = match safe_join_path(local_dir, rel) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log(&format!(
+                            "[{}/{}] ERROR: Unsafe relative path rejected for {}: {}\n",
+                            current_num, total_files, rel, e
+                        ));
+                        continue;
+                    }
+                };
+                if let Some(parent) = target_file.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        format!("Failed to create directory {}: {}", parent.display(), e)
+                    })?;
+                    if let (Ok(c_parent), Ok(c_base)) = (parent.canonicalize(), local_dir.canonicalize()) {
+                        if !c_parent.starts_with(&c_base) {
+                            return Err(format!("Directory traversal detected for {}", rel));
+                        }
+                    }
+                }
                 let download_url = resolve_item_url(remote_url, &item.href);
                 let get_res = client
                     .get(&download_url)
@@ -827,37 +1123,60 @@ where
                     ));
                     continue;
                 }
-                let bytes = get_res
-                    .bytes()
-                    .map_err(|e| format!("Failed to read response bytes: {}", e))?;
-                let target_file = local_dir.join(rel);
-                if let Some(parent) = target_file.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        format!("Failed to create directory {}: {}", parent.display(), e)
-                    })?;
-                }
-                std::fs::write(&target_file, &bytes)
+
+                let mut dest_file = std::fs::File::create(&target_file)
+                    .map_err(|e| format!("Failed to create {}: {}", target_file.display(), e))?;
+                let mut limited_reader = std::io::Read::take(get_res, max_size + 1);
+                let downloaded_len = std::io::copy(&mut limited_reader, &mut dest_file)
                     .map_err(|e| format!("Failed to write {}: {}", target_file.display(), e))?;
+
+                if downloaded_len > max_size {
+                    drop(dest_file);
+                    let _ = std::fs::remove_file(&target_file);
+                    log(&format!(
+                        "[{}/{}] ERROR: Downloaded file {} exceeded maximum limit ({} bytes), deleted.\n",
+                        current_num, total_files, rel, max_size
+                    ));
+                    continue;
+                }
+
                 if let Some(mtime_sec) = item.mtime {
-                    if let Ok(file) = std::fs::File::open(&target_file) {
-                        let sys_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_sec);
-                        let times = std::fs::FileTimes::new().set_modified(sys_time);
-                        let _ = file.set_times(times);
+                    match std::fs::File::options().write(true).open(&target_file) {
+                        Ok(file) => {
+                            let sys_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_sec);
+                            let times = std::fs::FileTimes::new().set_modified(sys_time);
+                            if let Err(e) = file.set_times(times) {
+                                log(&format!(
+                                    "[{}/{}] WARNING: Could not preserve modification time on {}: {}\n",
+                                    current_num, total_files, rel, e
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            log(&format!(
+                                "[{}/{}] WARNING: Could not open {} to set modification time: {}\n",
+                                current_num, total_files, rel, e
+                            ));
+                        }
                     }
                 }
+
                 let checksum_str = if with_checksum {
-                    format!(" (sha256: {})", compute_sha256(&bytes))
+                    match compute_file_sha256(&target_file) {
+                        Ok(hash) => format!(" (sha256: {})", hash),
+                        Err(_) => String::new(),
+                    }
                 } else {
                     String::new()
                 };
                 count += 1;
-                total_bytes += bytes.len();
+                total_bytes += downloaded_len as usize;
                 log(&format!(
                     "[{}/{}] Downloaded: {} ({} bytes){}\n",
                     current_num,
                     total_files,
                     rel,
-                    bytes.len(),
+                    downloaded_len,
                     checksum_str
                 ));
             }
@@ -953,18 +1272,40 @@ where
 
             let total_to_upload = files_to_upload.len();
             let mut uploaded = 0;
+            let max_size = get_max_file_size();
             for (idx, (path, rel, size)) in files_to_upload.into_iter().enumerate() {
                 if cancel_flag.load(Ordering::SeqCst) {
                     log("Operation canceled by user.\n");
                     return Ok(());
                 }
                 let current_num = idx + 1;
+                if size > max_size {
+                    log(&format!(
+                        "[{}/{}] ERROR: File {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
+                        current_num, total_to_upload, rel, size, max_size
+                    ));
+                    continue;
+                }
                 let file_url = build_file_url(remote_url, &rel);
-                ensure_remote_parent_dirs(client, remote_url, &rel);
-                let bytes = std::fs::read(&path)
-                    .map_err(|e| format!("Read error {}: {}", path.display(), e))?;
+                if let Err(e) = ensure_remote_parent_dirs(client, remote_url, &rel) {
+                    log(&format!(
+                        "[{}/{}] ERROR: Failed creating remote directory for {}: {}\n",
+                        current_num, total_to_upload, rel, e
+                    ));
+                    continue;
+                }
+                let file = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        log(&format!(
+                            "[{}/{}] ERROR: Failed to open {}: {}\n",
+                            current_num, total_to_upload, path.display(), e
+                        ));
+                        continue;
+                    }
+                };
                 let res = client
-                    .put(bytes, &file_url)
+                    .put(file, &file_url)
                     .map_err(|e| format!("Upload error: {}", e))?;
                 if res.status().is_success() {
                     log(&format!("[{}/{}] Synced: {} ({} bytes)\n", current_num, total_to_upload, rel, size));
@@ -1312,5 +1653,98 @@ mod tests {
         assert!(!should_upload_file(100, None, 100, Some(1000)));
         assert!(!should_upload_file(100, Some(1000), 100, None));
         assert!(!should_upload_file(100, None, 100, None));
+    }
+
+    #[test]
+    fn test_relative_path_traversal_guards() {
+        assert!(is_safe_relative_path("file.txt"));
+        assert!(is_safe_relative_path("sub/file.txt"));
+        assert!(is_safe_relative_path("sub/dir/nested.txt"));
+
+        assert!(!is_safe_relative_path(""));
+        assert!(!is_safe_relative_path("/file.txt"));
+        assert!(!is_safe_relative_path("../file.txt"));
+        assert!(!is_safe_relative_path("sub/../file.txt"));
+        assert!(!is_safe_relative_path("./file.txt"));
+        assert!(!is_safe_relative_path("sub/./file.txt"));
+        assert!(!is_safe_relative_path("sub\\file.txt"));
+
+        let base = std::env::temp_dir();
+        assert!(safe_join_path(&base, "safe/doc.txt").is_ok());
+        assert!(safe_join_path(&base, "../escape.txt").is_err());
+        assert!(safe_join_path(&base, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_rules() {
+        // In production mode (allow_insecure = false):
+        // 1. HTTP is rejected
+        assert!(validate_webdav_url_internal("http://example.com/dav", false).is_err());
+        // 2. Localhost is rejected
+        assert!(validate_webdav_url_internal("https://localhost/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://my.localhost/dav", false).is_err());
+        // 3. Loopback IP is rejected
+        assert!(validate_webdav_url_internal("https://127.0.0.1:3923/", false).is_err());
+        // 4. Cloud metadata / link-local is rejected
+        assert!(validate_webdav_url_internal("https://169.254.169.254/latest/meta-data", false).is_err());
+        // 5. Private RFC 1918 IPs are rejected
+        assert!(validate_webdav_url_internal("https://10.0.0.1/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://192.168.1.1/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://172.16.0.1/dav", false).is_err());
+        // 6. Valid external HTTPS URL is accepted
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav", false).is_ok());
+
+        // In test / dev mode (allow_insecure = true):
+        assert!(validate_webdav_url_internal("http://127.0.0.1:3923/content/", true).is_ok());
+    }
+
+    #[test]
+    fn test_symlinks_skipped_in_collect_local_files() {
+        let temp_dir = std::env::temp_dir().join(format!("scs_symlink_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let target_file = temp_dir.join("real_file.txt");
+        std::fs::write(&target_file, "real content").unwrap();
+
+        let secret_dir = std::env::temp_dir().join(format!("scs_secret_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&secret_dir);
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let secret_file = secret_dir.join("secret.txt");
+        std::fs::write(&secret_file, "secret content").unwrap();
+
+        #[cfg(unix)]
+        {
+            let symlink_path = temp_dir.join("symlink_to_secret.txt");
+            let _ = std::os::unix::fs::symlink(&secret_file, &symlink_path);
+        }
+
+        let collected = collect_local_files_with_mtime(&temp_dir);
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].1, "real_file.txt");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&secret_dir);
+    }
+
+    #[test]
+    fn test_webdav_item_builder() {
+        let item = WebdavItem::new("/path/file.txt", false, 1234);
+        assert_eq!(item.href, "/path/file.txt");
+        assert!(!item.is_dir);
+        assert_eq!(item.size, 1234);
+        assert_eq!(item.mtime, None);
+
+        let item_with_mtime = item.with_mtime(Some(99999));
+        assert_eq!(item_with_mtime.mtime, Some(99999));
+    }
+
+    #[test]
+    fn test_compute_file_sha256() {
+        let temp_file = std::env::temp_dir().join(format!("scs_sha_test_{}.txt", std::process::id()));
+        std::fs::write(&temp_file, b"test payload for streaming sha256").unwrap();
+        let computed = compute_file_sha256(&temp_file).unwrap();
+        let direct = compute_sha256(b"test payload for streaming sha256");
+        assert_eq!(computed, direct);
+        let _ = std::fs::remove_file(&temp_file);
     }
 }
