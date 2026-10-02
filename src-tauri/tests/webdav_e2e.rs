@@ -654,9 +654,12 @@ fn test_live_copyparty_incremental_put_timestamp_differentiation() {
     assert!(log_output.contains("3 file(s) up to date"), "Dry run must detect 3 up to date: {}", log_output);
 
     // 4. Modify doc_a.txt with SAME size (13 bytes) but NEWER timestamp (simulate editing file without changing length)
-    // Sleep 2.1s so local filesystem timestamp advances past remote mtime (which has 1-second resolution)
-    std::thread::sleep(std::time::Duration::from_millis(2100));
     fs::write(&file_a, "ALPHA-CONTENT").unwrap();
+    // Explicitly advance modification time by 60 seconds using FileTimes to eliminate flaky CI sleep
+    let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    let f = std::fs::File::options().write(true).open(&file_a).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(future_time)).unwrap();
+    drop(f);
 
     log_output.clear();
     let res3 = execute_webdav_action(

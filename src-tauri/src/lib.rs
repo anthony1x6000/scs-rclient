@@ -155,6 +155,7 @@ fn verify_webdav(
         None => get_credentials(username.clone())?,
     };
     let remote_url = webdav::build_remote_url(&base_url, &subdir);
+    webdav::validate_webdav_url(&remote_url)?;
     webdav::verify_webdav_auth(&remote_url, &username, &secret)
 }
 
@@ -186,6 +187,7 @@ async fn run_webdav_action(
     };
 
     let remote_url = webdav::build_remote_url(&base_url, &subdir);
+    webdav::validate_webdav_url(&remote_url)?;
 
     let (user, pass) = if let Some(u) = username.filter(|u| !u.trim().is_empty()) {
         let p = get_credentials(u.clone()).unwrap_or_default();
