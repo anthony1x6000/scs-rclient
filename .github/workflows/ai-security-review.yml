@@ -28,6 +28,8 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  checks: read
+  actions: read
 
 jobs:
   security-review:
