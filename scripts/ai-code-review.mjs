@@ -10,13 +10,14 @@ async function waitChecks() {
   const repo = process.env.REPO || process.env.GITHUB_REPOSITORY;
   const headSha = process.env.HEAD_SHA || process.env.GITHUB_SHA;
   const currentRunId = process.env.CURRENT_RUN_ID || process.env.GITHUB_RUN_ID;
+  const waitForSecurity = process.env.WAIT_FOR_SECURITY === "true";
 
   if (!token || !repo || !headSha) {
     console.error("missing required environment variables (GITHUB_TOKEN, REPO, HEAD_SHA).");
     process.exit(1);
   }
 
-  console.log(`waiting for other PR checks on commit ${headSha} (repo: ${repo})...`);
+  console.log(`waiting for other PR builds, checks, and tests on commit ${headSha} (repo: ${repo}, waitForSecurity=${waitForSecurity})...`);
 
   // Initial grace period to allow sibling checks to register
   await new Promise((r) => setTimeout(r, 15000));
@@ -26,6 +27,58 @@ async function waitChecks() {
   const startTime = Date.now();
 
   while (Date.now() - startTime < maxWaitMs) {
+    // 1. Check parent workflow runs (e.g. Tauri Build) to ensure multi-job pipelines are complete
+    let workflowRuns = [];
+    try {
+      const res = await fetch(`https://api.github.com/repos/${repo}/actions/runs?head_sha=${headSha}&per_page=100`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "scs-rclient-ai-review"
+        }
+      });
+      if (res.ok) {
+        const body = await res.json();
+        workflowRuns = body.workflow_runs || [];
+      } else {
+        console.warn(`warning: github api workflow-runs query returned ${res.status}`);
+      }
+    } catch (err) {
+      console.warn("warning: failed to fetch workflow runs:", err.message);
+    }
+
+    const nonAiWorkflows = workflowRuns.filter((w) => {
+      if (currentRunId && String(w.id) === String(currentRunId)) return false;
+      const lower = (w.name || "").toLowerCase();
+      if (lower.includes("ai code review") || lower.includes("ai-code-review")) return false;
+      if (!waitForSecurity && (lower.includes("ai security review") || lower.includes("ai-security-review"))) return false;
+      return true;
+    });
+
+    const failedWorkflows = nonAiWorkflows.filter((w) => {
+      return (
+        w.status === "completed" &&
+        ["failure", "timed_out", "cancelled", "action_required"].includes(w.conclusion)
+      );
+    });
+
+    if (failedWorkflows.length > 0) {
+      console.error("other PR workflow(s) failed:");
+      for (const w of failedWorkflows) {
+        console.error(`- ${w.name}: conclusion=${w.conclusion}`);
+      }
+      console.error("agent must only be invoked after all other PR checks pass. halting.");
+      process.exit(2);
+    }
+
+    const inProgressWorkflows = nonAiWorkflows.filter((w) => w.status !== "completed");
+    if (inProgressWorkflows.length > 0) {
+      console.log(`waiting for ${inProgressWorkflows.length} workflow(s) to finish: ${inProgressWorkflows.map((w) => w.name).join(", ")}`);
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+      continue;
+    }
+
+    // 2. Check individual job check-runs
     let checkRuns = [];
     try {
       const res = await fetch(`https://api.github.com/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, {
@@ -49,10 +102,11 @@ async function waitChecks() {
       if (currentRunId && String(r.id) === String(currentRunId)) return false;
       const lower = (r.name || "").toLowerCase();
       if (lower.includes("ai code review") || lower.includes("ai-code-review")) return false;
+      if (!waitForSecurity && (lower.includes("ai security review") || lower.includes("ai-security-review"))) return false;
       return true;
     });
 
-    if (otherRuns.length === 0) {
+    if (nonAiWorkflows.length === 0 && otherRuns.length === 0) {
       const elapsed = Date.now() - startTime;
       if (elapsed < 30000) {
         console.log("no other check runs detected yet. waiting for sibling jobs...");
@@ -86,7 +140,7 @@ async function waitChecks() {
       continue;
     }
 
-    console.log(`all ${otherRuns.length} other PR check(s) passed: ${otherRuns.map((r) => `${r.name} (${r.conclusion})`).join(", ")}`);
+    console.log(`all ${otherRuns.length} other PR check(s) and workflow(s) passed: ${otherRuns.map((r) => `${r.name} (${r.conclusion})`).join(", ")}`);
     process.exit(0);
   }
 

@@ -205,7 +205,7 @@ jobs:
           # run's own in-progress check until the timeout. wait-checks skips
           # ai review runs instead and exits non-zero if any sibling check on
           # this sha did not pass, so a re-run that went red still blocks.
-          node scripts/ai-code-review.mjs wait-checks
+          WAIT_FOR_SECURITY=true node scripts/ai-code-review.mjs wait-checks
 
           gh pr merge "$PR_NUMBER" --squash
           echo "merged pr #$PR_NUMBER on ai review verdict: APPROVE."

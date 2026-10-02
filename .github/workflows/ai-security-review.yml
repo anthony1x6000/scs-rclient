@@ -32,6 +32,8 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  checks: read
+  actions: read
 
 jobs:
   security-review:
@@ -42,10 +44,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     name: AI Security Review Agent
     runs-on: ${{ vars.FORCE_CLOUD_RUNNERS == 'true' && 'ubuntu-latest' || ((github.actor == 'anthony1x6000' || github.event.pull_request.user.login == 'anthony1x6000') && 'self-hosted' || 'ubuntu-latest') }}
-    # Stays under the 15 minute wait-checks budget ai-code-review grants a
-    # sibling check, so a slow security review fails its own gate instead of
-    # making the code review time out on a check that never reported.
-    timeout-minutes: 14
+    timeout-minutes: 20
 
     env:
       # Pinned upstream skill. To bump: fetch the exact commit, confirm the tree,
@@ -81,7 +80,28 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Wait for Other PR Checks to Pass
+        id: wait-checks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # A gate that cannot open must end red. Exiting green with the review
+          # skipped reads as "ai reviewed and approved" on the checks list, which
+          # is a false signal; red is honest that no review was produced.
+          if node scripts/ai-code-review.mjs wait-checks; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+            echo "::error title=ai security review skipped::other PR checks did not pass, so no ai security review was produced. the failing checks are listed above; fix or re-run them, then re-run this workflow."
+            exit 1
+          fi
+
       - name: Fetch Pinned Security Audit Skill
+        if: steps.wait-checks.outputs.passed == 'true'
         run: |
           set -euo pipefail
           rm -rf /tmp/security-audit-skill
@@ -101,6 +121,7 @@ jobs:
           git -C /tmp/security-audit-skill log -1 --format='%H %s'
 
       - name: Build Security Skill and Guidelines
+        if: steps.wait-checks.outputs.passed == 'true'
         run: |
           set -euo pipefail
           # One combined skill file for the shared engine: the upstream
@@ -126,6 +147,7 @@ jobs:
           echo "skill file $(wc -c < "$SKILL_FILE") bytes, guidelines $(wc -c < "$EXTRA_GUIDELINES_FILE") bytes."
 
       - name: Extract and Filter Source Diff
+        if: steps.wait-checks.outputs.passed == 'true'
         id: diff
         env:
           BASE_REF: ${{ github.base_ref || 'main' }}
@@ -184,6 +206,7 @@ jobs:
           fi
 
       - name: Collect PR Discussion and Excluded Summary
+        if: steps.wait-checks.outputs.passed == 'true'
         id: thread
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -230,7 +253,7 @@ jobs:
           fi
 
       - name: Post Comment When Nothing To Audit
-        if: success() && steps.diff.outputs.has_diff == 'false' && steps.thread.outputs.has_context == 'false'
+        if: steps.wait-checks.outputs.passed == 'true' && steps.diff.outputs.has_diff == 'false' && steps.thread.outputs.has_context == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -247,11 +270,11 @@ jobs:
           gh pr comment "$PR_NUMBER" --body-file "$COMMENT_FILE"
 
       - name: Prepare Security Review Payload
-        if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
+        if: steps.wait-checks.outputs.passed == 'true' && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         run: node scripts/ai-code-review.mjs prepare-payload
 
       - name: Call Security Review Agent
-        if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
+        if: steps.wait-checks.outputs.passed == 'true' && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_NIM_KEY }}
         run: |
@@ -297,7 +320,7 @@ jobs:
           fi
 
       - name: Post Security Review Comment and Verdict
-        if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
+        if: steps.wait-checks.outputs.passed == 'true' && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
