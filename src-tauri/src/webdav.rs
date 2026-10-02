@@ -115,19 +115,21 @@ pub fn get_cache_ttl_secs() -> u64 {
         .unwrap_or(DEFAULT_CACHE_TTL_SECS)
 }
 
-/// Returns the path to the WebDAV remote listing cache file.
+/// Returns the path to the WebDAV remote listing cache file if a secure user directory is available.
 ///
 /// Security & Access Control:
-/// - Unix/Linux/macOS: The cache directory is created with mode `0o700` and the cache file
-///   with mode `0o600`, strictly isolating access to the current user (CWE-200 / CWE-732).
-/// - Windows Limitation: On Windows, fine-grained DACLs are not manipulated via Win32 API.
-///   Instead, access control relies on the user-profile container DACL (`%LOCALAPPDATA%` or `%APPDATA%`),
-///   which natively grants access exclusively to the current user profile and SYSTEM.
-pub fn get_cache_file_path() -> PathBuf {
+/// - Unix/Linux/macOS: The cache file is located inside `$XDG_CACHE_HOME` or `$HOME/.cache`, with
+///   parent directory created mode `0o700` and file written mode `0o600` (CWE-200 / CWE-732).
+/// - Windows Limitation: Fine-grained per-file DACLs are not manipulated via Win32 API.
+///   Access control relies on the container DACL (`%LOCALAPPDATA%` or `%APPDATA%`), which natively
+///   restricts access to the current user profile and SYSTEM.
+/// - Fallback Rejection: If no user home or AppData directory is resolvable, fallback to shared/world-readable
+///   temporary directories (/tmp) is strictly rejected (returns `None`), safely disabling disk caching.
+pub fn get_cache_file_path() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("WEBDAV_CACHE_FILE") {
         let p = PathBuf::from(custom);
         if !p.as_os_str().is_empty() {
-            return p;
+            return Some(p);
         }
     }
 
@@ -136,13 +138,13 @@ pub fn get_cache_file_path() -> PathBuf {
         if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
             let p = PathBuf::from(xdg);
             if p.is_absolute() {
-                return p.join("scs-rclient").join("webdav_cache.json");
+                return Some(p.join("scs-rclient").join("webdav_cache.json"));
             }
         }
         if let Ok(home) = std::env::var("HOME") {
             let p = PathBuf::from(home);
             if p.is_absolute() {
-                return p.join(".cache").join("scs-rclient").join("webdav_cache.json");
+                return Some(p.join(".cache").join("scs-rclient").join("webdav_cache.json"));
             }
         }
     }
@@ -152,42 +154,18 @@ pub fn get_cache_file_path() -> PathBuf {
         if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
             let p = PathBuf::from(local_appdata);
             if !p.as_os_str().is_empty() {
-                return p.join("scs-rclient").join("webdav_cache.json");
+                return Some(p.join("scs-rclient").join("webdav_cache.json"));
             }
         }
         if let Ok(appdata) = std::env::var("APPDATA") {
             let p = PathBuf::from(appdata);
             if !p.as_os_str().is_empty() {
-                return p.join("scs-rclient").join("webdav_cache.json");
+                return Some(p.join("scs-rclient").join("webdav_cache.json"));
             }
         }
     }
 
-    let user_suffix = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "default".to_string());
-    let safe_suffix: String = user_suffix
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-
-    // In fallback mode when user profile / XDG environment variables are unavailable,
-    // create a private subdirectory with mode 0o700 on Unix to prevent world-readable snooping in /tmp.
-    let private_subdir = std::env::temp_dir().join(format!("scs_rclient_cache_{}", safe_suffix));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        builder.mode(0o700);
-        let _ = builder.create(&private_subdir);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::create_dir_all(&private_subdir);
-    }
-
-    private_subdir.join("webdav_cache.json")
+    None
 }
 
 /// Atomically writes content to the cache file using a temporary file and atomic rename.
@@ -195,7 +173,7 @@ pub fn get_cache_file_path() -> PathBuf {
 /// Security & Access Control:
 /// - Unix/Linux/macOS: The parent directory is created with mode `0o700` and the temporary file
 ///   with mode `0o600` before atomic rename, ensuring multi-user isolation on shared systems.
-/// - Windows Limitation: On Windows, fine-grained DACLs are not manipulated via Win32 API.
+/// - Windows Limitation: Fine-grained per-file DACLs are not manipulated via Win32 API.
 ///   Security isolation relies on the enclosing parent folder's DACL (e.g. `%LOCALAPPDATA%`).
 fn write_cache_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -235,6 +213,7 @@ fn write_cache_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
+        // Windows Limitation: Written without custom DACLs; relies on %LOCALAPPDATA% directory ACLs.
         std::fs::write(&tmp_path, content)?;
     }
 
@@ -276,7 +255,7 @@ fn write_cache_map(path: &Path, cache: &HashMap<String, CachedRemoteListing>) {
 
 /// Loads cached remote items for remote_url if valid and not expired.
 pub fn load_remote_cache(remote_url: &str) -> Option<Vec<WebdavItem>> {
-    let path = get_cache_file_path();
+    let path = get_cache_file_path()?;
     let cache = read_cache_map(&path);
     let key = remote_url.trim_end_matches('/').to_ascii_lowercase();
     let entry = cache.get(&key)?;
@@ -301,6 +280,10 @@ pub fn load_remote_cache(remote_url: &str) -> Option<Vec<WebdavItem>> {
         if !rel.is_empty() && !is_safe_relative_path(&rel) {
             continue;
         }
+        let item_lower = item.href.to_ascii_lowercase();
+        if !item_lower.starts_with(&key) {
+            continue;
+        }
         valid_items.push(item.clone());
     }
 
@@ -314,7 +297,10 @@ pub fn load_remote_cache(remote_url: &str) -> Option<Vec<WebdavItem>> {
 /// If switching credentials or access permissions for the same URL, invoke `clear_remote_cache()`
 /// or click the 'Clear Cache' button under Settings to invalidate prior cached listings.
 pub fn save_remote_cache(remote_url: &str, items: &[WebdavItem]) {
-    let path = get_cache_file_path();
+    let path = match get_cache_file_path() {
+        Some(p) => p,
+        None => return,
+    };
     let mut cache = read_cache_map(&path);
 
     let now = std::time::SystemTime::now()
@@ -356,7 +342,10 @@ pub fn update_remote_cache_item(
     if !is_safe_relative_path(rel_path) {
         return;
     }
-    let path = get_cache_file_path();
+    let path = match get_cache_file_path() {
+        Some(p) => p,
+        None => return,
+    };
     let mut cache = read_cache_map(&path);
     if cache.is_empty() {
         return;
@@ -392,7 +381,10 @@ pub fn remove_remote_cache_item(remote_url: &str, rel_path: &str) {
     if !is_safe_relative_path(rel_path) {
         return;
     }
-    let path = get_cache_file_path();
+    let path = match get_cache_file_path() {
+        Some(p) => p,
+        None => return,
+    };
     let mut cache = read_cache_map(&path);
     if cache.is_empty() {
         return;
@@ -411,7 +403,10 @@ pub fn remove_remote_cache_item(remote_url: &str, rel_path: &str) {
 
 /// Clears the remote listing cache file.
 pub fn clear_remote_cache() -> Result<(), String> {
-    let path = get_cache_file_path();
+    let path = match get_cache_file_path() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
         if meta.file_type().is_symlink() {
             let _ = std::fs::remove_file(&path);
@@ -1156,6 +1151,7 @@ where
                             scan_idx, display_folder
                         ));
 
+                        // Check cancellation before issuing directory listing network request
                         if cancel_flag.load(Ordering::SeqCst) {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
                             state.stopped = true;
@@ -1164,6 +1160,7 @@ where
 
                         let list_res = client.list(&current_url, "1");
 
+                        // Check cancellation immediately after blocking network I/O returns to abort before parsing response body
                         if cancel_flag.load(Ordering::SeqCst) {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
                             state.stopped = true;

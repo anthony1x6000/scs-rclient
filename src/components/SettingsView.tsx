@@ -19,7 +19,7 @@ interface SettingsViewProps {
 
 function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsViewProps) {
   const [draft, setDraft] = useState<string>(targetSubdir);
-  const [concurrencyDraft, setConcurrencyDraft] = useState<number | string>(DEFAULT_SCAN_CONCURRENCY);
+  const [concurrencyDraft, setConcurrencyDraft] = useState<string>(String(DEFAULT_SCAN_CONCURRENCY));
   const [savedIndicator, setSavedIndicator] = useState<string>("");
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const concurrencyDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -30,7 +30,7 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
   useEffect(() => {
     let active = true;
     getScanConcurrency().then((c) => {
-      if (active) setConcurrencyDraft(c);
+      if (active) setConcurrencyDraft(String(c));
     });
     return () => {
       active = false;
@@ -109,9 +109,9 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
   };
 
   const handleConcurrencyBlur = () => {
-    const clamped = parseAndClampScanConcurrency(String(concurrencyDraft));
+    const clamped = parseAndClampScanConcurrency(concurrencyDraft);
     const finalVal = clamped ?? DEFAULT_SCAN_CONCURRENCY;
-    setConcurrencyDraft(finalVal);
+    setConcurrencyDraft(String(finalVal));
     void persistConcurrency(finalVal);
   };
 

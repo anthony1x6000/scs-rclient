@@ -119,11 +119,11 @@ export function clampScanConcurrency(threads: number): number {
 
 /**
  * Parses and clamps a string input into a valid scan concurrency integer.
- * Returns null if the input is non-numeric or empty.
+ * Returns null if the input is non-numeric, contains non-digit characters, or is empty.
  */
 export function parseAndClampScanConcurrency(raw: string): number | null {
   const trimmed = raw.trim();
-  if (trimmed === "") return null;
+  if (trimmed === "" || !/^\d+$/.test(trimmed)) return null;
   const parsed = parseInt(trimmed, 10);
   if (isNaN(parsed)) return null;
   return clampScanConcurrency(parsed);
