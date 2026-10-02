@@ -3,6 +3,7 @@ import {
   setTargetSubdir,
   getScanConcurrency,
   setScanConcurrency,
+  clearWebDAVCache,
   DEFAULT_SCAN_CONCURRENCY,
   MIN_SCAN_CONCURRENCY,
   MAX_SCAN_CONCURRENCY,
@@ -78,6 +79,17 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
     }
   };
 
+  const handleClearCache = async () => {
+    setSavedIndicator("Clearing…");
+    try {
+      await clearWebDAVCache();
+      setSavedIndicator("Cache cleared.");
+    } catch (e) {
+      console.error("Failed to clear WebDAV cache:", e);
+      setSavedIndicator("Clear failed.");
+    }
+  };
+
   const handleChange = (newVal: string) => {
     setDraft(newVal);
     setSavedIndicator("");
@@ -125,6 +137,14 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
       </div>
       <button
         type="button"
+        onClick={handleClearCache}
+        className="shrink-0 px-2.5 py-1 text-xs border border-white/20 hover:border-amber-400/40 hover:text-amber-200 focus:border-amber-400/60 bg-transparent text-gray-300 outline-none cursor-pointer hover:bg-amber-500/10 active:scale-95 transition-all text-nowrap"
+        title="Clear cached remote WebDAV file listings"
+      >
+        Clear Cache
+      </button>
+      <button
+        type="button"
         onClick={onClose}
         className="shrink-0 px-3 py-1 text-xs border border-white/20 hover:border-white/40 focus:border-white/60 bg-transparent text-white outline-none cursor-pointer hover:bg-white/5 active:scale-95 transition-all text-nowrap"
       >
@@ -138,4 +158,5 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
 }
 
 export default SettingsView;
+
 

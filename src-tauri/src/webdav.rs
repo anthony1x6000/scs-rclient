@@ -83,6 +83,291 @@ impl Default for WebdavItem {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedRemoteListing {
+    pub remote_url: String,
+    pub timestamp: u64,
+    pub items: Vec<WebdavItem>,
+}
+
+/// Default TTL for cached remote file listings (24 hours).
+pub const DEFAULT_CACHE_TTL_SECS: u64 = 86400;
+
+/// Returns whether remote WebDAV file caching is enabled.
+pub fn is_cache_enabled() -> bool {
+    if cfg!(test) || std::env::var("TEST_WEBDAV_URL").is_ok() {
+        return std::env::var("ENABLE_WEBDAV_CACHE_IN_TEST").as_deref() == Ok("1");
+    }
+    std::env::var("WEBDAV_CACHE_DISABLED").as_deref() != Ok("1")
+}
+
+/// Returns the cache time-to-live in seconds.
+pub fn get_cache_ttl_secs() -> u64 {
+    std::env::var("WEBDAV_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CACHE_TTL_SECS)
+}
+
+/// Returns the path to the WebDAV remote listing cache file.
+pub fn get_cache_file_path() -> PathBuf {
+    if let Ok(custom) = std::env::var("WEBDAV_CACHE_FILE") {
+        let p = PathBuf::from(custom);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+            let p = PathBuf::from(xdg);
+            if p.is_absolute() {
+                return p.join("scs-rclient").join("webdav_cache.json");
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let p = PathBuf::from(home);
+            if p.is_absolute() {
+                return p.join(".cache").join("scs-rclient").join("webdav_cache.json");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            let p = PathBuf::from(local_appdata);
+            if !p.as_os_str().is_empty() {
+                return p.join("scs-rclient").join("webdav_cache.json");
+            }
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let p = PathBuf::from(appdata);
+            if !p.as_os_str().is_empty() {
+                return p.join("scs-rclient").join("webdav_cache.json");
+            }
+        }
+    }
+
+    let user_suffix = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "default".to_string());
+    let safe_suffix: String = user_suffix
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    std::env::temp_dir().join(format!("scs_rclient_webdav_cache_{}.json", safe_suffix))
+}
+
+fn write_cache_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            builder.mode(0o700);
+            let _ = builder.create(parent);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp_path, content)?;
+    }
+
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Loads cached remote items for remote_url if valid and not expired.
+pub fn load_remote_cache(remote_url: &str) -> Option<Vec<WebdavItem>> {
+    let path = get_cache_file_path();
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    }
+    let content = std::fs::read_to_string(&path).ok()?;
+    if content.len() > 50 * 1024 * 1024 {
+        return None;
+    }
+    let cache: HashMap<String, CachedRemoteListing> = serde_json::from_str(&content).ok()?;
+    let key = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    let entry = cache.get(&key)?;
+
+    let ttl = get_cache_ttl_secs();
+    if ttl > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        if now.saturating_sub(entry.timestamp) > ttl {
+            return None;
+        }
+    }
+
+    let mut valid_items = Vec::with_capacity(entry.items.len());
+    for item in &entry.items {
+        let rel = relative_item_path(remote_url, &item.href);
+        if !rel.is_empty() && !is_safe_relative_path(&rel) {
+            continue;
+        }
+        valid_items.push(item.clone());
+    }
+
+    Some(valid_items)
+}
+
+/// Saves remote items to the local cache file for remote_url.
+pub fn save_remote_cache(remote_url: &str, items: &[WebdavItem]) {
+    let path = get_cache_file_path();
+    let mut cache: HashMap<String, CachedRemoteListing> = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let key = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    cache.insert(
+        key,
+        CachedRemoteListing {
+            remote_url: remote_url.to_string(),
+            timestamp: now,
+            items: items.to_vec(),
+        },
+    );
+
+    if let Ok(json) = serde_json::to_string_pretty(&cache) {
+        let _ = write_cache_atomic(&path, &json);
+    }
+}
+
+/// Updates or inserts an item in the remote cache after upload.
+pub fn update_remote_cache_item(
+    remote_url: &str,
+    rel_path: &str,
+    new_size: u64,
+    new_mtime: Option<u64>,
+) {
+    let path = get_cache_file_path();
+    let mut cache: HashMap<String, CachedRemoteListing> = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    } else {
+        return;
+    };
+
+    let key = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    if let Some(entry) = cache.get_mut(&key) {
+        let expected_url = build_file_url(remote_url, rel_path);
+        let mut found = false;
+        for item in &mut entry.items {
+            let item_rel = relative_item_path(remote_url, &item.href);
+            if item_rel == rel_path || item.href.eq_ignore_ascii_case(&expected_url) {
+                item.size = new_size;
+                item.mtime = new_mtime;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            entry.items.push(WebdavItem {
+                href: expected_url,
+                is_dir: false,
+                size: new_size,
+                mtime: new_mtime,
+            });
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&cache) {
+            let _ = write_cache_atomic(&path, &json);
+        }
+    }
+}
+
+/// Removes an item from the remote cache after deletion.
+pub fn remove_remote_cache_item(remote_url: &str, rel_path: &str) {
+    let path = get_cache_file_path();
+    let mut cache: HashMap<String, CachedRemoteListing> = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    } else {
+        return;
+    };
+
+    let key = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    if let Some(entry) = cache.get_mut(&key) {
+        let expected_url = build_file_url(remote_url, rel_path);
+        entry.items.retain(|item| {
+            let item_rel = relative_item_path(remote_url, &item.href);
+            item_rel != rel_path && !item.href.eq_ignore_ascii_case(&expected_url)
+        });
+        if let Ok(json) = serde_json::to_string_pretty(&cache) {
+            let _ = write_cache_atomic(&path, &json);
+        }
+    }
+}
+
+/// Clears the remote listing cache file.
+pub fn clear_remote_cache() -> Result<(), String> {
+    let path = get_cache_file_path();
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        }
+    }
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to clear cache: {}", e))?;
+    }
+    Ok(())
+}
+
 /// Parses a WebDAV date string into a UNIX timestamp (seconds since epoch).
 pub fn parse_webdav_date(date_str: &str) -> Option<u64> {
     let s = date_str.trim();
@@ -616,6 +901,17 @@ where
         return Err("Operation canceled by user.".to_string());
     }
 
+    if is_cache_enabled() {
+        if let Some(cached_items) = load_remote_cache(remote_url) {
+            log(&format!(
+                "Loaded {} item(s) from remote listing cache for {}.\n",
+                cached_items.len(),
+                remote_url
+            ));
+            return Ok(cached_items);
+        }
+    }
+
     // Try Depth: infinity first
     log(&format!(
         "Querying remote server with Depth: infinity for {}...\n",
@@ -637,6 +933,9 @@ where
                         "Server returned {} items via Depth: infinity.\n",
                         child_count
                     ));
+                    if is_cache_enabled() {
+                        save_remote_cache(remote_url, &items);
+                    }
                     return Ok(items);
                 } else {
                     log("Depth: infinity returned 0 child items (server likely restricts Depth: infinity). Falling back to Depth: 1 traversal...\n");
@@ -917,6 +1216,10 @@ where
     }
 
     state.all_items.sort_by(|a, b| a.href.cmp(&b.href));
+
+    if is_cache_enabled() {
+        save_remote_cache(remote_url, &state.all_items);
+    }
 
     let file_count = state.all_items.iter().filter(|i| !i.is_dir).count();
     let dir_count = state.all_items.iter().filter(|i| i.is_dir).count();
@@ -1253,6 +1556,12 @@ where
                     .map_err(|e| format!("Upload failed for {}: {}", rel_str, e))?;
                 if res.status().is_success() {
                     copied_count += 1;
+                    if is_cache_enabled() {
+                        let mtime = std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|m| get_metadata_mtime(&m));
+                        update_remote_cache_item(remote_url, &rel_str, size, mtime);
+                    }
                     log(&format!(
                         "[{}/{}] Copied: {} ({} bytes){}\n",
                         current_num, total_to_upload, rel_str, size, checksum_str
@@ -1547,6 +1856,12 @@ where
                     .put(file, &file_url)
                     .map_err(|e| format!("Upload error: {}", e))?;
                 if res.status().is_success() {
+                    if is_cache_enabled() {
+                        let mtime = std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|m| get_metadata_mtime(&m));
+                        update_remote_cache_item(remote_url, &rel, size, mtime);
+                    }
                     log(&format!("[{}/{}] Synced: {} ({} bytes)\n", current_num, total_to_upload, rel, size));
                     uploaded += 1;
                 }
@@ -1565,6 +1880,9 @@ where
                     let file_url = resolve_item_url(remote_url, &item.href);
                     let del_res = client.delete(&file_url);
                     if del_res.is_ok() {
+                        if is_cache_enabled() {
+                            remove_remote_cache_item(remote_url, &rel);
+                        }
                         log(&format!("Deleted remote file not in local: {}\n", rel));
                         deleted += 1;
                     }
@@ -1994,6 +2312,35 @@ mod tests {
         assert_eq!(MAX_SCANNED_DIRS_LIMIT, 10_000);
         let concurrency = get_scan_concurrency();
         assert!(concurrency >= 1 && concurrency <= MAX_SCAN_CONCURRENCY);
+    }
+
+    #[test]
+    fn test_remote_cache_lifecycle() {
+        let temp_cache = std::env::temp_dir().join(format!("scs_cache_test_{}.json", std::process::id()));
+        std::env::set_var("WEBDAV_CACHE_FILE", &temp_cache);
+
+        let test_url = "https://example.com/remote/files/";
+        let items = vec![
+            WebdavItem::new("https://example.com/remote/files/doc.pdf", false, 4096),
+        ];
+
+        save_remote_cache(test_url, &items);
+        let loaded = load_remote_cache(test_url).expect("Cache should load saved items");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].size, 4096);
+
+        update_remote_cache_item(test_url, "doc.pdf", 8192, Some(12345678));
+        let updated = load_remote_cache(test_url).unwrap();
+        assert_eq!(updated[0].size, 8192);
+        assert_eq!(updated[0].mtime, Some(12345678));
+
+        remove_remote_cache_item(test_url, "doc.pdf");
+        let after_removal = load_remote_cache(test_url).unwrap();
+        assert_eq!(after_removal.len(), 0);
+
+        clear_remote_cache().unwrap();
+        assert!(!temp_cache.exists());
+        std::env::remove_var("WEBDAV_CACHE_FILE");
     }
 }
 

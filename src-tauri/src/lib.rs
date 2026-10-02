@@ -221,6 +221,11 @@ async fn run_webdav_action(
     .map_err(|e| format!("Task execution error: {}", e))?
 }
 
+#[tauri::command]
+fn clear_webdav_cache() -> Result<(), String> {
+    webdav::clear_remote_cache()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -274,8 +279,10 @@ pub fn run() {
             delete_credentials,
             verify_webdav,
             cancel_webdav_action,
-            run_webdav_action
+            run_webdav_action,
+            clear_webdav_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

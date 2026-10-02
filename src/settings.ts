@@ -139,3 +139,8 @@ export async function loadAppSettings(): Promise<{
   ]);
   return { baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency };
 }
+
+export async function clearWebDAVCache(): Promise<void> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("clear_webdav_cache");
+}
