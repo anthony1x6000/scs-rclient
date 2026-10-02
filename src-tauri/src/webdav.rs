@@ -85,6 +85,10 @@ impl Default for WebdavItem {
     }
 }
 
+/// Represents a cached remote WebDAV directory listing.
+/// Note: Cached listings are keyed by normalized remote collection URL.
+/// If switching credentials or access permissions for the same URL, invoke `clear_remote_cache()`
+/// or click the 'Clear Cache' button under Settings to invalidate prior cached listings.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CachedRemoteListing {
     pub remote_url: String,
