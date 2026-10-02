@@ -15,7 +15,7 @@ if [[ ! -f "$DEB_FILE" ]]; then
 fi
 
 echo "=== Installing .deb ($DEB_FILE) ==="
-sudo dpkg -i "$DEB_FILE" || sudo apt-get install -f -y
+sudo dpkg -i "$DEB_FILE" || sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -f -y
 
 echo "=== Verifying package installation ==="
 dpkg -l scs-rclient

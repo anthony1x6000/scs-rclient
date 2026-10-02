@@ -12,33 +12,46 @@ async function checkFailures() {
   const currentRunId = process.env.CURRENT_RUN_ID || process.env.GITHUB_RUN_ID;
 
   if (!token || !repo || !headSha) {
-    process.exit(0);
+    console.error("missing required environment variables for check-failures (GITHUB_TOKEN, REPO, HEAD_SHA).");
+    process.exit(1);
   }
 
-  try {
-    const res = await fetch(`https://api.github.com/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": "scs-rclient-ai-review"
-      }
-    });
-    if (res.ok) {
-      const body = await res.json();
-      const checkRuns = body.check_runs || [];
-      const failed = checkRuns.filter(
-        (r) =>
-          r.status === "completed" &&
-          ["failure", "timed_out", "cancelled", "action_required"].includes(r.conclusion) &&
-          (!currentRunId || String(r.id) !== String(currentRunId))
-      );
-      if (failed.length > 0) {
-        console.error(`sibling check(s) already failed on commit ${headSha}: ${failed.map((f) => f.name).join(", ")}. skipping review.`);
+  let res;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      res = await fetch(`https://api.github.com/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "scs-rclient-ai-review"
+        }
+      });
+      if (res.ok) break;
+    } catch (err) {
+      if (attempt === 3) {
+        console.error(`failed to query sibling check-runs after 3 attempts: ${err.message}`);
         process.exit(1);
       }
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
     }
-  } catch (err) {
-    console.warn("warning: failed to check sibling runs:", err.message);
+  }
+
+  if (!res || !res.ok) {
+    console.error(`github api check-runs returned status ${res?.status || "unknown"}`);
+    process.exit(1);
+  }
+
+  const body = await res.json();
+  const checkRuns = body.check_runs || [];
+  const failed = checkRuns.filter(
+    (r) =>
+      r.status === "completed" &&
+      ["failure", "timed_out", "cancelled", "action_required"].includes(r.conclusion) &&
+      (!currentRunId || (String(r.id) !== String(currentRunId) && String(r.run_id) !== String(currentRunId)))
+  );
+  if (failed.length > 0) {
+    console.error(`sibling check(s) already failed on commit ${headSha}: ${failed.map((f) => f.name).join(", ")}. skipping review.`);
+    process.exit(1);
   }
   process.exit(0);
 }

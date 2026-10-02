@@ -209,10 +209,10 @@ jobs:
               --jq '"# pr title\n" + .title + "\n\n# pr body\n" + (.body // "")' \
               >> "$EXTRA_CONTEXT_FILE" || true
             gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" --paginate \
-              --jq '.[] | "\n# comment by @\(.user.login)\n" + (.body // "")' \
+              --jq '.[] | select(.user.login != "github-actions[bot]" and .user.login != "github-actions") | "\n# comment by @\(.user.login)\n" + (.body // "")' \
               >> "$EXTRA_CONTEXT_FILE" || true
             gh api "repos/$REPO/pulls/$PR_NUMBER/comments?per_page=100" --paginate \
-              --jq '.[] | "\n# review comment by @\(.user.login) on \(.path):\(.line // .original_line // 0)\n" + (.body // "")' \
+              --jq '.[] | select(.user.login != "github-actions[bot]" and .user.login != "github-actions") | "\n# review comment by @\(.user.login) on \(.path):\(.line // .original_line // 0)\n" + (.body // "")' \
               >> "$EXTRA_CONTEXT_FILE" || true
           else
             echo "not a pull request; no discussion to collect."
