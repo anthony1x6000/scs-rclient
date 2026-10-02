@@ -677,6 +677,11 @@ fn test_live_copyparty_incremental_put_timestamp_differentiation() {
     assert!(!log_output.contains("Copied: doc_b.txt"), "Must not copy unchanged doc_b: {}", log_output);
     assert!(!log_output.contains("Copied: sub/doc_c.txt"), "Must not copy unchanged sub/doc_c: {}", log_output);
 
+    // Reset doc_a.txt mtime so it is no longer in the future for subsequent steps
+    let f = std::fs::File::options().write(true).open(&file_a).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(10))).unwrap();
+    drop(f);
+
     // 5. Modify doc_b.txt with DIFFERENT size
     fs::write(&file_b, "beta-content-extended-with-extra-text").unwrap();
 
