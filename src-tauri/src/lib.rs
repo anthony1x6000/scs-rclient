@@ -134,7 +134,7 @@ fn delete_credentials(username: String) -> Result<(), String> {
     }
 }
 
-mod webdav;
+pub mod webdav;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
