@@ -23,6 +23,9 @@ const ACTIONS: ActionDef[] = [
   { id: "lsd", label: "List Remote Folders", preview: true },
 ];
 
+const ACTION_BUTTON_CLASS =
+  "w-full bg-gray-800/25 border border-white/30 hover:border-white/70 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white";
+
 export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsProps) {
   const { runRclone, cancelCommand } = useRcloneExecution(onLog, isRunning, setIsRunning);
   const [syncArmed, setSyncArmed] = useState(false);
@@ -64,7 +67,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
               type="button"
               disabled={isRunning}
               onClick={() => runWithCompletion(action.id)}
-              className="w-full bg-gray-800/25 border border-white/30 hover:border-white/70 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+              className={ACTION_BUTTON_CLASS}
             >
               {action.label}
             </button>
@@ -76,7 +79,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
             disabled={isRunning}
             onClick={handleSyncClick}
             aria-live="polite"
-            className="w-full bg-gray-800/25 border border-white/30 hover:border-white/70 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+            className={ACTION_BUTTON_CLASS}
           >
             {syncArmed
               ? previewOk

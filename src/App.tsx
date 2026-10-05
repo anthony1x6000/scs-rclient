@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import Dropdown from "./components/Dropdown";
 import BackgroundWrapper from "./BackgroundWrapper";
 import BaseWebDAVURL from "./components/BaseWebDAVUrl";
@@ -50,14 +51,7 @@ function App() {
       : "scs-rclient";
 
     document.title = title;
-
-    import("@tauri-apps/api/window")
-      .then(({ getCurrentWindow }) => {
-        return getCurrentWindow().setTitle(title);
-      })
-      .catch((err) => {
-        console.warn("Could not set native window title:", err);
-      });
+    getCurrentWindow().setTitle(title).catch(() => {});
   }, [selectedSubdir]);
 
   const handleTargetSubdirChange = (newSub: string) => {
