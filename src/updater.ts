@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { check, type Update, type DownloadEvent } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 
 export function isTauri(): boolean {
@@ -81,13 +80,8 @@ export async function installUpdate(
   try {
     await relaunch();
   } catch (err) {
-    console.warn("relaunch via plugin-process failed, attempting native restart_app invoke:", err);
-    try {
-      await invoke("restart_app");
-    } catch (fallbackErr) {
-      console.error("Native restart_app also failed:", fallbackErr);
-      throw err;
-    }
+    console.error("Application relaunch failed after update installation:", err);
+    throw err;
   }
 }
 
@@ -147,6 +141,7 @@ export function useAppUpdater() {
         }
       }
     } catch (e: unknown) {
+      activeUpdateRef.current = null;
       console.warn("Error checking for updates from GitHub releases:", e);
       if (interactive) {
         const msg = e instanceof Error ? e.message : "Check failed";
@@ -160,24 +155,26 @@ export function useAppUpdater() {
 
   const install = useCallback(async () => {
     if (state.status !== "available") return;
-    const { update, info } = state;
+    const targetUpdate = state.update;
+    const targetInfo = state.info;
 
     setState({
       status: "downloading",
-      info,
+      info: targetInfo,
       progress: { downloaded: 0 },
     });
 
     try {
-      await installUpdate(update, (progress) => {
-        setState({
-          status: "downloading",
-          info,
-          progress,
-        });
+      await installUpdate(targetUpdate, (progress) => {
+        setState((prev) =>
+          prev.status === "downloading"
+            ? { status: "downloading", info: targetInfo, progress }
+            : prev
+        );
       });
       setState({ status: "restarting" });
     } catch (e: unknown) {
+      activeUpdateRef.current = null;
       console.error("Failed to install update:", e);
       const msg = e instanceof Error ? e.message : "Installation failed";
       setState({ status: "error", message: msg });

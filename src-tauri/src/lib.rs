@@ -241,11 +241,6 @@ fn clear_webdav_cache() -> Result<(), String> {
     webdav::clear_remote_cache()
 }
 
-#[tauri::command]
-fn restart_app(app: tauri::AppHandle) {
-    app.restart();
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -302,8 +297,7 @@ pub fn run() {
             verify_webdav,
             cancel_webdav_action,
             run_webdav_action,
-            clear_webdav_cache,
-            restart_app
+            clear_webdav_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

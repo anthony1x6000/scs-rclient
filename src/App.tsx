@@ -9,7 +9,7 @@ import SettingsView from "./components/SettingsView";
 import { RcloneActions } from "./components/RcloneActions";
 import RcloneConsole from "./components/RcloneConsole";
 import { getTargetSubdir } from "./settings";
-import { useAppUpdater } from "./updater";
+import { useAppUpdater, isTauri } from "./updater";
 
 function App() {
   const [mountDir, setMountDir] = useState<string>("");
@@ -34,8 +34,10 @@ function App() {
   };
 
   useEffect(() => {
-    // Check for application updates in the background on launch.
-    void updater.checkUpdates(false);
+    // Check for application updates in the background on launch in desktop runtime.
+    if (isTauri()) {
+      void updater.checkUpdates(false);
+    }
   }, []);
 
   useEffect(() => {
