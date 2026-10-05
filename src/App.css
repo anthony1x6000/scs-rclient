@@ -34,3 +34,24 @@ body {
     -webkit-mask-image: linear-gradient(to top, transparent, black 18px);
   }
 }
+
+button, input, textarea, select {
+  border-radius: 0 !important;
+}
+
+button, input, textarea, select {
+  transition: border-color 150ms ease-in-out, background-color 150ms ease-in-out, color 150ms ease-in-out;
+}
+
+@media (max-height: 480px) {
+  .hide-on-compact-height {
+    display: none !important;
+  }
+}
+
+@media (max-height: 380px) {
+  .hide-on-short-height {
+    display: none !important;
+  }
+}
+

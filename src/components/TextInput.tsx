@@ -1,20 +1,22 @@
 import { InputHTMLAttributes } from "react";
 
-interface TextInputProps extends InputHTMLAttributes<HTMLInputElement> {
+export type TextInputStatus = 'idle' | 'success' | 'error' | 'testing';
+
+export interface TextInputProps extends InputHTMLAttributes<HTMLInputElement> {
   lowercase?: boolean;
-  status?: 'success' | 'error' | 'testing' | 'idle';
+  status?: TextInputStatus;
 }
 
 function TextInput({ lowercase, status = 'idle', className = "", ...props }: TextInputProps) {
-  const baseClass = "ml-2 px-2 py-1 text-xs border bg-transparent text-white outline-none transition-all";
+  const baseClass = "px-2 py-1 text-xs border rounded-none bg-transparent text-white outline-none transition-all duration-150";
   
   let statusClass = "border-white/20 hover:border-white/40 focus:border-white/60";
   if (status === 'success') {
-    statusClass = "bg-emerald-950/80 border-emerald-500 text-emerald-200";
+    statusClass = "border-emerald-500 hover:border-emerald-400 focus:border-emerald-400 text-emerald-200";
   } else if (status === 'error') {
-    statusClass = "bg-red-950/80 border-red-500 text-red-200";
+    statusClass = "border-red-500 hover:border-red-400 focus:border-red-400 text-red-200";
   } else if (status === 'testing') {
-    statusClass = "bg-amber-950/40 border-amber-500/50 text-amber-200";
+    statusClass = "border-amber-500/50 hover:border-amber-400/50 focus:border-amber-400/50 text-amber-200";
   }
 
   const caseClass = lowercase ? "lowercase" : "";
