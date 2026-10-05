@@ -9,6 +9,7 @@ import SettingsView from "./components/SettingsView";
 import { RcloneActions } from "./components/RcloneActions";
 import RcloneConsole from "./components/RcloneConsole";
 import { getTargetSubdir } from "./settings";
+import { useAppUpdater } from "./updater";
 
 function App() {
   const [mountDir, setMountDir] = useState<string>("");
@@ -18,6 +19,7 @@ function App() {
   const [logs, setLogs] = useState<string>("");
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const mountSeq = useRef(0);
+  const updater = useAppUpdater();
 
   const updateMountDir = async (subdir?: string) => {
     const seq = ++mountSeq.current;
@@ -30,6 +32,11 @@ function App() {
       console.error("Failed to get mount dir:", e);
     }
   };
+
+  useEffect(() => {
+    // Check for application updates in the background on launch.
+    void updater.checkUpdates(false);
+  }, []);
 
   useEffect(() => {
     // Fetch target subdirectory from the single settings module.
@@ -95,6 +102,27 @@ function App() {
             <div className={showSettings ? "hidden" : "flex items-center gap-2 w-full"}>
               <CredentialsForm />
               <BaseWebDAVURL />
+              {updater.state.status === "available" && (
+                <button
+                  type="button"
+                  onClick={() => setShowSettings(true)}
+                  className="shrink-0 px-2.5 py-1 text-xs border border-emerald-500 text-emerald-200 bg-emerald-950/40 hover:border-emerald-400 outline-none cursor-pointer active:scale-95 transition-all duration-150 text-nowrap"
+                  title={`Update v${updater.state.info.version} available. Click to open Settings.`}
+                >
+                  Update: v{updater.state.info.version}
+                </button>
+              )}
+              {(updater.state.status === "downloading" ||
+                updater.state.status === "installing" ||
+                updater.state.status === "restarting") && (
+                <span className="shrink-0 px-2 py-1 text-xs border border-amber-400/60 text-amber-200 text-nowrap">
+                  {updater.state.status === "downloading"
+                    ? `Downloading update${updater.state.progress.percentage != null ? ` (${updater.state.progress.percentage}%)` : "…"}`
+                    : updater.state.status === "installing"
+                    ? "Installing…"
+                    : "Restarting…"}
+                </span>
+              )}
               <button
                 type="button"
                 onClick={() => setShowSettings(true)}
@@ -108,6 +136,7 @@ function App() {
                 onClose={() => setShowSettings(false)}
                 targetSubdir={targetSubdir}
                 onTargetSubdirChange={handleTargetSubdirChange}
+                updater={updater}
               />
             )}
           </div>

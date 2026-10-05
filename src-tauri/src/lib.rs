@@ -241,6 +241,11 @@ fn clear_webdav_cache() -> Result<(), String> {
     webdav::clear_remote_cache()
 }
 
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    app.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -255,6 +260,8 @@ pub fn run() {
     tauri::Builder::default()
         .manage(WebdavState { cancel_flag })
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Ensure ~/Documents/scs-rclient exists on startup
             if let Ok(docs_dir) = app.path().document_dir() {
@@ -295,7 +302,8 @@ pub fn run() {
             verify_webdav,
             cancel_webdav_action,
             run_webdav_action,
-            clear_webdav_cache
+            clear_webdav_cache,
+            restart_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

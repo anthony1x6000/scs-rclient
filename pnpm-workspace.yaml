@@ -20,3 +20,8 @@ minimumReleaseAgeExclude:
   - postcss@8.5.26
   - nanoid@3.3.18
   - browserslist@4.28.8
+  - '@tauri-apps/api@2.12.1'
+  - '@tauri-apps/cli@2.12.1'
+  - '@tauri-apps/plugin-updater@2.13.0'
+  - '@tauri-apps/plugin-process@2.4.0'
+

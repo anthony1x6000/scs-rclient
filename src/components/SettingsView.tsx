@@ -10,11 +10,18 @@ import {
   MAX_SCAN_CONCURRENCY,
 } from "../settings";
 import TextInput from "./TextInput";
+import type { UpdateState } from "../updater";
 
 interface SettingsViewProps {
   onClose: () => void;
   targetSubdir: string;
   onTargetSubdirChange: (subdir: string) => void;
+  updater: {
+    state: UpdateState;
+    currentVersion: string;
+    checkUpdates: (interactive?: boolean) => Promise<void>;
+    install: () => Promise<void>;
+  };
 }
 
 function getCacheButtonClass(status: 'idle' | 'clearing' | 'cleared' | 'error'): string {
@@ -44,7 +51,49 @@ function getCacheButtonLabel(status: 'idle' | 'clearing' | 'cleared' | 'error'):
   }
 }
 
-function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsViewProps) {
+function getUpdateButtonClass(state: UpdateState): string {
+  const base = "shrink-0 px-2.5 py-1 text-xs border bg-transparent outline-none cursor-pointer active:scale-95 transition-all duration-150 text-nowrap";
+  switch (state.status) {
+    case 'uptodate':
+      return `${base} border-emerald-500 text-emerald-200`;
+    case 'available':
+      return `${base} border-emerald-500 text-emerald-200 bg-emerald-950/40 hover:border-emerald-400`;
+    case 'error':
+      return `${base} border-red-500 text-red-300`;
+    case 'checking':
+    case 'downloading':
+    case 'installing':
+    case 'restarting':
+      return `${base} border-amber-400/60 text-amber-200`;
+    default:
+      return `${base} border-white/20 hover:border-white/50 focus:border-white/60 text-gray-300`;
+  }
+}
+
+function getUpdateButtonLabel(state: UpdateState, currentVersion: string): string {
+  switch (state.status) {
+    case 'checking':
+      return 'Checking…';
+    case 'uptodate':
+      return `Up to date (v${state.version || currentVersion})`;
+    case 'available':
+      return `Install v${state.info.version}`;
+    case 'downloading':
+      return state.progress.percentage != null
+        ? `Downloading ${state.progress.percentage}%…`
+        : 'Downloading…';
+    case 'installing':
+      return 'Installing…';
+    case 'restarting':
+      return 'Restarting…';
+    case 'error':
+      return 'Check failed';
+    default:
+      return 'Check for Updates';
+  }
+}
+
+function SettingsView({ onClose, targetSubdir, onTargetSubdirChange, updater }: SettingsViewProps) {
   const [draft, setDraft] = useState<string>(targetSubdir);
   const [concurrencyDraft, setConcurrencyDraft] = useState<string>(String(DEFAULT_SCAN_CONCURRENCY));
   const [subdirStatus, setSubdirStatus] = useState<'idle' | 'success' | 'error'>('idle');
@@ -149,6 +198,12 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
     void persistConcurrency(finalVal);
   };
 
+  const isUpdateBusy =
+    updater.state.status === 'checking' ||
+    updater.state.status === 'downloading' ||
+    updater.state.status === 'installing' ||
+    updater.state.status === 'restarting';
+
   return (
     <div role="dialog" aria-label="Settings" className="flex items-center gap-3 w-full">
       <div className="flex-1 min-w-0">
@@ -188,6 +243,27 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
         title="Clear cached remote WebDAV file listings"
       >
         {getCacheButtonLabel(cacheStatus)}
+      </button>
+      <button
+        type="button"
+        disabled={isUpdateBusy}
+        onClick={() => {
+          if (updater.state.status === 'available') {
+            void updater.install();
+          } else {
+            void updater.checkUpdates(true);
+          }
+        }}
+        className={getUpdateButtonClass(updater.state)}
+        title={
+          updater.state.status === 'available'
+            ? `Release notes for v${updater.state.info.version}:\n${updater.state.info.body || 'No release notes.'}`
+            : updater.state.status === 'error'
+            ? `Error: ${updater.state.message}`
+            : 'Check for updates from GitHub releases'
+        }
+      >
+        {getUpdateButtonLabel(updater.state, updater.currentVersion)}
       </button>
       <button
         type="button"

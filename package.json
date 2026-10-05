@@ -13,9 +13,11 @@
     "test": "bash scripts/test/test-repo-install.sh"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "^2.12.1",
+    "@tauri-apps/plugin-process": "^2.4.0",
     "@tauri-apps/plugin-shell": "^2",
     "@tauri-apps/plugin-store": "^2",
+    "@tauri-apps/plugin-updater": "^2.13.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
