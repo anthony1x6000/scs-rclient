@@ -56,10 +56,10 @@ echo "=== Launching Copyparty backend server on port $UPSTREAM_PORT ==="
 if command -v docker >/dev/null 2>&1; then
   echo "Starting Copyparty via Docker container (copyparty/ac:latest)..."
   CONTAINER_NAME="copyparty-e2e-$$-${RANDOM}"
-  chmod -R 777 "$TMP_DIR"
   if docker run -d \
     --name "$CONTAINER_NAME" \
-    --network host \
+    -p "$UPSTREAM_PORT:$UPSTREAM_PORT" \
+    --user "$(id -u):$(id -g)" \
     -v "$TMP_DIR:$TMP_DIR" \
     copyparty/ac:latest -c "$CONF_FILE" -ed > /tmp/copyparty-docker.log 2>&1; then
     echo "Started Docker container $CONTAINER_NAME"

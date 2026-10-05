@@ -1524,7 +1524,9 @@ pub fn should_upload_file(
 /// Returns true if:
 /// - File does not exist locally.
 /// - File sizes differ.
-/// - File sizes match, but remote file was modified after the local file (with a 1-second margin for rounding).
+/// - File sizes match, but remote file was modified after the local file (with a 1-second margin for rounding/skew).
+///
+/// The 1-second margin accommodates HTTP-date 1-second resolution per RFC 7231 and minor client/server clock skew.
 pub fn should_download_file(
     remote_size: u64,
     remote_mtime: Option<u64>,
@@ -1537,7 +1539,7 @@ pub fn should_download_file(
     match (remote_mtime, local_mtime) {
         (Some(r_time), Some(l_time)) => {
             // Remote file is considered newer if its mtime is strictly greater than
-            // local mtime + 1s (to avoid false positives due to HTTP-date 1-second rounding).
+            // local mtime + 1s (to avoid false positives due to HTTP-date 1-second rounding or clock skew).
             r_time > l_time + 1
         }
         // If timestamps are not both available, but sizes match, consider it up-to-date
@@ -1860,7 +1862,10 @@ where
             ));
 
             if total_files == 0 {
-                log("All files are already up to date on local.\n\nGet operation finished: 0 file(s) downloaded, all files up to date.\n");
+                log(&format!(
+                    "All files are already up to date on local.\n\nGet operation finished: 0 file(s) downloaded, {} file(s) skipped (already up to date).\n",
+                    skipped_count
+                ));
                 return Ok(());
             }
 
@@ -1882,7 +1887,7 @@ where
                 }
                 if is_dry {
                     log(&format!(
-                        "[{}/{}] NOTICE: {}: Would copy (new or modified, {} bytes)\n",
+                        "[{}/{}] NOTICE: {}: Would download (new or modified, {} bytes)\n",
                         current_num, total_files, rel, item.size
                     ));
                     continue;

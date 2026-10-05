@@ -773,6 +773,16 @@ fn test_live_copyparty_incremental_get_timestamp_differentiation() {
             .unwrap()
             .as_nanos()
     ));
+
+    struct CleanupGuard<'a>(&'a rustydav::client::Client, String, std::path::PathBuf);
+    impl<'a> Drop for CleanupGuard<'a> {
+        fn drop(&mut self) {
+            let _ = self.0.delete(&self.1);
+            let _ = fs::remove_dir_all(&self.2);
+        }
+    }
+    let _guard = CleanupGuard(&client, base_url.clone(), tmp_test_dir.clone());
+
     let local_seed_dir = tmp_test_dir.join("seed");
     let local_get_dir = tmp_test_dir.join("download");
     fs::create_dir_all(&local_seed_dir).unwrap();
