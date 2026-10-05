@@ -257,7 +257,7 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange, updater }: 
         className={getUpdateButtonClass(updater.state)}
         title={
           updater.state.status === 'available'
-            ? `Release notes for v${updater.state.info.version}:\n${updater.state.info.body || 'No release notes.'}`
+            ? `Release notes for v${updater.state.info.version}:\n${(updater.state.info.body || 'No release notes.').replace(/<[^>]*>/g, '').trim().slice(0, 300)}`
             : updater.state.status === 'error'
             ? `Error: ${updater.state.message}`
             : 'Check for updates from GitHub releases'

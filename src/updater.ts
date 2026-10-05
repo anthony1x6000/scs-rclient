@@ -61,12 +61,13 @@ export async function checkForUpdates(): Promise<Update | null> {
  */
 export async function installUpdate(
   update: Update,
-  onProgress?: (progress: UpdateProgress) => void
+  onProgress?: (progress: UpdateProgress) => void,
+  timeoutMs = 600000 // 10 minutes timeout
 ): Promise<void> {
   let downloaded = 0;
   let total: number | undefined;
 
-  await update.downloadAndInstall((event: DownloadEvent) => {
+  const downloadPromise = update.downloadAndInstall((event: DownloadEvent) => {
     if (event.event === "Started") {
       total = event.data.contentLength;
       onProgress?.({ downloaded, total, percentage: total ? 0 : undefined });
@@ -78,6 +79,12 @@ export async function installUpdate(
       onProgress?.({ downloaded, total, percentage: 100 });
     }
   });
+
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("Update download timed out. Check your connection and try again.")), timeoutMs)
+  );
+
+  await Promise.race([downloadPromise, timeoutPromise]);
 
   try {
     await relaunch();
@@ -146,14 +153,24 @@ export function useAppUpdater() {
       activeUpdateRef.current = null;
       console.warn("Error checking for updates from GitHub releases:", e);
       if (interactive) {
-        const msg = e instanceof Error ? e.message : "Check failed";
+        let msg = "Failed to check for updates";
+        if (e instanceof Error) {
+          const raw = e.message.toLowerCase();
+          if (raw.includes("network") || raw.includes("fetch") || raw.includes("connection") || raw.includes("dns")) {
+            msg = "Network error checking for updates";
+          } else if (raw.includes("timeout")) {
+            msg = "Update check timed out";
+          } else if (raw.includes("signature") || raw.includes("key")) {
+            msg = "Update signature verification failed";
+          }
+        }
         setState({ status: "error", message: msg });
         scheduleReset(3000);
       } else {
         setState({ status: "idle" });
       }
     }
-  }, []);
+  }, [currentVersion]);
 
   const install = useCallback(async () => {
     if (state.status !== "available") return;
@@ -178,7 +195,17 @@ export function useAppUpdater() {
     } catch (e: unknown) {
       activeUpdateRef.current = null;
       console.error("Failed to install update:", e);
-      const msg = e instanceof Error ? e.message : "Installation failed";
+      let msg = "Update installation failed";
+      if (e instanceof Error) {
+        const raw = e.message.toLowerCase();
+        if (raw.includes("timeout")) {
+          msg = "Download timed out";
+        } else if (raw.includes("signature") || raw.includes("verify")) {
+          msg = "Signature verification failed";
+        } else if (raw.includes("network") || raw.includes("connection")) {
+          msg = "Network connection lost during download";
+        }
+      }
       setState({ status: "error", message: msg });
       scheduleReset(4000);
     }
