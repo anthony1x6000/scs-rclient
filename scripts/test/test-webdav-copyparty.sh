@@ -90,6 +90,7 @@ if [[ "$READY" -ne 1 ]]; then
   if [[ -n "${CONTAINER_NAME:-}" ]]; then
     docker logs "$CONTAINER_NAME" || true
   fi
+  tail -n 50 /tmp/copyparty-docker.log 2>/dev/null || true
   tail -n 50 /tmp/copyparty-test.log 2>/dev/null || true
   exit 1
 fi
