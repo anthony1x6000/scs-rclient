@@ -35,7 +35,7 @@ body {
   }
 }
 
-*, *::before, *::after {
+button, input, textarea, select, div, span, ul, li, a {
   border-radius: 0 !important;
 }
 

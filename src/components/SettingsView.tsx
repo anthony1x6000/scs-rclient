@@ -20,8 +20,9 @@ interface SettingsViewProps {
 function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsViewProps) {
   const [draft, setDraft] = useState<string>(targetSubdir);
   const [concurrencyDraft, setConcurrencyDraft] = useState<string>(String(DEFAULT_SCAN_CONCURRENCY));
-  const [subdirSaved, setSubdirSaved] = useState<boolean>(false);
-  const [concurrencySaved, setConcurrencySaved] = useState<boolean>(false);
+  const [subdirStatus, setSubdirStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [concurrencyStatus, setConcurrencyStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [cacheStatus, setCacheStatus] = useState<'idle' | 'clearing' | 'cleared' | 'error'>('idle');
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const concurrencyDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onChangeRef = useRef(onTargetSubdirChange);
@@ -41,7 +42,7 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
   // Sync from parent only when the parent value changes externally.
   useEffect(() => {
     setDraft(targetSubdir);
-    setSubdirSaved(false);
+    setSubdirStatus('idle');
   }, [targetSubdir]);
 
   useEffect(() => {
@@ -63,41 +64,46 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
     try {
       await setTargetSubdir(newVal);
       onChangeRef.current(newVal);
-      setSubdirSaved(true);
+      setSubdirStatus('success');
     } catch (e) {
       console.error("Failed to save target subdirectory setting:", e);
-      setSubdirSaved(false);
+      setSubdirStatus('error');
     }
   };
 
   const persistConcurrency = async (threads: number) => {
     try {
       await setScanConcurrency(threads);
-      setConcurrencySaved(true);
+      setConcurrencyStatus('success');
     } catch (e) {
       console.error("Failed to save scan concurrency setting:", e);
-      setConcurrencySaved(false);
+      setConcurrencyStatus('error');
     }
   };
 
   const handleClearCache = async () => {
+    setCacheStatus('clearing');
     try {
       await clearWebDAVCache();
+      setCacheStatus('cleared');
+      setTimeout(() => setCacheStatus('idle'), 2000);
     } catch (e) {
       console.error("Failed to clear WebDAV cache:", e);
+      setCacheStatus('error');
+      setTimeout(() => setCacheStatus('idle'), 3000);
     }
   };
 
   const handleChange = (newVal: string) => {
     setDraft(newVal);
-    setSubdirSaved(false);
+    setSubdirStatus('idle');
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => void persist(newVal.trim()), 400);
   };
 
   const handleConcurrencyChange = (raw: string) => {
     setConcurrencyDraft(raw);
-    setConcurrencySaved(false);
+    setConcurrencyStatus('idle');
     const clamped = parseAndClampScanConcurrency(raw);
     if (clamped !== null) {
       if (concurrencyDebounceRef.current) clearTimeout(concurrencyDebounceRef.current);
@@ -126,7 +132,7 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
           value={draft}
           onChange={(e) => handleChange(e.target.value)}
           placeholder="Mount root subdirectory..."
-          status={subdirSaved ? "success" : "idle"}
+          status={subdirStatus}
           className="w-full"
         />
       </div>
@@ -143,17 +149,32 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
           onChange={(e) => handleConcurrencyChange(e.target.value)}
           onBlur={handleConcurrencyBlur}
           title="Number of concurrent scanning threads (1–64)"
-          status={concurrencySaved ? "success" : "idle"}
+          status={concurrencyStatus}
           className="w-14 text-center [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
         />
       </div>
       <button
         type="button"
+        disabled={cacheStatus === 'clearing'}
         onClick={handleClearCache}
-        className="shrink-0 px-2.5 py-1 text-xs border border-white/20 hover:border-amber-400/60 hover:text-amber-200 focus:border-amber-400/60 bg-transparent text-gray-300 outline-none cursor-pointer active:scale-95 transition-all duration-150 text-nowrap"
+        className={`shrink-0 px-2.5 py-1 text-xs border bg-transparent outline-none cursor-pointer active:scale-95 transition-all duration-150 text-nowrap ${
+          cacheStatus === 'cleared'
+            ? 'border-emerald-500 text-emerald-200'
+            : cacheStatus === 'error'
+              ? 'border-red-500 text-red-300'
+              : cacheStatus === 'clearing'
+                ? 'border-amber-400/60 text-amber-200'
+                : 'border-white/20 hover:border-amber-400/60 hover:text-amber-200 focus:border-amber-400/60 text-gray-300'
+        }`}
         title="Clear cached remote WebDAV file listings"
       >
-        Clear Cache
+        {cacheStatus === 'clearing'
+          ? 'Clearing…'
+          : cacheStatus === 'cleared'
+            ? 'Cache cleared'
+            : cacheStatus === 'error'
+              ? 'Clear failed'
+              : 'Clear Cache'}
       </button>
       <button
         type="button"
