@@ -35,12 +35,12 @@ body {
   }
 }
 
-button, input, textarea, select, div, span, ul, li, a {
+button, input, textarea, select {
   border-radius: 0 !important;
 }
 
-button, input, textarea, a {
-  transition: all 150ms ease-in-out;
+button, input, textarea, select {
+  transition: border-color 150ms ease-in-out, background-color 150ms ease-in-out, color 150ms ease-in-out;
 }
 
 @media (max-height: 480px) {

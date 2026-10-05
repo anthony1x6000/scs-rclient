@@ -1,8 +1,10 @@
 import { InputHTMLAttributes } from "react";
 
-interface TextInputProps extends InputHTMLAttributes<HTMLInputElement> {
+export type TextInputStatus = 'idle' | 'success' | 'error' | 'testing';
+
+export interface TextInputProps extends InputHTMLAttributes<HTMLInputElement> {
   lowercase?: boolean;
-  status?: 'success' | 'error' | 'testing' | 'idle';
+  status?: TextInputStatus;
 }
 
 function TextInput({ lowercase, status = 'idle', className = "", ...props }: TextInputProps) {

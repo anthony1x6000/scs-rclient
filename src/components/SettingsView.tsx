@@ -17,6 +17,33 @@ interface SettingsViewProps {
   onTargetSubdirChange: (subdir: string) => void;
 }
 
+function getCacheButtonClass(status: 'idle' | 'clearing' | 'cleared' | 'error'): string {
+  const base = "shrink-0 px-2.5 py-1 text-xs border bg-transparent outline-none cursor-pointer active:scale-95 transition-all duration-150 text-nowrap";
+  switch (status) {
+    case 'cleared':
+      return `${base} border-emerald-500 text-emerald-200`;
+    case 'error':
+      return `${base} border-red-500 text-red-300`;
+    case 'clearing':
+      return `${base} border-amber-400/60 text-amber-200`;
+    default:
+      return `${base} border-white/20 hover:border-amber-400/60 hover:text-amber-200 focus:border-amber-400/60 text-gray-300`;
+  }
+}
+
+function getCacheButtonLabel(status: 'idle' | 'clearing' | 'cleared' | 'error'): string {
+  switch (status) {
+    case 'clearing':
+      return 'Clearing…';
+    case 'cleared':
+      return 'Cache cleared';
+    case 'error':
+      return 'Clear failed';
+    default:
+      return 'Clear Cache';
+  }
+}
+
 function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsViewProps) {
   const [draft, setDraft] = useState<string>(targetSubdir);
   const [concurrencyDraft, setConcurrencyDraft] = useState<string>(String(DEFAULT_SCAN_CONCURRENCY));
@@ -157,24 +184,10 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
         type="button"
         disabled={cacheStatus === 'clearing'}
         onClick={handleClearCache}
-        className={`shrink-0 px-2.5 py-1 text-xs border bg-transparent outline-none cursor-pointer active:scale-95 transition-all duration-150 text-nowrap ${
-          cacheStatus === 'cleared'
-            ? 'border-emerald-500 text-emerald-200'
-            : cacheStatus === 'error'
-              ? 'border-red-500 text-red-300'
-              : cacheStatus === 'clearing'
-                ? 'border-amber-400/60 text-amber-200'
-                : 'border-white/20 hover:border-amber-400/60 hover:text-amber-200 focus:border-amber-400/60 text-gray-300'
-        }`}
+        className={getCacheButtonClass(cacheStatus)}
         title="Clear cached remote WebDAV file listings"
       >
-        {cacheStatus === 'clearing'
-          ? 'Clearing…'
-          : cacheStatus === 'cleared'
-            ? 'Cache cleared'
-            : cacheStatus === 'error'
-              ? 'Clear failed'
-              : 'Clear Cache'}
+        {getCacheButtonLabel(cacheStatus)}
       </button>
       <button
         type="button"
