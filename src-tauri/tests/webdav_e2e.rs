@@ -1,7 +1,7 @@
 use scs_rclient_lib::webdav::{
     build_file_url, collect_local_files, compute_sha256, execute_webdav_action,
     list_remote_recursive, parse_propfind_xml, parse_webdav_date, relative_item_path,
-    resolve_item_url, should_upload_file, verify_webdav_auth,
+    resolve_item_url, should_download_file, should_upload_file, verify_webdav_auth,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -28,6 +28,29 @@ fn test_incremental_upload_decision_matrix() {
     assert!(should_upload_file(500, Some(local_newer), 500, Some(remote_date)));
     assert!(!should_upload_file(500, Some(local_older), 500, Some(remote_date)));
     assert!(!should_upload_file(500, Some(remote_date), 500, Some(remote_date)));
+}
+
+#[test]
+fn test_incremental_download_decision_matrix() {
+    // 1. Different sizes -> must always download
+    assert!(should_download_file(200, Some(1000), 100, Some(1000)));
+    assert!(should_download_file(200, None, 100, None));
+
+    // 2. Same size, remote file newer than local + 1s -> must download
+    assert!(should_download_file(100, Some(1005), 100, Some(1000)));
+
+    // 3. Same size, remote file older or within 1s margin -> skip (already up-to-date)
+    assert!(!should_download_file(100, Some(1000), 100, Some(1000)));
+    assert!(!should_download_file(100, Some(1001), 100, Some(1000)));
+    assert!(!should_download_file(100, Some(990), 100, Some(1000)));
+
+    // 4. Date parsing integration
+    let remote_date = parse_webdav_date("Mon, 28 Sep 2026 13:45:09 GMT").unwrap();
+    let local_newer = remote_date + 60;
+    let local_older = remote_date - 60;
+    assert!(should_download_file(500, Some(remote_date), 500, Some(local_older)));
+    assert!(!should_download_file(500, Some(remote_date), 500, Some(local_newer)));
+    assert!(!should_download_file(500, Some(remote_date), 500, Some(remote_date)));
 }
 
 #[test]
@@ -716,6 +739,172 @@ fn test_live_copyparty_incremental_put_timestamp_differentiation() {
     assert!(log_output.contains("1 file(s) to upload"), "Must report 1 to upload: {}", log_output);
     assert!(log_output.contains("3 file(s) up to date"), "Must report 3 up to date: {}", log_output);
     assert!(log_output.contains("Copied: doc_d.txt"), "Must copy brand new doc_d: {}", log_output);
+
+    // Cleanup remote test directory & local files
+    let _ = client.delete(&base_url);
+    let _ = fs::remove_dir_all(&tmp_test_dir);
+}
+
+#[test]
+fn test_live_copyparty_incremental_get_timestamp_differentiation() {
+    let base_url = match std::env::var("TEST_WEBDAV_URL") {
+        Ok(url) => format!("{}/incremental_get_test/", url.trim_end_matches('/')),
+        Err(_) => {
+            eprintln!("TEST_WEBDAV_URL not set, skipping live incremental get test");
+            return;
+        }
+    };
+    let user = std::env::var("TEST_WEBDAV_USER").unwrap_or_else(|_| "testuser".into());
+    let pass = std::env::var("TEST_WEBDAV_PASS").unwrap_or_else(|_| "testpass".into());
+
+    let client = rustydav::client::Client::init(&user, &pass);
+    let cancel_flag = AtomicBool::new(false);
+    let mut log_output = String::new();
+
+    // Ensure remote test collection starts clean
+    let _ = client.delete(&base_url);
+    let _ = client.mkcol(&base_url);
+
+    let tmp_test_dir = std::env::temp_dir().join(format!(
+        "scs_inc_get_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let local_seed_dir = tmp_test_dir.join("seed");
+    let local_get_dir = tmp_test_dir.join("download");
+    fs::create_dir_all(&local_seed_dir).unwrap();
+    fs::create_dir_all(&local_get_dir).unwrap();
+
+    let file_a = local_seed_dir.join("file_a.txt");
+    let file_b = local_seed_dir.join("file_b.txt");
+    let file_c = local_seed_dir.join("sub").join("file_c.txt");
+    fs::create_dir_all(file_c.parent().unwrap()).unwrap();
+
+    fs::write(&file_a, "remote-alpha-data").unwrap();
+    fs::write(&file_b, "remote-beta-data").unwrap();
+    fs::write(&file_c, "remote-gamma-data").unwrap();
+
+    // Populate remote collection using PUT from seed directory
+    let put_res = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_seed_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(put_res.is_ok(), "Seed PUT failed: {:?}", put_res);
+
+    // 1. Initial GET into empty local_get_dir: all 3 files must be downloaded
+    log_output.clear();
+    let res1 = execute_webdav_action(
+        &client,
+        "get",
+        &base_url,
+        &local_get_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(res1.is_ok(), "Initial GET failed: {:?}", res1);
+    assert!(log_output.contains("Downloaded: file_a.txt"), "Must download file_a: {}", log_output);
+    assert!(log_output.contains("Downloaded: file_b.txt"), "Must download file_b: {}", log_output);
+    assert!(log_output.contains("Downloaded: sub/file_c.txt"), "Must download sub/file_c: {}", log_output);
+    assert!(log_output.contains("3 file(s) to download"), "Must report 3 to download: {}", log_output);
+    assert!(log_output.contains("0 file(s) up to date"), "Must report 0 up to date initially: {}", log_output);
+
+    // Verify downloaded files exist on disk
+    assert!(local_get_dir.join("file_a.txt").exists());
+    assert!(local_get_dir.join("file_b.txt").exists());
+    assert!(local_get_dir.join("sub").join("file_c.txt").exists());
+
+    // 2. Immediate Second GET: files exist and match remote -> all 3 files must be skipped as up to date!
+    log_output.clear();
+    let res2 = execute_webdav_action(
+        &client,
+        "get",
+        &base_url,
+        &local_get_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(res2.is_ok(), "Second GET failed: {:?}", res2);
+    assert!(log_output.contains("3 file(s) up to date"), "Must report 3 up to date: {}", log_output);
+    assert!(log_output.contains("0 file(s) to download"), "Must report 0 to download: {}", log_output);
+    assert!(!log_output.contains("Downloaded: file_a.txt"), "Must not redownload file_a: {}", log_output);
+
+    // 3. Dry-run GET (get-dry): verify dry-run logs skip notices for up to date files
+    log_output.clear();
+    let dry_res = execute_webdav_action(
+        &client,
+        "get-dry",
+        &base_url,
+        &local_get_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(dry_res.is_ok(), "Dry-run GET failed: {:?}", dry_res);
+    assert!(log_output.contains("3 file(s) up to date"), "Dry run must detect 3 up to date: {}", log_output);
+
+    // 4. Modify remote file_b.txt with DIFFERENT size and upload to remote
+    fs::write(&file_b, "remote-beta-data-extended-content-size-change").unwrap();
+    let put_mod = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_seed_dir,
+        &cancel_flag,
+        |_| {},
+    );
+    assert!(put_mod.is_ok(), "PUT modified seed failed: {:?}", put_mod);
+
+    log_output.clear();
+    let res3 = execute_webdav_action(
+        &client,
+        "get",
+        &base_url,
+        &local_get_dir,
+        &cancel_flag,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(res3.is_ok(), "GET with size change failed: {:?}", res3);
+    assert!(log_output.contains("1 file(s) to download"), "Must report 1 to download: {}", log_output);
+    assert!(log_output.contains("2 file(s) up to date"), "Must report 2 up to date: {}", log_output);
+    assert!(log_output.contains("Downloaded: file_b.txt"), "Must download modified file_b: {}", log_output);
+    assert!(!log_output.contains("Downloaded: file_a.txt"), "Must not download unchanged file_a: {}", log_output);
+    assert!(!log_output.contains("Downloaded: sub/file_c.txt"), "Must not download unchanged sub/file_c: {}", log_output);
+
+    // 5. Add brand new file file_d.txt to remote
+    let file_d = local_seed_dir.join("file_d.txt");
+    fs::write(&file_d, "brand-new-remote-file-d").unwrap();
+    let put_new = execute_webdav_action(
+        &client,
+        "put",
+        &base_url,
+        &local_seed_dir,
+        &cancel_flag,
+        |_| {},
+    );
+    assert!(put_new.is_ok(), "PUT new seed failed: {:?}", put_new);
+
+    // Test GET with parallel scan concurrency
+    log_output.clear();
+    let res4 = scs_rclient_lib::webdav::execute_webdav_action_with_options(
+        &client,
+        "get",
+        &base_url,
+        &local_get_dir,
+        &cancel_flag,
+        Some(4),
+        Some(&user),
+        |msg| log_output.push_str(msg),
+    );
+    assert!(res4.is_ok(), "GET with concurrency option failed: {:?}", res4);
+    assert!(log_output.contains("1 file(s) to download"), "Must report 1 to download: {}", log_output);
+    assert!(log_output.contains("3 file(s) up to date"), "Must report 3 up to date: {}", log_output);
+    assert!(log_output.contains("Downloaded: file_d.txt"), "Must download brand new file_d: {}", log_output);
 
     // Cleanup remote test directory & local files
     let _ = client.delete(&base_url);
