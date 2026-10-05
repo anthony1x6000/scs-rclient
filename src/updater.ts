@@ -4,7 +4,9 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
 
 export function isTauri(): boolean {
-  return typeof window !== "undefined" && Boolean((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+  if (typeof window === "undefined") return false;
+  const win = window as unknown as { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown };
+  return Boolean(win.__TAURI_INTERNALS__ || win.__TAURI__);
 }
 
 export interface UpdateInfo {
@@ -133,7 +135,7 @@ export function useAppUpdater() {
       } else {
         activeUpdateRef.current = null;
         if (interactive) {
-          const ver = await getAppVersion();
+          const ver = currentVersion || (await getAppVersion());
           setState({ status: "uptodate", version: ver });
           scheduleReset(3000);
         } else {

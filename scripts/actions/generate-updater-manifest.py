@@ -32,9 +32,7 @@ def is_valid_signature(sig_content: str) -> bool:
     if not sig_content or len(sig_content) < 32:
         return False
     lines = [line.strip() for line in sig_content.splitlines() if line.strip()]
-    return len(lines) >= 2 and any(
-        "untrusted comment:" in line.lower() or "signature" in line.lower() for line in lines
-    )
+    return len(lines) >= 2 and lines[0].lower().startswith("untrusted comment:")
 
 
 def read_and_validate_sig(sig_path: str) -> str | None:
@@ -66,12 +64,14 @@ def sign_file_if_needed(file_path: str, private_key: str, password: str = "") ->
     try:
         env = os.environ.copy()
         env["TAURI_SIGNING_PRIVATE_KEY"] = private_key
+        cmd = ["pnpm", "tauri", "signer", "sign"]
         if password:
             env["TAURI_SIGNING_PRIVATE_KEY_PASSWORD"] = password
         else:
             env.pop("TAURI_SIGNING_PRIVATE_KEY_PASSWORD", None)
+            cmd.extend(["-p", ""])
 
-        cmd = ["pnpm", "tauri", "signer", "sign", "-p", "", file_path]
+        cmd.append(file_path)
         subprocess.run(cmd, env=env, capture_output=True, text=True, check=True)
         if os.path.exists(sig_path):
             return read_and_validate_sig(sig_path)
