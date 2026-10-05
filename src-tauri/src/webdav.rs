@@ -1526,7 +1526,8 @@ pub fn should_upload_file(
 /// - File sizes differ.
 /// - File sizes match, but remote file was modified after the local file (with a 1-second margin for rounding/skew).
 ///
-/// The 1-second margin accommodates HTTP-date 1-second resolution per RFC 7231 and minor client/server clock skew.
+/// The 1-second margin accommodates RFC 7231 Section 7.1.1.1 HTTP-date 1-second timestamp resolution
+/// and slight client/server clock skew between WebDAV hosts.
 pub fn should_download_file(
     remote_size: u64,
     remote_mtime: Option<u64>,
