@@ -43,6 +43,23 @@ function App() {
       });
   }, []);
 
+  useEffect(() => {
+    const trimmed = selectedSubdir.trim();
+    const title = trimmed
+      ? `scs-rclient: ${trimmed.endsWith("/") ? trimmed : `${trimmed}/`}`
+      : "scs-rclient";
+
+    document.title = title;
+
+    import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) => {
+        return getCurrentWindow().setTitle(title);
+      })
+      .catch((err) => {
+        console.warn("Could not set native window title:", err);
+      });
+  }, [selectedSubdir]);
+
   const handleTargetSubdirChange = (newSub: string) => {
     setTargetSubdir(newSub);
     void updateMountDir(newSub);
@@ -50,55 +67,56 @@ function App() {
 
   return (
     <BackgroundWrapper>
-      <div className="flex flex-col h-screen pb-44 box-border overflow-hidden">
-        <div className="px-2 text-xs text-gray-400" aria-label="Sync subdirectory">
-          Sync item: {selectedSubdir || "none selected"}
+      <div className="flex flex-col h-screen w-full box-border overflow-hidden p-2 justify-between">
+        <div className="shrink-0">
+          <RcloneActions
+            onLog={setLogs}
+            isRunning={isRunning}
+            setIsRunning={setIsRunning}
+          />
         </div>
-        <RcloneActions
-          onLog={setLogs}
-          isRunning={isRunning}
-          setIsRunning={setIsRunning}
-        />
 
-        <RcloneConsole logs={logs} onClear={() => setLogs("")} />
-      </div>
-
-      <div className="bottom-0 absolute p-2 w-[100%] text-white flex flex-col gap-4 overflow-hidden">
-        <div className="p-2 font-['Roboto'] font-light">
-          <div className="flex items-baseline justify-between gap-4 w-full min-w-0">
-            <Dropdown onSelect={setSelectedSubdir} />
-            <div
-              className="italic truncate shrink-[9999] min-w-0 ml-auto"
-              title="a subdirectory of your WebDAV drive"
-            >
-              a subdirectory of your WebDAV drive
-            </div>
-          </div>
-          {mountDir && (
-            <div className="text-[10px] text-gray-400 font-mono mt-1 opacity-70">
-              mount directory: {mountDir}
-            </div>
-          )}
+        <div className="flex-1 min-h-0 flex flex-col overflow-hidden my-1 hide-on-compact-height">
+          <RcloneConsole logs={logs} onClear={() => setLogs("")} />
         </div>
-        <div className="flex items-center gap-1 w-full">
-          <div className={showSettings ? "hidden" : "flex items-center gap-1 w-full"}>
-            <CredentialsForm />
-            <BaseWebDAVURL />
-            <button
-              type="button"
-              onClick={() => setShowSettings(true)}
-              className="ml-2 px-3 py-1 text-xs border border-white/20 hover:border-white/40 focus:border-white/60 bg-transparent text-white outline-none cursor-pointer hover:bg-white/5 active:scale-95 transition-all text-nowrap"
-            >
-              Settings
-            </button>
+
+        <div className="shrink-0 text-white flex flex-col gap-2 w-full">
+          <div className="directory-pane px-2 font-light hide-on-short-height">
+            <div className="flex items-baseline justify-between gap-4 w-full min-w-0">
+              <Dropdown onSelect={setSelectedSubdir} />
+              <div
+                className="italic truncate shrink-[9999] min-w-0 ml-auto"
+                title="a subdirectory of your WebDAV drive"
+              >
+                a subdirectory of your WebDAV drive
+              </div>
+            </div>
+            {mountDir && (
+              <div className="text-[10px] text-gray-400 mt-1 opacity-70">
+                Mount directory: {mountDir}
+              </div>
+            )}
           </div>
-          {showSettings && (
-            <SettingsView
-              onClose={() => setShowSettings(false)}
-              targetSubdir={targetSubdir}
-              onTargetSubdirChange={handleTargetSubdirChange}
-            />
-          )}
+          <div className="settings-pane flex items-center gap-2 w-full hide-on-compact-height">
+            <div className={showSettings ? "hidden" : "flex items-center gap-2 w-full"}>
+              <CredentialsForm />
+              <BaseWebDAVURL />
+              <button
+                type="button"
+                onClick={() => setShowSettings(true)}
+                className="shrink-0 px-3 py-1 text-xs border border-white/20 hover:border-white/50 focus:border-white/60 bg-transparent text-white outline-none cursor-pointer active:scale-95 transition-all duration-150 text-nowrap"
+              >
+                Settings
+              </button>
+            </div>
+            {showSettings && (
+              <SettingsView
+                onClose={() => setShowSettings(false)}
+                targetSubdir={targetSubdir}
+                onTargetSubdirChange={handleTargetSubdirChange}
+              />
+            )}
+          </div>
         </div>
       </div>
     </BackgroundWrapper>

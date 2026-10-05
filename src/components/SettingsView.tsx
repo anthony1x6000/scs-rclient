@@ -20,7 +20,8 @@ interface SettingsViewProps {
 function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsViewProps) {
   const [draft, setDraft] = useState<string>(targetSubdir);
   const [concurrencyDraft, setConcurrencyDraft] = useState<string>(String(DEFAULT_SCAN_CONCURRENCY));
-  const [savedIndicator, setSavedIndicator] = useState<string>("");
+  const [subdirSaved, setSubdirSaved] = useState<boolean>(false);
+  const [concurrencySaved, setConcurrencySaved] = useState<boolean>(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const concurrencyDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onChangeRef = useRef(onTargetSubdirChange);
@@ -40,6 +41,7 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
   // Sync from parent only when the parent value changes externally.
   useEffect(() => {
     setDraft(targetSubdir);
+    setSubdirSaved(false);
   }, [targetSubdir]);
 
   useEffect(() => {
@@ -58,51 +60,46 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
   }, [onClose]);
 
   const persist = async (newVal: string) => {
-    setSavedIndicator("Saving…");
     try {
       await setTargetSubdir(newVal);
       onChangeRef.current(newVal);
-      setSavedIndicator("Saved.");
+      setSubdirSaved(true);
     } catch (e) {
       console.error("Failed to save target subdirectory setting:", e);
-      setSavedIndicator("Save failed.");
+      setSubdirSaved(false);
     }
   };
 
   const persistConcurrency = async (threads: number) => {
-    setSavedIndicator("Saving…");
     try {
       await setScanConcurrency(threads);
-      setSavedIndicator("Saved.");
+      setConcurrencySaved(true);
     } catch (e) {
       console.error("Failed to save scan concurrency setting:", e);
-      setSavedIndicator("Save failed.");
+      setConcurrencySaved(false);
     }
   };
 
   const handleClearCache = async () => {
-    setSavedIndicator("Clearing…");
     try {
       await clearWebDAVCache();
-      setSavedIndicator("Cache cleared.");
     } catch (e) {
       console.error("Failed to clear WebDAV cache:", e);
-      setSavedIndicator("Clear failed.");
     }
   };
 
   const handleChange = (newVal: string) => {
     setDraft(newVal);
-    setSavedIndicator("");
+    setSubdirSaved(false);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => void persist(newVal.trim()), 400);
   };
 
   const handleConcurrencyChange = (raw: string) => {
     setConcurrencyDraft(raw);
+    setConcurrencySaved(false);
     const clamped = parseAndClampScanConcurrency(raw);
     if (clamped !== null) {
-      setSavedIndicator("");
       if (concurrencyDebounceRef.current) clearTimeout(concurrencyDebounceRef.current);
       concurrencyDebounceRef.current = setTimeout(() => void persistConcurrency(clamped), 400);
     }
@@ -120,7 +117,7 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
   };
 
   return (
-    <div role="dialog" aria-label="Settings" className="flex items-center gap-2 w-full">
+    <div role="dialog" aria-label="Settings" className="flex items-center gap-3 w-full">
       <div className="flex-1 min-w-0">
         <label className="sr-only" htmlFor="scs-target-subdir">Mount root subdirectory</label>
         <TextInput
@@ -129,14 +126,15 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
           value={draft}
           onChange={(e) => handleChange(e.target.value)}
           placeholder="Mount root subdirectory..."
+          status={subdirSaved ? "success" : "idle"}
           className="w-full"
         />
       </div>
-      <div className="flex items-center gap-1.5 shrink-0">
+      <div className="flex items-center gap-1.5 shrink-0 ml-1">
         <label htmlFor="scs-scan-concurrency" className="text-xs text-gray-300 font-light select-none">
           Threads:
         </label>
-        <input
+        <TextInput
           id="scs-scan-concurrency"
           type="number"
           min={MIN_SCAN_CONCURRENCY}
@@ -145,13 +143,14 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
           onChange={(e) => handleConcurrencyChange(e.target.value)}
           onBlur={handleConcurrencyBlur}
           title="Number of concurrent scanning threads (1–64)"
-          className="w-14 px-1.5 py-1 text-xs text-center border border-white/20 bg-black/40 text-white rounded outline-none focus:border-white/60 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+          status={concurrencySaved ? "success" : "idle"}
+          className="w-14 text-center [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
         />
       </div>
       <button
         type="button"
         onClick={handleClearCache}
-        className="shrink-0 px-2.5 py-1 text-xs border border-white/20 hover:border-amber-400/40 hover:text-amber-200 focus:border-amber-400/60 bg-transparent text-gray-300 outline-none cursor-pointer hover:bg-amber-500/10 active:scale-95 transition-all text-nowrap"
+        className="shrink-0 px-2.5 py-1 text-xs border border-white/20 hover:border-amber-400/60 hover:text-amber-200 focus:border-amber-400/60 bg-transparent text-gray-300 outline-none cursor-pointer active:scale-95 transition-all duration-150 text-nowrap"
         title="Clear cached remote WebDAV file listings"
       >
         Clear Cache
@@ -159,13 +158,10 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
       <button
         type="button"
         onClick={onClose}
-        className="shrink-0 px-3 py-1 text-xs border border-white/20 hover:border-white/40 focus:border-white/60 bg-transparent text-white outline-none cursor-pointer hover:bg-white/5 active:scale-95 transition-all text-nowrap"
+        className="shrink-0 px-3 py-1 text-xs border border-white/20 hover:border-white/50 focus:border-white/60 bg-transparent text-white outline-none cursor-pointer active:scale-95 transition-all duration-150 text-nowrap"
       >
         Close Settings
       </button>
-      <span className="text-xs text-gray-400 shrink-0 min-w-[45px]" role="status" aria-live="polite">
-        {savedIndicator}
-      </span>
     </div>
   );
 }

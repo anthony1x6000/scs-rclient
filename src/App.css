@@ -34,3 +34,24 @@ body {
     -webkit-mask-image: linear-gradient(to top, transparent, black 18px);
   }
 }
+
+*, *::before, *::after {
+  border-radius: 0 !important;
+}
+
+button, input, textarea, a {
+  transition: all 150ms ease-in-out;
+}
+
+@media (max-height: 480px) {
+  .hide-on-compact-height {
+    display: none !important;
+  }
+}
+
+@media (max-height: 380px) {
+  .hide-on-short-height {
+    display: none !important;
+  }
+}
+
