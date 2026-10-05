@@ -1001,6 +1001,35 @@ pub fn list_remote_recursive_with_concurrency_and_log<F>(
     cancel_flag: &AtomicBool,
     concurrency: Option<usize>,
     auth_user: Option<&str>,
+    log: F,
+) -> Result<Vec<WebdavItem>, String>
+where
+    F: FnMut(&str),
+{
+    list_remote_recursive_with_options_and_log(
+        client,
+        remote_url,
+        cancel_flag,
+        concurrency,
+        auth_user,
+        true,
+        log,
+    )
+}
+
+/// Recursively lists remote WebDAV items under remote_url with configurable worker concurrency, cache control, and streamed diagnostic logs.
+///
+/// Parameters:
+/// - `concurrency`: Worker thread count (1..64). If `None`, defaults to `get_scan_concurrency()`.
+/// - `auth_user`: Optional username for credential-scoped cache partitioning (CWE-287 / CWE-384).
+/// - `use_cache`: When true and cache is enabled, loads from/saves to remote listing cache. When false (e.g. GET), bypasses cache.
+pub fn list_remote_recursive_with_options_and_log<F>(
+    client: &rustydav::client::Client,
+    remote_url: &str,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
+    auth_user: Option<&str>,
+    use_cache: bool,
     mut log: F,
 ) -> Result<Vec<WebdavItem>, String>
 where
@@ -1011,7 +1040,7 @@ where
         return Err("Operation canceled by user.".to_string());
     }
 
-    if is_cache_enabled() {
+    if use_cache && is_cache_enabled() {
         if let Some(cached_items) = load_remote_cache(remote_url, auth_user) {
             log(&format!(
                 "Loaded {} item(s) from remote listing cache for {}.\n",
@@ -1043,7 +1072,7 @@ where
                         "Server returned {} items via Depth: infinity.\n",
                         child_count
                     ));
-                    if is_cache_enabled() {
+                    if use_cache && is_cache_enabled() {
                         save_remote_cache(remote_url, auth_user, &items);
                     }
                     return Ok(items);
@@ -1383,7 +1412,7 @@ where
 
     state.all_items.sort_by(|a, b| a.href.cmp(&b.href));
 
-    if is_cache_enabled() {
+    if use_cache && is_cache_enabled() {
         save_remote_cache(remote_url, auth_user, &state.all_items);
     }
 
@@ -1484,6 +1513,37 @@ pub fn should_upload_file(
             // Local file is considered newer if its mtime is strictly greater than
             // remote mtime + 1s (to avoid false positives due to HTTP-date 1-second rounding).
             l_time > r_time + 1
+        }
+        // If timestamps are not both available, but sizes match, consider it up-to-date
+        _ => false,
+    }
+}
+
+/// Determines whether a remote file needs to be downloaded based on local existence, file size, and timestamps.
+///
+/// Returns true if:
+/// - File does not exist locally.
+/// - File sizes differ.
+/// - File sizes match, but remote file was modified after the local file (with a 1-second margin for rounding/skew).
+///
+/// The 1-second margin accommodates RFC 7231 Section 7.1.1.1 HTTP-date 1-second timestamp resolution
+/// and slight client/server clock skew between WebDAV hosts. Strict inequality `> l_time + 1`
+/// guarantees that the remote modification is strictly newer even when local modification occurred
+/// at the upper boundary of a 1-second interval.
+pub fn should_download_file(
+    remote_size: u64,
+    remote_mtime: Option<u64>,
+    local_size: u64,
+    local_mtime: Option<u64>,
+) -> bool {
+    if remote_size != local_size {
+        return true;
+    }
+    match (remote_mtime, local_mtime) {
+        (Some(r_time), Some(l_time)) => {
+            // Remote file is considered newer if its mtime is strictly greater than
+            // local mtime + 1s (to avoid false positives due to HTTP-date 1-second rounding or clock skew).
+            r_time > l_time + 1
         }
         // If timestamps are not both available, but sizes match, consider it up-to-date
         _ => false,
@@ -1749,11 +1809,12 @@ where
         "get" | "get-dry" | "get-checksum" => {
             let is_dry = action == "get-dry";
             let with_checksum = action == "get-checksum";
-            log(&format!("Listing remote files in {}...\n", remote_url));
-            let items = list_remote_recursive_with_concurrency_and_log(
-                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
+            log(&format!("Querying remote files in {} with parallel scan...\n", remote_url));
+            // Caching does not apply for GET; bypass cache to ensure fresh remote scan
+            let items = list_remote_recursive_with_options_and_log(
+                client, remote_url, cancel_flag, concurrency, auth_user, false, &mut log,
             )?;
-            let files_to_download: Vec<(&WebdavItem, String)> = items
+            let remote_files: Vec<(&WebdavItem, String)> = items
                 .iter()
                 .filter(|item| !item.is_dir)
                 .filter_map(|item| {
@@ -1766,11 +1827,50 @@ where
                 })
                 .collect();
 
+            log(&format!("Scanning local files in {}...\n", local_dir.display()));
+            let local_files = collect_local_files_with_mtime(local_dir);
+            let mut local_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
+            for (_, rel, size, mtime) in local_files {
+                local_map.insert(rel, (size, mtime));
+            }
+
+            let mut files_to_download: Vec<(&WebdavItem, String)> = Vec::new();
+            let mut skipped_count = 0;
+
+            for (item, rel) in remote_files {
+                let needs_download = match local_map.get(&rel) {
+                    None => true,
+                    Some((loc_size, loc_mtime)) => {
+                        should_download_file(item.size, item.mtime, *loc_size, *loc_mtime)
+                    }
+                };
+
+                if needs_download {
+                    files_to_download.push((item, rel));
+                } else {
+                    skipped_count += 1;
+                    if is_dry {
+                        log(&format!(
+                            "NOTICE: {}: Up to date (matches local {} bytes), skipping\n",
+                            rel, item.size
+                        ));
+                    }
+                }
+            }
+
             let total_files = files_to_download.len();
             log(&format!(
-                "Starting download of {} file(s)...\n\n",
-                total_files
+                "Scan complete: {} file(s) up to date, {} file(s) to download.\n\n",
+                skipped_count, total_files
             ));
+
+            if total_files == 0 {
+                log(&format!(
+                    "All files are already up to date on local.\n\nGet operation finished: 0 file(s) downloaded, {} file(s) skipped (already up to date).\n",
+                    skipped_count
+                ));
+                return Ok(());
+            }
 
             let max_size = get_max_file_size();
             let mut count = 0;
@@ -1790,10 +1890,9 @@ where
                 }
                 if is_dry {
                     log(&format!(
-                        "[{}/{}] NOTICE: {}: Skipped copy (dry run, {} bytes)\n",
+                        "[{}/{}] NOTICE: {}: Would download (new or modified, {} bytes)\n",
                         current_num, total_files, rel, item.size
                     ));
-                    count += 1;
                     continue;
                 }
                 log(&format!(
@@ -1892,8 +1991,8 @@ where
                 ));
             }
             log(&format!(
-                "\nGet operation finished: {} file(s) downloaded ({} bytes).\n",
-                count, total_bytes
+                "\nGet operation finished: {} file(s) downloaded ({} bytes), {} file(s) skipped (already up to date).\n",
+                count, total_bytes, skipped_count
             ));
             Ok(())
         }
@@ -2549,6 +2648,25 @@ mod tests {
         clear_remote_cache().unwrap();
         assert!(!temp_cache.exists());
         std::env::remove_var("WEBDAV_CACHE_FILE");
+    }
+
+    #[test]
+    fn test_should_download_file_decision_matrix() {
+        // Different sizes -> download
+        assert!(should_download_file(200, Some(1000), 100, Some(1000)));
+        assert!(should_download_file(200, None, 100, None));
+
+        // Same size, remote newer than local + 1s -> download
+        assert!(should_download_file(100, Some(1005), 100, Some(1000)));
+
+        // Same size, remote older or within 1s margin -> skip
+        assert!(!should_download_file(100, Some(1000), 100, Some(1000)));
+        assert!(!should_download_file(100, Some(1001), 100, Some(1000)));
+        assert!(!should_download_file(100, Some(990), 100, Some(1000)));
+
+        // Missing timestamp -> skip if sizes match
+        assert!(!should_download_file(100, None, 100, Some(1000)));
+        assert!(!should_download_file(100, Some(1000), 100, None));
     }
 }
 
