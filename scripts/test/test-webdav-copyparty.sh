@@ -9,6 +9,7 @@ TMP_DIR="$(mktemp -d)"
 MOCK_DIR="$TMP_DIR/storage"
 CONF_FILE="$TMP_DIR/copyparty.conf"
 SERVER_PID=""
+CONTAINER_NAME=""
 PROXY_PID=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,13 +45,36 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
+  if [[ -n "${CONTAINER_NAME:-}" ]]; then
+    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
 echo "=== Launching Copyparty backend server on port $UPSTREAM_PORT ==="
-python3 -m copyparty -c "$CONF_FILE" -ed > /tmp/copyparty-test.log 2>&1 &
-SERVER_PID=$!
+if command -v docker >/dev/null 2>&1; then
+  IMAGE="${WEBDAV_DOCKER_IMAGE:-copyparty/ac:latest}"
+  echo "Starting Copyparty via Docker container ($IMAGE)..."
+  CONTAINER_NAME="copyparty-e2e-$$-${RANDOM}"
+  if docker run -d \
+    --name "$CONTAINER_NAME" \
+    -p "$UPSTREAM_PORT:$UPSTREAM_PORT" \
+    --user "$(id -u):$(id -g)" \
+    -v "$TMP_DIR:$TMP_DIR" \
+    "$IMAGE" -c "$CONF_FILE" -ed > /tmp/copyparty-docker.log 2>&1; then
+    echo "Started Docker container $CONTAINER_NAME"
+  else
+    echo "::warning::Docker run failed; falling back to python copyparty..."
+    CONTAINER_NAME=""
+    python3 -m copyparty -c "$CONF_FILE" -ed > /tmp/copyparty-test.log 2>&1 &
+    SERVER_PID=$!
+  fi
+else
+  echo "Docker not available; starting Copyparty via Python..."
+  python3 -m copyparty -c "$CONF_FILE" -ed > /tmp/copyparty-test.log 2>&1 &
+  SERVER_PID=$!
+fi
 
 READY=0
 for i in {1..30}; do
@@ -62,8 +86,12 @@ for i in {1..30}; do
 done
 
 if [[ "$READY" -ne 1 ]]; then
-  echo "::error::Copyparty failed to start on port $UPSTREAM_PORT within 15 seconds; server log tail:" >&2
-  tail -n 50 /tmp/copyparty-test.log || true
+  echo "::error::Copyparty failed to start on port $UPSTREAM_PORT within 15 seconds; server logs:" >&2
+  if [[ -n "${CONTAINER_NAME:-}" ]]; then
+    docker logs "$CONTAINER_NAME" || true
+  fi
+  tail -n 50 /tmp/copyparty-docker.log 2>/dev/null || true
+  tail -n 50 /tmp/copyparty-test.log 2>/dev/null || true
   exit 1
 fi
 

@@ -70,7 +70,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Copyparty
+      - name: Pull Copyparty Docker Image
+        run: docker pull copyparty/ac:latest
+
+      - name: Install Copyparty (Fallback)
         run: pip install copyparty
 
       - name: Run WebDAV Copyparty Integration Tests
