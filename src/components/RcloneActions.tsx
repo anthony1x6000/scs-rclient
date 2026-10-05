@@ -14,14 +14,17 @@ interface ActionDef {
 }
 
 const ACTIONS: ActionDef[] = [
-  { id: "put", label: "Upload (Local → Remote)" },
-  { id: "get", label: "Download (Remote → Local)" },
+  { id: "put", label: "Upload (Local to Remote)" },
+  { id: "get", label: "Download (Remote to Local)" },
   { id: "put-dry", label: "Preview Upload (Dry Run)", preview: true },
   { id: "get-dry", label: "Preview Download (Dry Run)", preview: true },
   { id: "check", label: "Compare Local vs Remote", preview: true },
   { id: "ls", label: "List Remote Files", preview: true },
   { id: "lsd", label: "List Remote Folders", preview: true },
 ];
+
+const ACTION_BUTTON_CLASS =
+  "w-full bg-gray-800/25 border border-white/30 hover:border-white/70 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white";
 
 export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsProps) {
   const { runRclone, cancelCommand } = useRcloneExecution(onLog, isRunning, setIsRunning);
@@ -57,26 +60,26 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
 
   return (
     <div className="p-2">
-      <ul className="grid grid-cols-2 gap-2 list-none">
+      <ul className="grid grid-cols-2 gap-2 list-none m-0 p-0">
         {ACTIONS.map((action) => (
-          <li key={action.id} className="bg-gray-800/25 border border-white/50 p-0 text-center">
+          <li key={action.id} className="p-0 text-center">
             <button
               type="button"
               disabled={isRunning}
               onClick={() => runWithCompletion(action.id)}
-              className="w-full p-3 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+              className={ACTION_BUTTON_CLASS}
             >
               {action.label}
             </button>
           </li>
         ))}
-        <li className="bg-gray-800/25 border border-white/50 p-0 text-center">
+        <li className="p-0 text-center">
           <button
             type="button"
             disabled={isRunning}
             onClick={handleSyncClick}
             aria-live="polite"
-            className="w-full p-3 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+            className={ACTION_BUTTON_CLASS}
           >
             {syncArmed
               ? previewOk
@@ -91,7 +94,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
           <button
             type="button"
             onClick={() => setSyncArmed(false)}
-            className="px-3 py-1 text-xs border border-white/20 hover:border-white/40 bg-transparent text-white cursor-pointer"
+            className="px-3 py-1 text-xs border border-white/20 hover:border-white/50 bg-transparent text-white cursor-pointer transition-all duration-150"
           >
             Cancel sync
           </button>
@@ -105,9 +108,9 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
           <button
             type="button"
             onClick={cancelCommand}
-            className="w-full bg-red-950/25 border border-red-500/50 hover:bg-red-900/20 text-red-400 p-3 text-center cursor-pointer transition-all active:scale-[0.99] select-none text-xs uppercase font-light tracking-wide"
+            className="w-full bg-red-950/25 border border-red-500/50 hover:border-red-400 text-red-400 p-3 text-center cursor-pointer transition-all duration-150 active:scale-[0.99] select-none"
           >
-            Cancel active operation
+            Cancel operation
           </button>
         </div>
       )}

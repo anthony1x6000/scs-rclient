@@ -37,7 +37,7 @@ function BaseWebDAVURL() {
         value={url}
         onChange={(e) => handleChange(e.target.value)}
         placeholder="Paste WebDAV URL..."
-        className="w-[50%]"
+        className="flex-1 min-w-0"
         autoComplete="url"
         inputMode="url"
       />

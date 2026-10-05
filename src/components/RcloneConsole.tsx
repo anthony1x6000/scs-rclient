@@ -9,6 +9,7 @@ export function RcloneConsole({ logs, onClear }: RcloneConsoleProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [follow, setFollow] = useState(true);
+  const [isMono, setIsMono] = useState(false);
   const [copied, setCopied] = useState(false);
   const [hasOverflow, setHasOverflow] = useState(false);
   const [atTop, setAtTop] = useState(true);
@@ -62,21 +63,30 @@ export function RcloneConsole({ logs, onClear }: RcloneConsoleProps) {
   };
 
   return (
-    <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
+    <div className="flex flex-col flex-1 min-h-0 overflow-hidden logs-pane">
       <div className="flex gap-2 px-2 pb-1 text-xs">
         <button
           type="button"
           onClick={() => setFollow((f) => !f)}
           aria-pressed={follow}
-          className="px-2 py-1 border border-white/20 hover:border-white/40 bg-transparent text-white cursor-pointer"
+          className="px-2 py-1 border border-white/20 hover:border-white/50 bg-transparent text-white cursor-pointer transition-all duration-150"
         >
           {follow ? "Pause follow" : "Follow output"}
+        </button>
+        <button
+          type="button"
+          onClick={() => setIsMono((m) => !m)}
+          aria-pressed={isMono}
+          className="px-2 py-1 border border-white/20 hover:border-white/50 bg-transparent text-white cursor-pointer transition-all duration-150"
+          title="Toggle between standard app font and monospace font"
+        >
+          {isMono ? "Standard font" : "Mono font"}
         </button>
         {onClear && (
           <button
             type="button"
             onClick={onClear}
-            className="px-2 py-1 border border-white/20 hover:border-white/40 bg-transparent text-white cursor-pointer"
+            className="px-2 py-1 border border-white/20 hover:border-white/50 bg-transparent text-white cursor-pointer transition-all duration-150"
           >
             Clear
           </button>
@@ -84,7 +94,7 @@ export function RcloneConsole({ logs, onClear }: RcloneConsoleProps) {
         <button
           type="button"
           onClick={handleCopy}
-          className="px-2 py-1 border border-white/20 hover:border-white/40 bg-transparent text-white cursor-pointer"
+          className="px-2 py-1 border border-white/20 hover:border-white/50 bg-transparent text-white cursor-pointer transition-all duration-150"
           aria-live="polite"
         >
           {copied ? "Copied!" : "Copy"}
@@ -95,7 +105,7 @@ export function RcloneConsole({ logs, onClear }: RcloneConsoleProps) {
         {/* top fade */}
         <div
           aria-hidden
-          className={`pointer-events-none absolute inset-x-2 top-0 h-6 bg-gradient-to-b from-black/40 to-transparent transition-opacity duration-200 z-10 ${hasOverflow && !atTop ? "opacity-100" : "opacity-0"}`}
+          className={`pointer-events-none absolute inset-x-0 top-0 h-6 bg-gradient-to-b from-black/40 to-transparent transition-opacity duration-200 z-10 ${hasOverflow && !atTop ? "opacity-100" : "opacity-0"}`}
         />
         <textarea
           id="scs-console"
@@ -105,7 +115,7 @@ export function RcloneConsole({ logs, onClear }: RcloneConsoleProps) {
           onScroll={handleScroll}
           placeholder="Click an action above to run and view output..."
           wrap="off"
-          className="w-full flex-1 min-h-0 p-2 font-mono text-xs bg-black/25 border border-white/10 outline-none no-scrollbar overflow-auto overscroll-contain resize-none"
+          className={`w-full flex-1 min-h-0 p-2 text-xs bg-black/25 border border-white/10 outline-none no-scrollbar overflow-auto overscroll-contain resize-none transition-all duration-150 ${isMono ? 'font-mono' : 'font-sans font-light'}`}
         />
         {/* bottom fade */}
         <div

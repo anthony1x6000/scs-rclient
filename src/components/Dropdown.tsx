@@ -330,7 +330,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
             onWheel={onWheel}
             onTouchStart={onTouchStart}
             onTouchEnd={onTouchEnd}
-            className="relative bg-black/85 backdrop-blur-md border border-white/15 rounded-sm shadow-[0_12px_40px_rgba(0,0,0,0.6)] overflow-hidden"
+            className="relative bg-black/85 backdrop-blur-md border border-white/15 shadow-[0_12px_40px_rgba(0,0,0,0.6)] overflow-hidden"
           >
             {/* Top fade */}
             <div
@@ -357,7 +357,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
                     <li
                       key={item}
                       id={`scs-opt-${globalIdx}`}
-                      className={`flex items-center rounded-sm ${isHighlighted ? "bg-white/10 ring-1 ring-white/20" : ""} ${isSelected ? "bg-white/[0.06]" : ""}`}
+                      className={`flex items-center ${isHighlighted ? "bg-white/10 ring-1 ring-white/20" : ""} ${isSelected ? "bg-white/[0.06]" : ""}`}
                       role="option"
                       aria-selected={isSelected}
                     >
@@ -392,7 +392,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
                 )}
                 {/* Off-page selected hint */}
                 {selectedOffPage && filteredItems.length > 0 && (
-                  <li className="mt-1 py-1.5 px-2 text-[11px] text-amber-200/80 bg-amber-950/20 border border-amber-500/20 rounded-sm">
+                  <li className="mt-1 py-1.5 px-2 text-[11px] text-amber-200/80 bg-amber-950/20 border border-amber-500/20">
                     Selected “{selectedItem}” is on page {selectedPage + 1} ·{" "}
                     <button
                       type="button"
@@ -434,7 +434,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
                     disabled={clampedPage === 0}
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => setPage((p) => Math.max(0, p - 1))}
-                    className="w-6 h-6 grid place-items-center rounded-sm border border-white/15 hover:border-white/30 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer bg-white/5 hover:bg-white/10"
+                    className="w-6 h-6 grid place-items-center border border-white/15 hover:border-white/50 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer bg-transparent transition-all duration-150"
                   >
                     ‹
                   </button>
@@ -450,7 +450,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
                       return (
                         <span
                           key={pageIdx}
-                          className={`h-1.5 rounded-full transition-all ${active ? "w-4 bg-white" : "w-1.5 bg-white/30"}`}
+                          className={`h-1.5 transition-all ${active ? "w-4 bg-white" : "w-1.5 bg-white/30"}`}
                         />
                       );
                     })}
@@ -462,7 +462,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
                     disabled={clampedPage >= pageCount - 1}
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
-                    className="w-6 h-6 grid place-items-center rounded-sm border border-white/15 hover:border-white/30 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer bg-white/5 hover:bg-white/10"
+                    className="w-6 h-6 grid place-items-center border border-white/15 hover:border-white/50 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer bg-transparent transition-all duration-150"
                   >
                     ›
                   </button>
