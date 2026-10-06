@@ -3,9 +3,10 @@ import { useEffect, useRef, useState, useLayoutEffect } from "react";
 interface RcloneConsoleProps {
   logs: string;
   onClear?: () => void;
+  onOpenFolder?: () => void;
 }
 
-export function RcloneConsole({ logs, onClear }: RcloneConsoleProps) {
+export function RcloneConsole({ logs, onClear, onOpenFolder }: RcloneConsoleProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [follow, setFollow] = useState(true);
@@ -89,6 +90,15 @@ export function RcloneConsole({ logs, onClear }: RcloneConsoleProps) {
         >
           {copied ? "Copied!" : "Copy"}
         </button>
+        {onOpenFolder && (
+          <button
+            type="button"
+            onClick={onOpenFolder}
+            className="px-2 py-1 border border-white/20 hover:border-white/50 bg-transparent text-white cursor-pointer transition-all duration-150"
+          >
+            Open folder
+          </button>
+        )}
       </div>
       <label className="sr-only" htmlFor="scs-console">WebDAV console output</label>
       <div ref={wrapRef} className="relative flex-1 min-h-0 flex flex-col overflow-hidden px-2 pb-1">
