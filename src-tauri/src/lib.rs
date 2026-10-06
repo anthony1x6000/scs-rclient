@@ -90,6 +90,42 @@ fn get_mount_dir(app: tauri::AppHandle, target_subdir: Option<String>) -> Result
         .map_err(|_| "Unable to resolve the documents directory.".to_string())
 }
 
+/// Opens `dir` in the platform's default file manager.
+fn open_in_file_manager(dir: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opener = "xdg-open";
+
+    std::process::Command::new(opener)
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open {}: {}", dir.display(), e))
+}
+
+/// Opens the local working directory (mount dir + selected subdir) in the file manager.
+/// The path is resolved with the same containment rules as WebDAV actions.
+#[tauri::command]
+fn open_local_dir(
+    app: tauri::AppHandle,
+    target_subdir: Option<String>,
+    subdir: String,
+) -> Result<(), String> {
+    let mount_dir = get_mount_dir(app, target_subdir)?;
+    let base = std::path::Path::new(&mount_dir);
+    let trimmed = subdir.trim();
+    let dir = if trimmed.is_empty() || trimmed == "." {
+        base.to_path_buf()
+    } else {
+        join_contained(base, trimmed)?
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+    open_in_file_manager(&dir)
+}
+
 #[tauri::command]
 fn save_credentials(username: String, secret: String) -> Result<(), String> {
     validate_username(&username)?;
@@ -289,6 +325,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_mount_dir,
+            open_local_dir,
             save_credentials,
             get_credentials,
             delete_credentials,
