@@ -14,6 +14,10 @@ pub const MAX_SCAN_CONCURRENCY: usize = 64;
 /// Set to 10,000 to comfortably accommodate very large course hierarchies (typical max depth ~10 * breadth ~100)
 /// while bounding memory usage and avoiding infinite traversal cycles.
 pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
+/// Maximum attempts for each remote directory listing request before the scan fails.
+/// Retrying absorbs transient transport errors (timeouts, connection resets) so a single
+/// flaky request does not abort the entire recursive scan.
+pub const LIST_MAX_ATTEMPTS: u32 = 3;
 
 // Static compile-time assertion verifying that rustydav::client::Client implements Send + Sync
 // and can safely be shared across concurrent scanning worker threads.
@@ -1260,7 +1264,24 @@ where
                             return;
                         }
 
-                        let list_res = client.list(&current_url, "1");
+                        let mut list_res = client.list(&current_url, "1");
+                        for attempt in 2..=LIST_MAX_ATTEMPTS {
+                            let last_err = match &list_res {
+                                Ok(_) => break,
+                                Err(e) => e,
+                            };
+                            if cancel_flag.load(Ordering::SeqCst) {
+                                let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                                state.stopped = true;
+                                return;
+                            }
+                            let _ = worker_log_tx.send(format!(
+                                "List request for {} failed ({}); retrying (attempt {}/{})...\n",
+                                current_url, last_err, attempt, LIST_MAX_ATTEMPTS
+                            ));
+                            std::thread::sleep(Duration::from_secs(u64::from(attempt - 1)));
+                            list_res = client.list(&current_url, "1");
+                        }
 
                         // Check cancellation immediately after blocking network I/O returns to abort before parsing response body
                         if cancel_flag.load(Ordering::SeqCst) {
@@ -1273,7 +1294,10 @@ where
                             Ok(r) => r,
                             Err(e) => {
                                 let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                                state.error = Some(format!("List request failed for {}: {}", current_url, e));
+                                state.error = Some(format!(
+                                    "List request failed for {} after {} attempt(s): {}",
+                                    current_url, LIST_MAX_ATTEMPTS, e
+                                ));
                                 state.stopped = true;
                                 return;
                             }
