@@ -59,6 +59,17 @@ function App() {
     void updateMountDir(newSub);
   };
 
+  const handleOpenFolder = async () => {
+    try {
+      await invoke("open_local_dir", {
+        targetSubdir: targetSubdir || undefined,
+        subdir: selectedSubdir,
+      });
+    } catch (e) {
+      setLogs((prev) => `${prev}\nFailed to open folder: ${e}\n`);
+    }
+  };
+
   return (
     <BackgroundWrapper>
       <div className="flex flex-col h-screen w-full box-border overflow-hidden p-2 justify-between">
@@ -71,7 +82,7 @@ function App() {
         </div>
 
         <div className="flex-1 min-h-0 flex flex-col overflow-hidden my-1 hide-on-compact-height">
-          <RcloneConsole logs={logs} onClear={() => setLogs("")} />
+          <RcloneConsole logs={logs} onClear={() => setLogs("")} onOpenFolder={handleOpenFolder} />
         </div>
 
         <div className="shrink-0 text-white flex flex-col gap-2 w-full">
