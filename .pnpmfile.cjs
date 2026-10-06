@@ -16,6 +16,9 @@ module.exports = {
         if (deps.browserslist) {
           deps.browserslist = "^4.28.7";
         }
+        if (deps["source-map-js"]) {
+          deps["source-map-js"] = "^1.2.2";
+        }
       }
       return pkg;
     },
