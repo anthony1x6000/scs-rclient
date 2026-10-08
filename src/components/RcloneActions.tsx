@@ -18,6 +18,7 @@ const ACTIONS: ActionDef[] = [
   { id: "get-dry", label: "Preview Download (Dry Run)" },
   { id: "check", label: "Compare Local vs Remote" },
   { id: "ls", label: "List Remote" },
+  { id: "get-backup-dated", label: "Backup" },
 ];
 
 const ACTION_BUTTON_CLASS =
