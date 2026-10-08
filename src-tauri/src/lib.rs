@@ -207,6 +207,8 @@ fn cancel_webdav_action(state: tauri::State<'_, WebdavState>) -> Result<(), Stri
 /// - `concurrency`: Optional number of worker threads for parallel remote directory traversal (1..64).
 ///   When `None`, defaults to 6 (`DEFAULT_SCAN_CONCURRENCY`).
 /// - `username`: Optional authenticated username, used for credential-scoped cache partitioning.
+/// - `backup`: When true, the local side is redirected under `<mount>/backups`, keeping an
+///   operation off the working copy it is meant to leave alone.
 #[tauri::command]
 async fn run_webdav_action(
     app: tauri::AppHandle,
@@ -217,6 +219,7 @@ async fn run_webdav_action(
     target_subdir: Option<String>,
     username: Option<String>,
     concurrency: Option<usize>,
+    backup: Option<bool>,
 ) -> Result<(), String> {
     use tauri::Emitter;
 
@@ -225,11 +228,16 @@ async fn run_webdav_action(
 
     let mount_dir_str = get_mount_dir(app.clone(), target_subdir)?;
     let base_mount = std::path::Path::new(&mount_dir_str);
+    let dest_root = if backup.unwrap_or(false) {
+        join_contained(base_mount, "backups")?
+    } else {
+        base_mount.to_path_buf()
+    };
     let trimmed_subdir = subdir.trim();
     let local_path = if trimmed_subdir.is_empty() || trimmed_subdir == "." {
-        base_mount.to_path_buf()
+        dest_root
     } else {
-        join_contained(base_mount, trimmed_subdir)?
+        join_contained(&dest_root, trimmed_subdir)?
     };
 
     let remote_url = webdav::build_remote_url(&base_url, &subdir);
