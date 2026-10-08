@@ -209,6 +209,8 @@ fn cancel_webdav_action(state: tauri::State<'_, WebdavState>) -> Result<(), Stri
 /// - `username`: Optional authenticated username, used for credential-scoped cache partitioning.
 /// - `backup`: When true, the local side is redirected under `<mount>/backups`, keeping an
 ///   operation off the working copy it is meant to leave alone.
+/// - `backup_dated`: When true (and `backup` is also true), the redirect is nested one level
+///   deeper under today's date, giving each day its own `<mount>/backups/<YYYY-MM-DD>` folder.
 #[tauri::command]
 async fn run_webdav_action(
     app: tauri::AppHandle,
@@ -220,6 +222,7 @@ async fn run_webdav_action(
     username: Option<String>,
     concurrency: Option<usize>,
     backup: Option<bool>,
+    backup_dated: Option<bool>,
 ) -> Result<(), String> {
     use tauri::Emitter;
 
@@ -229,7 +232,13 @@ async fn run_webdav_action(
     let mount_dir_str = get_mount_dir(app.clone(), target_subdir)?;
     let base_mount = std::path::Path::new(&mount_dir_str);
     let dest_root = if backup.unwrap_or(false) {
-        join_contained(base_mount, "backups")?
+        let backups = join_contained(base_mount, "backups")?;
+        if backup_dated.unwrap_or(false) {
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            join_contained(&backups, &today)?
+        } else {
+            backups
+        }
     } else {
         base_mount.to_path_buf()
     };
