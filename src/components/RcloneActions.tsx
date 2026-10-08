@@ -17,8 +17,7 @@ const ACTIONS: ActionDef[] = [
   { id: "put-dry", label: "Preview Upload (Dry Run)" },
   { id: "get-dry", label: "Preview Download (Dry Run)" },
   { id: "check", label: "Compare Local vs Remote" },
-  { id: "ls", label: "List Remote Files" },
-  { id: "lsd", label: "List Remote Folders" },
+  { id: "ls", label: "List Remote" },
 ];
 
 const ACTION_BUTTON_CLASS =
