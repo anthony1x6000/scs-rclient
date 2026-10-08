@@ -1637,27 +1637,33 @@ where
     validate_webdav_url(remote_url)?;
     match action {
         "ls" => {
-            log(&format!("Listing remote files in {}...\n", remote_url));
+            log(&format!(
+                "Listing remote files and folders in {}...\n",
+                remote_url
+            ));
             let items = list_remote_recursive_with_concurrency_and_log(
                 client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
             )?;
-            let mut count = 0;
+            let mut file_count = 0;
+            let mut dir_count = 0;
             let mut total_size = 0;
             for item in &items {
-                if item.is_dir {
-                    continue;
-                }
                 let rel = relative_item_path(remote_url, &item.href);
                 if rel.is_empty() {
                     continue;
                 }
-                log(&format!("{:>9} {}\n", item.size, rel));
-                count += 1;
-                total_size += item.size;
+                if item.is_dir {
+                    log(&format!("{:>9} {}/\n", -1, rel));
+                    dir_count += 1;
+                } else {
+                    log(&format!("{:>9} {}\n", item.size, rel));
+                    file_count += 1;
+                    total_size += item.size;
+                }
             }
             log(&format!(
-                "\nTotal objects: {}, Total size: {} bytes\n",
-                count, total_size
+                "\nTotal files: {}, Total directories: {}, Total size: {} bytes\n",
+                file_count, dir_count, total_size
             ));
             Ok(())
         }
