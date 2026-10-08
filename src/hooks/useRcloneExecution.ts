@@ -11,7 +11,7 @@ export interface RcloneSettings {
   scanConcurrency: number;
 }
 
-export type RcloneActionType = 'put' | 'get' | 'put-dry' | 'get-dry' | 'put-checksum' | 'get-checksum' | 'ls' | 'lsd' | 'check' | 'sync';
+export type RcloneActionType = 'put' | 'get' | 'get-backup' | 'put-dry' | 'get-dry' | 'put-checksum' | 'get-checksum' | 'ls' | 'lsd' | 'check' | 'sync';
 
 /** Keep at most ~500KB / ~5000 lines of log; drop oldest with a notice. */
 const MAX_LOG_CHARS = 500_000;
@@ -126,13 +126,16 @@ export function useRcloneExecution(
       });
       unlistenRef.current = unlisten;
 
+      // `get-backup` is a GET whose local side is redirected to <mount>/backups.
+      const isBackup = action === "get-backup";
       await invoke("run_webdav_action", {
-        action,
+        action: isBackup ? "get" : action,
         baseUrl: settings.baseUrl,
         subdir: settings.selectedSubdir,
         targetSubdir: settings.targetSubdir || undefined,
         username: settings.username || undefined,
         concurrency: settings.scanConcurrency,
+        backup: isBackup || undefined,
       });
 
       log(`\nWebDAV operation finished successfully.\n`);

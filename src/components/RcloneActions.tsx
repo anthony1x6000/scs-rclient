@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { useRcloneExecution, type RcloneActionType } from "../hooks/useRcloneExecution";
 
 interface RcloneActionsProps {
@@ -10,52 +9,31 @@ interface RcloneActionsProps {
 interface ActionDef {
   id: RcloneActionType;
   label: string;
-  preview?: boolean;
 }
 
 const ACTIONS: ActionDef[] = [
   { id: "put", label: "Upload (Local to Remote)" },
   { id: "get", label: "Download (Remote to Local)" },
-  { id: "put-dry", label: "Preview Upload (Dry Run)", preview: true },
-  { id: "get-dry", label: "Preview Download (Dry Run)", preview: true },
-  { id: "check", label: "Compare Local vs Remote", preview: true },
-  { id: "ls", label: "List Remote Files", preview: true },
-  { id: "lsd", label: "List Remote Folders", preview: true },
+  { id: "put-dry", label: "Preview Upload (Dry Run)" },
+  { id: "get-dry", label: "Preview Download (Dry Run)" },
+  { id: "check", label: "Compare Local vs Remote" },
+  { id: "ls", label: "List Remote Files" },
+  { id: "lsd", label: "List Remote Folders" },
 ];
 
 const ACTION_BUTTON_CLASS =
   "w-full bg-gray-800/25 border border-white/30 hover:border-white/70 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white";
 
+/** Halves of the split control: the wrapper owns the border and the shared divider. */
+const SPLIT_BUTTON_CLASS =
+  "w-full bg-gray-800/25 hover:bg-gray-800/40 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white";
+
 export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsProps) {
   const { runRclone, cancelCommand } = useRcloneExecution(onLog, isRunning, setIsRunning);
-  const [syncArmed, setSyncArmed] = useState(false);
-  const [previewOk, setPreviewOk] = useState(false);
-  const [syncDetail, setSyncDetail] = useState("");
 
-  const runWithCompletion = (action: RcloneActionType) => {
+  const runAction = (action: RcloneActionType) => {
     if (isRunning) return;
-    runRclone(action, {
-      onDone: (code) => {
-        if (code === 0 && ACTIONS.some((a) => a.id === action && a.preview)) {
-          setPreviewOk(true);
-        }
-      },
-    });
-  };
-
-  const handleSyncClick = () => {
-    if (isRunning) return;
-    if (!syncArmed) {
-      setSyncDetail("");
-      setSyncArmed(true);
-      return;
-    }
-    if (!previewOk) {
-      onLog("Sync blocked: run a preview (Compare, List, or Dry Run) successfully first.\n");
-      return;
-    }
-    setSyncArmed(false);
-    runRclone("sync");
+    runRclone(action);
   };
 
   return (
@@ -66,43 +44,34 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
             <button
               type="button"
               disabled={isRunning}
-              onClick={() => runWithCompletion(action.id)}
+              onClick={() => runAction(action.id)}
               className={ACTION_BUTTON_CLASS}
             >
               {action.label}
             </button>
           </li>
         ))}
-        <li className="p-0 text-center">
-          <button
-            type="button"
-            disabled={isRunning}
-            onClick={handleSyncClick}
-            aria-live="polite"
-            className={ACTION_BUTTON_CLASS}
-          >
-            {syncArmed
-              ? previewOk
-                ? "Sync will DELETE remote files missing locally. Click again to confirm."
-                : "Run a preview (Compare, List, or Dry Run) first, then click again to arm sync"
-              : "Sync (Mirror Local to Remote)"}
-          </button>
+        <li className="p-0 text-center col-span-2">
+          <div className="grid grid-cols-2 border border-white/30 hover:border-white/70 divide-x divide-white/30 transition-all duration-150">
+            <button
+              type="button"
+              disabled={isRunning}
+              onClick={() => runAction("sync")}
+              className={SPLIT_BUTTON_CLASS}
+            >
+              Sync (Mirror Local to Remote)
+            </button>
+            <button
+              type="button"
+              disabled={isRunning}
+              onClick={() => runAction("get-backup")}
+              className={SPLIT_BUTTON_CLASS}
+            >
+              Backup Download (Remote to backups/)
+            </button>
+          </div>
         </li>
       </ul>
-      {syncArmed && (
-        <div className="mt-2 flex gap-2">
-          <button
-            type="button"
-            onClick={() => setSyncArmed(false)}
-            className="px-3 py-1 text-xs border border-white/20 hover:border-white/50 bg-transparent text-white cursor-pointer transition-all duration-150"
-          >
-            Cancel sync
-          </button>
-          <span className="text-xs text-gray-400 self-center" aria-live="polite">
-            {syncDetail || "Armed: review the preview output above before confirming."}
-          </span>
-        </div>
-      )}
       {isRunning && (
         <div className="mt-2">
           <button
