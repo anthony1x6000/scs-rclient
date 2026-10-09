@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { useRcloneExecution, type RcloneActionType } from "../hooks/useRcloneExecution";
 
 interface RcloneActionsProps {
@@ -30,6 +31,38 @@ const SPLIT_BUTTON_CLASS =
 
 export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsProps) {
   const { runRclone, cancelCommand } = useRcloneExecution(onLog, isRunning, setIsRunning);
+  const uploadButtonRef = useRef<HTMLButtonElement>(null);
+
+  // The webview starts sequential Tab navigation at the first control without ever
+  // focusing it in the DOM, so the first Tab press lands on Download, not Upload
+  // (blurring activeElement cannot fix this — the parked position is not DOM focus).
+  // Instead, grab the first bare Tab press before any user interaction and focus
+  // Upload explicitly. Any other key or pointer input disarms the shim, so normal
+  // tabbing is untouched afterwards.
+  useEffect(() => {
+    let armed = true;
+    const disarm = () => {
+      armed = false;
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!armed) return;
+      if (e.key !== "Tab" || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) {
+        armed = false;
+        return;
+      }
+      const upload = uploadButtonRef.current;
+      armed = false;
+      if (!upload || upload.disabled) return;
+      e.preventDefault();
+      upload.focus();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("pointerdown", disarm, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("pointerdown", disarm, true);
+    };
+  }, []);
 
   const runAction = (action: RcloneActionType) => {
     if (isRunning) return;
@@ -39,9 +72,10 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
   return (
     <div className="p-2">
       <ul className="grid grid-cols-2 gap-2 list-none m-0 p-0">
-        {ACTIONS.map((action) => (
+        {ACTIONS.map((action, index) => (
           <li key={action.id} className="p-0 text-center">
             <button
+              ref={index === 0 ? uploadButtonRef : undefined}
               type="button"
               disabled={isRunning}
               onClick={() => runAction(action.id)}
