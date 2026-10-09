@@ -175,7 +175,7 @@ function SettingsView({ onClose, targetSubdir, onTargetSubdirChange }: SettingsV
           value={concurrencyDraft}
           onChange={(e) => handleConcurrencyChange(e.target.value)}
           onBlur={handleConcurrencyBlur}
-          title="Number of concurrent scanning threads (1–64)"
+          title="Number of concurrent threads for scanning and uploads (1–64)"
           status={concurrencyStatus}
           className="w-14 text-center [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
         />

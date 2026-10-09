@@ -1,5 +1,9 @@
 # Changelog
 
+## Concurrent Uploads
+
+- **Parallel PUT/Sync Uploads**: `put` and `sync` now upload files through a worker pool sized by the Settings "Threads" value (the same concurrency setting already used for remote scanning), instead of uploading files one at a time. The pool mirrors the scan design (atomic work cursor, mpsc log funneling, panic recovery) and serializes remote-cache updates behind a mutex because `update_remote_cache_item` performs a read-modify-write of the cache file. Per-file error semantics are unchanged: MKCOL/open/HTTP-status failures are logged and skipped, while a transport-level PUT failure aborts the batch.
+
 ## WebDAV Security Hardening
 
 - **Symlink Traversal Prevention**: `collect_local_files_with_mtime` skips symlinks and enforces canonical path containment checks under the root source directory to prevent arbitrary file disclosure.

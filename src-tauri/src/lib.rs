@@ -204,7 +204,7 @@ fn cancel_webdav_action(state: tauri::State<'_, WebdavState>) -> Result<(), Stri
 /// Runs a native WebDAV action (e.g. "put", "get", "sync", "list").
 ///
 /// Parameters:
-/// - `concurrency`: Optional number of worker threads for parallel remote directory traversal (1..64).
+/// - `concurrency`: Optional number of worker threads for parallel remote directory traversal and concurrent uploads (1..64).
 ///   When `None`, defaults to 6 (`DEFAULT_SCAN_CONCURRENCY`).
 /// - `username`: Optional authenticated username, used for credential-scoped cache partitioning.
 /// - `backup`: When true, the local side is redirected under `<mount>/backups`, keeping an
