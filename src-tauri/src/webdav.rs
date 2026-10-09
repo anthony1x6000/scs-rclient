@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -1605,6 +1605,198 @@ pub fn verify_webdav_auth(url: &str, username: &str, password: &str) -> Result<(
     }
 }
 
+/// Outcome of a concurrent upload batch.
+enum UploadOutcome {
+    /// All queued files were processed; carries the count successfully copied.
+    Completed(usize),
+    /// The user canceled mid-batch; copied-so-far is reflected in the log output.
+    Canceled,
+}
+
+/// Uploads a batch of local files to the remote URL concurrently.
+///
+/// The worker pool is sized by `concurrency` (clamped to 1..=MAX_SCAN_CONCURRENCY,
+/// falling back to `get_scan_concurrency()` when `None`), mirroring the scan worker
+/// pool so the Settings "Threads" value governs both scanning and uploads.
+///
+/// Design mirrors `list_remote_recursive_with_options_and_log`:
+/// - Work is distributed via a shared atomic cursor over `files`.
+/// - Per-file log lines are funneled through an mpsc channel because the `log`
+///   callback is `FnMut` (not `Sync`).
+/// - `rustydav::client::Client` is `Send + Sync` (asserted at compile time above),
+///   so workers share one connection pool.
+/// - Remote-cache updates are serialized behind a mutex because
+///   `update_remote_cache_item` performs a read-modify-write of the cache file.
+///
+/// Error semantics match the former sequential loop: per-file failures (oversize,
+/// MKCOL, open, non-2xx status) are logged and skipped, while a transport-level
+/// PUT failure aborts the whole batch with `Err`.
+fn upload_files_concurrently<F>(
+    client: &rustydav::client::Client,
+    remote_url: &str,
+    files: Vec<(PathBuf, String, u64)>,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
+    auth_user: Option<&str>,
+    max_size: u64,
+    with_checksum: bool,
+    done_label: &str,
+    log: &mut F,
+) -> Result<UploadOutcome, String>
+where
+    F: FnMut(&str),
+{
+    let total = files.len();
+    if total == 0 {
+        return Ok(UploadOutcome::Completed(0));
+    }
+    let num_workers = concurrency
+        .map(|c| c.clamp(1, MAX_SCAN_CONCURRENCY))
+        .unwrap_or_else(get_scan_concurrency)
+        .min(total);
+
+    let next_idx = AtomicUsize::new(0);
+    let copied = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let error: Mutex<Option<String>> = Mutex::new(None);
+    let cache_write_lock = Mutex::new(());
+
+    let (log_tx, log_rx) = mpsc::channel::<String>();
+
+    std::thread::scope(|s| {
+        for _ in 0..num_workers {
+            let worker_log_tx = log_tx.clone();
+            let files_ref = &files;
+            let next_idx_ref = &next_idx;
+            let copied_ref = &copied;
+            let stop_ref = &stop;
+            let error_ref = &error;
+            let cache_write_lock_ref = &cache_write_lock;
+
+            s.spawn(move || {
+                let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    loop {
+                        if stop_ref.load(Ordering::SeqCst)
+                            || cancel_flag.load(Ordering::SeqCst)
+                        {
+                            return;
+                        }
+                        let idx = next_idx_ref.fetch_add(1, Ordering::SeqCst);
+                        if idx >= total {
+                            return;
+                        }
+                        let (path, rel_str, size) = &files_ref[idx];
+                        let current_num = idx + 1;
+                        if *size > max_size {
+                            let _ = worker_log_tx.send(format!(
+                                "[{}/{}] ERROR: File {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
+                                current_num, total, rel_str, size, max_size
+                            ));
+                            continue;
+                        }
+                        let file_url = build_file_url(remote_url, rel_str);
+                        let _ = worker_log_tx.send(format!(
+                            "[{}/{}] Uploading: {} ({} bytes)...\n",
+                            current_num, total, rel_str, size
+                        ));
+                        if let Err(e) = ensure_remote_parent_dirs(client, remote_url, rel_str) {
+                            let _ = worker_log_tx.send(format!(
+                                "[{}/{}] ERROR: Failed creating remote directory for {}: {}\n",
+                                current_num, total, rel_str, e
+                            ));
+                            continue;
+                        }
+                        let file = match std::fs::File::open(path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                let _ = worker_log_tx.send(format!(
+                                    "[{}/{}] ERROR: Failed to open {}: {}\n",
+                                    current_num, total, path.display(), e
+                                ));
+                                continue;
+                            }
+                        };
+                        let checksum_str = if with_checksum {
+                            match compute_file_sha256(path) {
+                                Ok(hash) => format!(" (sha256: {})", hash),
+                                Err(_) => String::new(),
+                            }
+                        } else {
+                            String::new()
+                        };
+                        let res = match client.put(file, &file_url) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let mut err_slot =
+                                    error_ref.lock().unwrap_or_else(|p| p.into_inner());
+                                if err_slot.is_none() {
+                                    *err_slot = Some(format!(
+                                        "Upload failed for {}: {}",
+                                        rel_str, e
+                                    ));
+                                }
+                                stop_ref.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                        };
+                        if res.status().is_success() {
+                            copied_ref.fetch_add(1, Ordering::SeqCst);
+                            if is_cache_enabled() {
+                                let mtime = std::fs::metadata(path)
+                                    .ok()
+                                    .and_then(|m| get_metadata_mtime(&m));
+                                // Serialize the cache read-modify-write across workers.
+                                let _guard = cache_write_lock_ref
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner());
+                                update_remote_cache_item(
+                                    remote_url,
+                                    auth_user,
+                                    rel_str,
+                                    *size,
+                                    mtime,
+                                );
+                            }
+                            let _ = worker_log_tx.send(format!(
+                                "[{}/{}] {}: {} ({} bytes){}\n",
+                                current_num, total, done_label, rel_str, size, checksum_str
+                            ));
+                        } else {
+                            let _ = worker_log_tx.send(format!(
+                                "[{}/{}] ERROR: Failed to copy {}: HTTP {}\n",
+                                current_num, total, rel_str, res.status()
+                            ));
+                        }
+                    }
+                }));
+                if run_result.is_err() {
+                    let mut err_slot = error_ref.lock().unwrap_or_else(|p| p.into_inner());
+                    if err_slot.is_none() {
+                        *err_slot = Some("Upload worker thread panicked unexpectedly.".to_string());
+                    }
+                    stop_ref.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+
+        drop(log_tx);
+
+        while let Ok(msg) = log_rx.recv() {
+            log(&msg);
+        }
+    });
+
+    let copied = copied.load(Ordering::SeqCst);
+    let error = error.into_inner().unwrap_or_else(|p| p.into_inner());
+    if let Some(err) = error {
+        return Err(err);
+    }
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(UploadOutcome::Canceled);
+    }
+    Ok(UploadOutcome::Completed(copied))
+}
+
 /// Executes a native WebDAV action and streams logs through the callback.
 pub fn execute_webdav_action<F>(
     client: &rustydav::client::Client,
@@ -1620,7 +1812,10 @@ where
     execute_webdav_action_with_options(client, action, remote_url, local_dir, cancel_flag, None, None, log)
 }
 
-/// Executes a native WebDAV action with custom options (such as scan concurrency and auth context) and streams logs.
+/// Executes a native WebDAV action with custom options (such as worker concurrency and auth context) and streams logs.
+///
+/// `concurrency` sizes both the remote scan worker pool and the upload worker
+/// pool (put/sync), so the Settings "Threads" value governs each phase.
 pub fn execute_webdav_action_with_options<F>(
     client: &rustydav::client::Client,
     action: &str,
@@ -1756,80 +1951,51 @@ where
                 return Ok(());
             }
 
-            let mut copied_count = 0;
             let max_size = get_max_file_size();
-            for (idx, (path, rel_str, size)) in files_to_upload.into_iter().enumerate() {
-                if cancel_flag.load(Ordering::SeqCst) {
-                    log("Operation canceled by user.\n");
-                    return Ok(());
-                }
-                let current_num = idx + 1;
-                if size > max_size {
-                    log(&format!(
-                        "[{}/{}] ERROR: File {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
-                        current_num, total_to_upload, rel_str, size, max_size
-                    ));
-                    continue;
-                }
-                let file_url = build_file_url(remote_url, &rel_str);
-                if is_dry {
+            if is_dry {
+                // Dry-run performs no network I/O; keep it sequential for stable output order.
+                for (idx, (_, rel_str, size)) in files_to_upload.iter().enumerate() {
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        log("Operation canceled by user.\n");
+                        return Ok(());
+                    }
+                    let current_num = idx + 1;
+                    if *size > max_size {
+                        log(&format!(
+                            "[{}/{}] ERROR: File {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
+                            current_num, total_to_upload, rel_str, size, max_size
+                        ));
+                        continue;
+                    }
                     log(&format!(
                         "[{}/{}] NOTICE: {}: Would copy (new or modified, {} bytes)\n",
                         current_num, total_to_upload, rel_str, size
                     ));
-                    continue;
                 }
                 log(&format!(
-                    "[{}/{}] Uploading: {} ({} bytes)...\n",
-                    current_num, total_to_upload, rel_str, size
+                    "\nPut operation finished: {} file(s) copied, {} file(s) skipped (already up to date).\n",
+                    0, skipped_count
                 ));
-                if let Err(e) = ensure_remote_parent_dirs(client, remote_url, &rel_str) {
-                    log(&format!(
-                        "[{}/{}] ERROR: Failed creating remote directory for {}: {}\n",
-                        current_num, total_to_upload, rel_str, e
-                    ));
-                    continue;
-                }
-                let file = match std::fs::File::open(&path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log(&format!(
-                            "[{}/{}] ERROR: Failed to open {}: {}\n",
-                            current_num, total_to_upload, path.display(), e
-                        ));
-                        continue;
-                    }
-                };
-                let checksum_str = if with_checksum {
-                    match compute_file_sha256(&path) {
-                        Ok(hash) => format!(" (sha256: {})", hash),
-                        Err(_) => String::new(),
-                    }
-                } else {
-                    String::new()
-                };
-                let res = client
-                    .put(file, &file_url)
-                    .map_err(|e| format!("Upload failed for {}: {}", rel_str, e))?;
-                if res.status().is_success() {
-                    copied_count += 1;
-                    if is_cache_enabled() {
-                        let mtime = std::fs::metadata(&path)
-                            .ok()
-                            .and_then(|m| get_metadata_mtime(&m));
-                        update_remote_cache_item(remote_url, auth_user, &rel_str, size, mtime);
-                    }
-                    log(&format!(
-                        "[{}/{}] Copied: {} ({} bytes){}\n",
-                        current_num, total_to_upload, rel_str, size, checksum_str
-                    ));
-                } else {
-                    log(&format!(
-                        "[{}/{}] ERROR: Failed to copy {}: HTTP {}\n",
-                        current_num, total_to_upload, rel_str, res.status()
-                    ));
-                }
+                return Ok(());
             }
+            let copied_count = match upload_files_concurrently(
+                client,
+                remote_url,
+                files_to_upload,
+                cancel_flag,
+                concurrency,
+                auth_user,
+                max_size,
+                with_checksum,
+                "Copied",
+                &mut log,
+            )? {
+                UploadOutcome::Completed(n) => n,
+                UploadOutcome::Canceled => {
+                    log("Operation canceled by user.\n");
+                    return Ok(());
+                }
+            };
             log(&format!(
                 "\nPut operation finished: {} file(s) copied, {} file(s) skipped (already up to date).\n",
                 copied_count, skipped_count
@@ -2114,54 +2280,25 @@ where
                 }
             }
 
-            let total_to_upload = files_to_upload.len();
-            let mut uploaded = 0;
             let max_size = get_max_file_size();
-            for (idx, (path, rel, size)) in files_to_upload.into_iter().enumerate() {
-                if cancel_flag.load(Ordering::SeqCst) {
+            let uploaded = match upload_files_concurrently(
+                client,
+                remote_url,
+                files_to_upload,
+                cancel_flag,
+                concurrency,
+                auth_user,
+                max_size,
+                false,
+                "Synced",
+                &mut log,
+            )? {
+                UploadOutcome::Completed(n) => n,
+                UploadOutcome::Canceled => {
                     log("Operation canceled by user.\n");
                     return Ok(());
                 }
-                let current_num = idx + 1;
-                if size > max_size {
-                    log(&format!(
-                        "[{}/{}] ERROR: File {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
-                        current_num, total_to_upload, rel, size, max_size
-                    ));
-                    continue;
-                }
-                let file_url = build_file_url(remote_url, &rel);
-                if let Err(e) = ensure_remote_parent_dirs(client, remote_url, &rel) {
-                    log(&format!(
-                        "[{}/{}] ERROR: Failed creating remote directory for {}: {}\n",
-                        current_num, total_to_upload, rel, e
-                    ));
-                    continue;
-                }
-                let file = match std::fs::File::open(&path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log(&format!(
-                            "[{}/{}] ERROR: Failed to open {}: {}\n",
-                            current_num, total_to_upload, path.display(), e
-                        ));
-                        continue;
-                    }
-                };
-                let res = client
-                    .put(file, &file_url)
-                    .map_err(|e| format!("Upload error: {}", e))?;
-                if res.status().is_success() {
-                    if is_cache_enabled() {
-                        let mtime = std::fs::metadata(&path)
-                            .ok()
-                            .and_then(|m| get_metadata_mtime(&m));
-                        update_remote_cache_item(remote_url, auth_user, &rel, size, mtime);
-                    }
-                    log(&format!("[{}/{}] Synced: {} ({} bytes)\n", current_num, total_to_upload, rel, size));
-                    uploaded += 1;
-                }
-            }
+            };
             let mut deleted = 0;
             for item in remote_items {
                 if item.is_dir {
