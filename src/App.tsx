@@ -44,6 +44,32 @@ function App() {
       });
   }, []);
 
+  // Webviews park focus on the first focusable control as soon as the window opens. That
+  // silently puts focus on "Upload (Local to Remote)" without a visible ring, so the first
+  // Tab press looks like it skips straight to "Download (Remote to Local)". Drop that
+  // startup focus — never focus the user moved themselves — so Tab starts at Upload.
+  useEffect(() => {
+    let userInteracted = false;
+    const markInteracted = () => {
+      userInteracted = true;
+    };
+    const dropStartupFocus = () => {
+      const active = document.activeElement;
+      if (!userInteracted && active instanceof HTMLElement && active !== document.body) {
+        active.blur();
+      }
+    };
+    document.addEventListener("focusin", dropStartupFocus, true);
+    window.addEventListener("keydown", markInteracted, true);
+    window.addEventListener("pointerdown", markInteracted, true);
+    dropStartupFocus();
+    return () => {
+      document.removeEventListener("focusin", dropStartupFocus, true);
+      window.removeEventListener("keydown", markInteracted, true);
+      window.removeEventListener("pointerdown", markInteracted, true);
+    };
+  }, []);
+
   useEffect(() => {
     const trimmed = selectedSubdir.trim();
     const title = trimmed
