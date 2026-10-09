@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRcloneExecution, type RcloneActionType } from "../hooks/useRcloneExecution";
 
 interface RcloneActionsProps {
@@ -25,12 +25,9 @@ const ACTIONS: ActionDef[] = [
 const ACTION_BUTTON_CLASS =
   "w-full bg-gray-800/25 border border-white/30 hover:border-white/70 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white";
 
-/** Halves of the split control: the wrapper owns the border and the shared divider. */
-const SPLIT_BUTTON_CLASS =
-  "w-full bg-gray-800/25 hover:bg-gray-800/40 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white";
-
 export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsProps) {
   const { runRclone, cancelCommand } = useRcloneExecution(onLog, isRunning, setIsRunning);
+  const [overwriteArmed, setOverwriteArmed] = useState(false);
   const uploadButtonRef = useRef<HTMLButtonElement>(null);
 
   // The webview starts sequential Tab navigation at the first control without ever
@@ -66,7 +63,18 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
 
   const runAction = (action: RcloneActionType) => {
     if (isRunning) return;
+    setOverwriteArmed(false);
     runRclone(action);
+  };
+
+  const handleOverwriteClick = () => {
+    if (isRunning) return;
+    if (!overwriteArmed) {
+      setOverwriteArmed(true);
+      return;
+    }
+    setOverwriteArmed(false);
+    runRclone("sync");
   };
 
   return (
@@ -86,24 +94,16 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
           </li>
         ))}
         <li className="p-0 text-center col-span-2">
-          <div className="grid grid-cols-2 border border-white/30 hover:border-white/70 divide-x divide-white/30 transition-all duration-150">
-            <button
-              type="button"
-              disabled={isRunning}
-              onClick={() => runAction("sync")}
-              className={SPLIT_BUTTON_CLASS}
-            >
-              Sync (Mirror Local to Remote)
-            </button>
-            <button
-              type="button"
-              disabled={isRunning}
-              onClick={() => runAction("get-backup")}
-              className={SPLIT_BUTTON_CLASS}
-            >
-              Backup Download (Remote to backups/)
-            </button>
-          </div>
+          <button
+            type="button"
+            disabled={isRunning}
+            onClick={handleOverwriteClick}
+            className={ACTION_BUTTON_CLASS}
+          >
+            {overwriteArmed
+              ? "Overwrite will DELETE remote files missing locally. Press again to confirm."
+              : "Overwrite remote"}
+          </button>
         </li>
       </ul>
       {isRunning && (
