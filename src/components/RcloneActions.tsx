@@ -93,16 +93,14 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
             </button>
           </li>
         ))}
-        <li className="p-0 text-center col-span-2">
+        <li className="p-0 text-center">
           <button
             type="button"
             disabled={isRunning}
             onClick={handleOverwriteClick}
             className={ACTION_BUTTON_CLASS}
           >
-            {overwriteArmed
-              ? "Overwrite will DELETE remote files missing locally. Press again to confirm."
-              : "Overwrite remote"}
+            {overwriteArmed ? "Press again to confirm overwrite" : "Overwrite remote"}
           </button>
         </li>
       </ul>
