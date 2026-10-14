@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::error::Error as StdError;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
 /// Default concurrency level for remote Depth: 1 folder scanning.
@@ -14,10 +15,16 @@ pub const MAX_SCAN_CONCURRENCY: usize = 64;
 /// Set to 10,000 to comfortably accommodate very large course hierarchies (typical max depth ~10 * breadth ~100)
 /// while bounding memory usage and avoiding infinite traversal cycles.
 pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
-/// Maximum attempts for each remote directory listing request before the scan fails.
-/// Retrying absorbs transient transport errors (timeouts, connection resets) so a single
-/// flaky request does not abort the entire recursive scan.
-pub const LIST_MAX_ATTEMPTS: u32 = 3;
+/// Default number of attempts for a single WebDAV request before it is treated as failed.
+/// Retrying absorbs transient transport failures (timeouts, connection resets, truncated
+/// bodies) so one flaky request cannot abort an entire multi-file transfer.
+pub const REQUEST_MAX_ATTEMPTS: u32 = 3;
+/// Base delay before the first retry; each subsequent retry multiplies it by the attempt number.
+pub const RETRY_BASE_DELAY_MS: u64 = 1_000;
+/// Upper bound for a single retry delay.
+pub const RETRY_MAX_DELAY_MS: u64 = 10_000;
+/// Retry delay used by production call sites; unit tests pass [`Duration::ZERO`] instead.
+const RETRY_DELAY: Duration = Duration::from_millis(RETRY_BASE_DELAY_MS);
 
 // Static compile-time assertion verifying that rustydav::client::Client implements Send + Sync
 // and can safely be shared across concurrent scanning worker threads.
@@ -27,6 +34,167 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<rustydav::client::Client>();
 };
+
+/// Classification of a single WebDAV request attempt, used to decide whether a retry is worth it.
+enum AttemptError {
+    /// Transport-level failure (timeout, connection reset, truncated body) that is safe to retry.
+    Transient(String),
+    /// Deterministic failure (bad credentials, forbidden, local disk error) that a retry cannot fix.
+    Fatal(String),
+}
+
+/// Formats a reqwest transport error with its full source chain and a retry classification,
+/// then labels it transient or fatal.
+fn classify_reqwest_error(context: &str, error: &rustydav::prelude::Error) -> AttemptError {
+    let mut detail = format!("{context}: {error}");
+    if let Some(url) = error.url() {
+        detail.push_str(&format!("\n    url: {url}"));
+    }
+    if let Some(status) = error.status() {
+        detail.push_str(&format!("\n    http status: {status}"));
+    }
+    detail.push_str(&format!(
+        "\n    flags: timeout={} connect={} request={} body={} decode={}",
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_request(),
+        error.is_body(),
+        error.is_decode(),
+    ));
+    let mut source = StdError::source(error);
+    let mut depth = 0;
+    while let Some(cause) = source {
+        detail.push_str(&format!("\n    caused by[{depth}]: {cause}"));
+        source = cause.source();
+        depth += 1;
+    }
+    let transient =
+        error.is_timeout() || error.is_connect() || error.is_request() || error.is_body();
+    if transient {
+        AttemptError::Transient(detail)
+    } else {
+        AttemptError::Fatal(detail)
+    }
+}
+
+/// Formats an I/O error raised while streaming a response body. When the error wraps a reqwest
+/// failure (as `reqwest::blocking::Response` does) its transport classification wins, so a
+/// mid-download timeout is retried instead of being mistaken for a local disk failure.
+fn classify_io_error(context: &str, error: &std::io::Error) -> AttemptError {
+    if let Some(inner) = error.get_ref() {
+        if let Some(reqwest_error) = inner.downcast_ref::<rustydav::prelude::Error>() {
+            return classify_reqwest_error(context, reqwest_error);
+        }
+    }
+    let detail = format!("{context}: {error}");
+    let transient = matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    );
+    if transient {
+        AttemptError::Transient(detail)
+    } else {
+        AttemptError::Fatal(detail)
+    }
+}
+
+/// Returns the delay before retry number `attempt` (1-based): 1x, 2x, 3x ... the base delay, capped.
+fn retry_delay(attempt: u32, base: Duration) -> Duration {
+    let millis = base
+        .as_millis()
+        .saturating_mul(u128::from(attempt.max(1)))
+        .min(u128::from(RETRY_MAX_DELAY_MS));
+    Duration::from_millis(millis as u64)
+}
+
+/// Sleeps for `total`, waking every 100 ms so a cancel request is honored promptly.
+fn sleep_cancellable(total: Duration, cancel_flag: &AtomicBool) {
+    let step = Duration::from_millis(100);
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return;
+        }
+        let slice = remaining.min(step);
+        std::thread::sleep(slice);
+        remaining = remaining.saturating_sub(slice);
+    }
+}
+
+/// Runs one WebDAV operation with bounded retries and verbose per-attempt diagnostics.
+///
+/// Only transport-level [`AttemptError::Transient`] failures are retried (timeouts, connection
+/// resets, truncated bodies); permanent failures return immediately. When every attempt is
+/// exhausted the last failure is returned as `Err` so the caller can decide whether to skip the
+/// item and keep going or fail the whole action.
+fn retry_webdav_operation<T, F, L>(
+    operation: &str,
+    cancel_flag: &AtomicBool,
+    max_attempts: u32,
+    base_delay: Duration,
+    mut log: L,
+    mut attempt_op: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Result<T, AttemptError>,
+    L: FnMut(&str),
+{
+    let max_attempts = max_attempts.max(1);
+    let mut last_failure = String::new();
+    for attempt in 1..=max_attempts {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Err("Operation canceled by user.".to_string());
+        }
+        let started = Instant::now();
+        match attempt_op() {
+            Ok(value) => {
+                if attempt > 1 {
+                    log(&format!(
+                        "[webdav] {operation}: recovered on attempt {attempt}/{max_attempts} after {:?}.\n",
+                        started.elapsed()
+                    ));
+                }
+                return Ok(value);
+            }
+            Err(AttemptError::Fatal(detail)) => {
+                log(&format!(
+                    "[webdav] {operation}: attempt {attempt}/{max_attempts} failed permanently after {:?}; not retrying.\n{detail}\n",
+                    started.elapsed()
+                ));
+                return Err(detail);
+            }
+            Err(AttemptError::Transient(detail)) => {
+                log(&format!(
+                    "[webdav] {operation}: attempt {attempt}/{max_attempts} hit a transient transport failure after {:?}.\n{detail}\n",
+                    started.elapsed()
+                ));
+                last_failure = detail;
+                if attempt == max_attempts {
+                    break;
+                }
+                let delay = retry_delay(attempt, base_delay);
+                log(&format!(
+                    "[webdav] {operation}: retrying in {delay:?} (attempt {}/{max_attempts})...\n",
+                    attempt + 1
+                ));
+                sleep_cancellable(delay, cancel_flag);
+                if cancel_flag.load(Ordering::SeqCst) {
+                    return Err("Operation canceled by user.".to_string());
+                }
+            }
+        }
+    }
+    log(&format!(
+        "[webdav] {operation}: giving up after {max_attempts} attempt(s).\n"
+    ));
+    Err(last_failure)
+}
 
 /// Returns the concurrency limit for remote WebDAV folder scanning.
 pub fn get_scan_concurrency() -> usize {
@@ -918,10 +1086,16 @@ pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Resu
 }
 
 /// Ensures all parent collections exist for a relative file path prior to PUT.
-pub fn ensure_remote_parent_dirs(
+///
+/// Each MKCOL is retried on transient transport failures; the streamed logs describe every
+/// attempt. A failure that survives all retries is returned to the caller, which logs it and
+/// skips only the affected file.
+pub fn ensure_remote_parent_dirs<L: FnMut(&str)>(
     client: &rustydav::client::Client,
     remote_url: &str,
     rel_path: &str,
+    cancel_flag: &AtomicBool,
+    log: &mut L,
 ) -> Result<(), String> {
     validate_webdav_url(remote_url)?;
 
@@ -929,16 +1103,30 @@ pub fn ensure_remote_parent_dirs(
         return Err(format!("Unsafe relative path rejected: {}", rel_path));
     }
 
-    let res = client.mkcol(remote_url);
-    if let Ok(r) = res {
-        let status = r.status().as_u16();
-        if status != 201 && status != 405 && status != 200 && status != 301 && status != 302 {
-            if status == 401 || status == 403 {
-                return Err(format!("MKCOL failed for {}: HTTP {}", remote_url, status));
+    let res = retry_webdav_operation(
+        &format!("MKCOL {remote_url}"),
+        cancel_flag,
+        REQUEST_MAX_ATTEMPTS,
+        RETRY_DELAY,
+        &mut *log,
+        || {
+            client
+                .mkcol(remote_url)
+                .map_err(|e| classify_reqwest_error(&format!("MKCOL {remote_url}"), &e))
+        },
+    );
+    match res {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            if status != 201 && status != 405 && status != 200 && status != 301 && status != 302 {
+                if status == 401 || status == 403 {
+                    return Err(format!("MKCOL failed for {}: HTTP {}", remote_url, status));
+                }
             }
         }
-    } else if let Err(e) = res {
-        return Err(format!("MKCOL network error for {}: {}", remote_url, e));
+        Err(e) => {
+            return Err(format!("MKCOL failed for {}: {}", remote_url, e));
+        }
     }
 
     let parts: Vec<&str> = rel_path.split('/').collect();
@@ -952,9 +1140,19 @@ pub fn ensure_remote_parent_dirs(
         }
         current_rel.push_str(part);
         let dir_url = format!("{}/", build_file_url(remote_url, &current_rel));
-        let res = client
-            .mkcol(&dir_url)
-            .map_err(|e| format!("Failed to create folder {}: {}", dir_url, e))?;
+        let res = retry_webdav_operation(
+            &format!("MKCOL {dir_url}"),
+            cancel_flag,
+            REQUEST_MAX_ATTEMPTS,
+            RETRY_DELAY,
+            &mut *log,
+            || {
+                client
+                    .mkcol(&dir_url)
+                    .map_err(|e| classify_reqwest_error(&format!("MKCOL {dir_url}"), &e))
+            },
+        )
+        .map_err(|e| format!("Failed to create folder {}: {}", dir_url, e))?;
         let status = res.status().as_u16();
         if status != 201 && status != 405 && status != 200 && status != 301 && status != 302 {
             if status == 401 || status == 403 {
@@ -1060,7 +1258,19 @@ where
         "Querying remote server with Depth: infinity for {}...\n",
         remote_url
     ));
-    match client.list(remote_url, "infinity") {
+    let infinity_result = retry_webdav_operation(
+        &format!("PROPFIND Depth: infinity {remote_url}"),
+        cancel_flag,
+        REQUEST_MAX_ATTEMPTS,
+        RETRY_DELAY,
+        &mut log,
+        || {
+            client.list(remote_url, "infinity").map_err(|e| {
+                classify_reqwest_error(&format!("PROPFIND Depth: infinity {remote_url}"), &e)
+            })
+        },
+    );
+    match infinity_result {
         Ok(res) => {
             let status = res.status();
             if status.is_success() || status.as_u16() == 207 {
@@ -1091,8 +1301,11 @@ where
             }
         }
         Err(e) => {
+            if cancel_flag.load(Ordering::SeqCst) {
+                return Err("Operation canceled by user.".to_string());
+            }
             log(&format!(
-                "Depth: infinity request failed ({}). Falling back to Depth: 1 traversal...\n",
+                "Depth: infinity request failed after retries ({}). Falling back to Depth: 1 traversal...\n",
                 e
             ));
         }
@@ -1122,6 +1335,8 @@ where
         seen_items: HashSet<(bool, String)>,
         all_items: Vec<WebdavItem>,
         scanned_count: usize,
+        /// Directories whose listing kept failing after every retry and were skipped.
+        skipped_dirs: Vec<String>,
         error: Option<String>,
         stopped: bool,
     }
@@ -1219,6 +1434,7 @@ where
         seen_items: HashSet::new(),
         all_items: Vec::new(),
         scanned_count: 0,
+        skipped_dirs: Vec::new(),
         error: None,
         stopped: false,
     });
@@ -1264,24 +1480,23 @@ where
                             return;
                         }
 
-                        let mut list_res = client.list(&current_url, "1");
-                        for attempt in 2..=LIST_MAX_ATTEMPTS {
-                            let last_err = match &list_res {
-                                Ok(_) => break,
-                                Err(e) => e,
-                            };
-                            if cancel_flag.load(Ordering::SeqCst) {
-                                let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                                state.stopped = true;
-                                return;
-                            }
-                            let _ = worker_log_tx.send(format!(
-                                "List request for {} failed ({}); retrying (attempt {}/{})...\n",
-                                current_url, last_err, attempt, LIST_MAX_ATTEMPTS
-                            ));
-                            std::thread::sleep(Duration::from_secs(u64::from(attempt - 1)));
-                            list_res = client.list(&current_url, "1");
-                        }
+                        let list_res = retry_webdav_operation(
+                            &format!("PROPFIND Depth: 1 {current_url}"),
+                            cancel_flag,
+                            REQUEST_MAX_ATTEMPTS,
+                            RETRY_DELAY,
+                            |msg: &str| {
+                                let _ = worker_log_tx.send(msg.to_string());
+                            },
+                            || {
+                                client.list(&current_url, "1").map_err(|e| {
+                                    classify_reqwest_error(
+                                        &format!("PROPFIND Depth: 1 {current_url}"),
+                                        &e,
+                                    )
+                                })
+                            },
+                        );
 
                         // Check cancellation immediately after blocking network I/O returns to abort before parsing response body
                         if cancel_flag.load(Ordering::SeqCst) {
@@ -1293,13 +1508,28 @@ where
                         let res = match list_res {
                             Ok(r) => r,
                             Err(e) => {
-                                let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                                state.error = Some(format!(
-                                    "List request failed for {} after {} attempt(s): {}",
-                                    current_url, LIST_MAX_ATTEMPTS, e
+                                if scan_idx == 1 {
+                                    // Without the root listing there is nothing to traverse, so the
+                                    // scan still fails — but only after every retry has been spent.
+                                    let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                                    state.error = Some(format!(
+                                        "Root listing failed for {}: {}",
+                                        remote_url, e
+                                    ));
+                                    state.stopped = true;
+                                    return;
+                                }
+                                // A flaky subfolder must not abort the whole scan: record it, warn
+                                // loudly, and let the remaining workers finish the traversal.
+                                {
+                                    let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                                    state.skipped_dirs.push(current_url.clone());
+                                }
+                                let _ = worker_log_tx.send(format!(
+                                    "[{}] WARNING: giving up on {}; skipping this directory and continuing the scan. Files inside it are missing from this listing.\n",
+                                    scan_idx, display_folder
                                 ));
-                                state.stopped = true;
-                                return;
+                                continue;
                             }
                         };
 
@@ -1438,6 +1668,16 @@ where
 
     if use_cache && is_cache_enabled() {
         save_remote_cache(remote_url, auth_user, &state.all_items);
+    }
+
+    if !state.skipped_dirs.is_empty() {
+        log(&format!(
+            "\nWARNING: {} director(ies) could not be listed and were skipped; files inside them are absent from this listing (see the [webdav] log above for the failed requests):\n",
+            state.skipped_dirs.len()
+        ));
+        for dir in &state.skipped_dirs {
+            log(&format!("  - {}\n", dir));
+        }
     }
 
     let file_count = state.all_items.iter().filter(|i| !i.is_dir).count();
@@ -1629,8 +1869,8 @@ enum UploadOutcome {
 ///   `update_remote_cache_item` performs a read-modify-write of the cache file.
 ///
 /// Error semantics match the former sequential loop: per-file failures (oversize,
-/// MKCOL, open, non-2xx status) are logged and skipped, while a transport-level
-/// PUT failure aborts the whole batch with `Err`.
+/// MKCOL, open, non-2xx status, and transport failures that survive every retry)
+/// are logged and skipped, while a worker panic still aborts the batch with `Err`.
 fn upload_files_concurrently<F>(
     client: &rustydav::client::Client,
     remote_url: &str,
@@ -1699,23 +1939,21 @@ where
                             "[{}/{}] Uploading: {} ({} bytes)...\n",
                             current_num, total, rel_str, size
                         ));
-                        if let Err(e) = ensure_remote_parent_dirs(client, remote_url, rel_str) {
+                        if let Err(e) = ensure_remote_parent_dirs(
+                            client,
+                            remote_url,
+                            rel_str,
+                            cancel_flag,
+                            &mut |msg: &str| {
+                                let _ = worker_log_tx.send(msg.to_string());
+                            },
+                        ) {
                             let _ = worker_log_tx.send(format!(
                                 "[{}/{}] ERROR: Failed creating remote directory for {}: {}\n",
                                 current_num, total, rel_str, e
                             ));
                             continue;
                         }
-                        let file = match std::fs::File::open(path) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                let _ = worker_log_tx.send(format!(
-                                    "[{}/{}] ERROR: Failed to open {}: {}\n",
-                                    current_num, total, path.display(), e
-                                ));
-                                continue;
-                            }
-                        };
                         let checksum_str = if with_checksum {
                             match compute_file_sha256(path) {
                                 Ok(hash) => format!(" (sha256: {})", hash),
@@ -1724,19 +1962,41 @@ where
                         } else {
                             String::new()
                         };
-                        let res = match client.put(file, &file_url) {
+                        let put_result = retry_webdav_operation(
+                            &format!("PUT {file_url}"),
+                            cancel_flag,
+                            REQUEST_MAX_ATTEMPTS,
+                            RETRY_DELAY,
+                            |msg: &str| {
+                                let _ = worker_log_tx.send(msg.to_string());
+                            },
+                            || {
+                                // PUT consumes the handle, so each attempt opens the file afresh.
+                                let file = std::fs::File::open(path).map_err(|e| {
+                                    AttemptError::Fatal(format!(
+                                        "Failed to open {}: {}",
+                                        path.display(),
+                                        e
+                                    ))
+                                })?;
+                                client.put(file, &file_url).map_err(|e| {
+                                    classify_reqwest_error(&format!("PUT {file_url}"), &e)
+                                })
+                            },
+                        );
+                        let res = match put_result {
                             Ok(r) => r,
                             Err(e) => {
-                                let mut err_slot =
-                                    error_ref.lock().unwrap_or_else(|p| p.into_inner());
-                                if err_slot.is_none() {
-                                    *err_slot = Some(format!(
-                                        "Upload failed for {}: {}",
-                                        rel_str, e
-                                    ));
+                                if cancel_flag.load(Ordering::SeqCst) {
+                                    return;
                                 }
-                                stop_ref.store(true, Ordering::SeqCst);
-                                return;
+                                // The file had every retry and still failed; skip it and keep
+                                // uploading the rest of the batch.
+                                let _ = worker_log_tx.send(format!(
+                                    "[{}/{}] ERROR: Upload failed for {}: {}\n",
+                                    current_num, total, rel_str, e
+                                ));
+                                continue;
                             }
                         };
                         if res.status().is_success() {
@@ -1864,9 +2124,18 @@ where
         }
         "lsd" => {
             log(&format!("Listing remote directories in {}...\n", remote_url));
-            let res = client
-                .list(remote_url, "1")
-                .map_err(|e| format!("List request failed: {}", e))?;
+            let res = retry_webdav_operation(
+                &format!("PROPFIND Depth: 1 {remote_url}"),
+                cancel_flag,
+                REQUEST_MAX_ATTEMPTS,
+                RETRY_DELAY,
+                &mut log,
+                || {
+                    client.list(remote_url, "1").map_err(|e| {
+                        classify_reqwest_error(&format!("PROPFIND Depth: 1 {remote_url}"), &e)
+                    })
+                },
+            )?;
             if !res.status().is_success() && res.status().as_u16() != 207 {
                 return Err(format!("Server returned HTTP {}", res.status()));
             }
@@ -2116,35 +2385,73 @@ where
                     }
                 }
                 let download_url = resolve_item_url(remote_url, &item.href);
-                let get_res = client
-                    .get(&download_url)
-                    .map_err(|e| format!("Download failed for {}: {}", rel, e))?;
-                if !get_res.status().is_success() {
-                    log(&format!(
-                        "[{}/{}] ERROR: Failed to download {}: HTTP {}\n",
-                        current_num,
-                        total_files,
-                        rel,
-                        get_res.status()
-                    ));
-                    continue;
-                }
-
-                let mut dest_file = std::fs::File::create(&target_file)
-                    .map_err(|e| format!("Failed to create {}: {}", target_file.display(), e))?;
-                let mut limited_reader = std::io::Read::take(get_res, max_size + 1);
-                let downloaded_len = std::io::copy(&mut limited_reader, &mut dest_file)
-                    .map_err(|e| format!("Failed to write {}: {}", target_file.display(), e))?;
-
-                if downloaded_len > max_size {
-                    drop(dest_file);
-                    let _ = std::fs::remove_file(&target_file);
-                    log(&format!(
-                        "[{}/{}] ERROR: Downloaded file {} exceeded maximum limit ({} bytes), deleted.\n",
-                        current_num, total_files, rel, max_size
-                    ));
-                    continue;
-                }
+                let download_result = retry_webdav_operation(
+                    &format!("GET {download_url}"),
+                    cancel_flag,
+                    REQUEST_MAX_ATTEMPTS,
+                    RETRY_DELAY,
+                    &mut log,
+                    || {
+                        let get_res = client.get(&download_url).map_err(|e| {
+                            classify_reqwest_error(&format!("GET {download_url}"), &e)
+                        })?;
+                        let status = get_res.status();
+                        if !status.is_success() {
+                            return Err(AttemptError::Fatal(format!(
+                                "GET {download_url} returned HTTP {status}"
+                            )));
+                        }
+                        // Recreate the file on every attempt so a retried download never appends
+                        // to bytes left behind by a timed-out body stream.
+                        let mut dest_file = std::fs::File::create(&target_file).map_err(|e| {
+                            AttemptError::Fatal(format!(
+                                "Failed to create {}: {}",
+                                target_file.display(),
+                                e
+                            ))
+                        })?;
+                        let mut limited_reader = std::io::Read::take(get_res, max_size + 1);
+                        let written =
+                            std::io::copy(&mut limited_reader, &mut dest_file).map_err(|e| {
+                                classify_io_error(&format!("streaming GET {download_url}"), &e)
+                            })?;
+                        if written > max_size {
+                            drop(dest_file);
+                            let _ = std::fs::remove_file(&target_file);
+                            return Err(AttemptError::Fatal(format!(
+                                "Downloaded file exceeded the maximum size limit ({} bytes > {} bytes)",
+                                written, max_size
+                            )));
+                        }
+                        Ok(written)
+                    },
+                );
+                let downloaded_len = match download_result {
+                    Ok(len) => len,
+                    Err(e) => {
+                        // Never leave a truncated partial behind after the final attempt.
+                        if let Err(remove_err) = std::fs::remove_file(&target_file) {
+                            if remove_err.kind() != std::io::ErrorKind::NotFound {
+                                log(&format!(
+                                    "[{}/{}] WARNING: Could not remove partial download {}: {}\n",
+                                    current_num,
+                                    total_files,
+                                    target_file.display(),
+                                    remove_err
+                                ));
+                            }
+                        }
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            log("Operation canceled by user.\n");
+                            return Ok(());
+                        }
+                        log(&format!(
+                            "[{}/{}] ERROR: Download failed for {}: {}\n",
+                            current_num, total_files, rel, e
+                        ));
+                        continue;
+                    }
+                };
 
                 if let Some(mtime_sec) = item.mtime {
                     match std::fs::File::options().write(true).open(&target_file) {
@@ -2311,13 +2618,36 @@ where
                         return Ok(());
                     }
                     let file_url = resolve_item_url(remote_url, &item.href);
-                    let del_res = client.delete(&file_url);
-                    if del_res.is_ok() {
-                        if is_cache_enabled() {
-                            remove_remote_cache_item(remote_url, auth_user, &rel);
+                    let del_res = retry_webdav_operation(
+                        &format!("DELETE {file_url}"),
+                        cancel_flag,
+                        REQUEST_MAX_ATTEMPTS,
+                        RETRY_DELAY,
+                        &mut log,
+                        || {
+                            client.delete(&file_url).map_err(|e| {
+                                classify_reqwest_error(&format!("DELETE {file_url}"), &e)
+                            })
+                        },
+                    );
+                    match del_res {
+                        Ok(_) => {
+                            if is_cache_enabled() {
+                                remove_remote_cache_item(remote_url, auth_user, &rel);
+                            }
+                            log(&format!("Deleted remote file not in local: {}\n", rel));
+                            deleted += 1;
                         }
-                        log(&format!("Deleted remote file not in local: {}\n", rel));
-                        deleted += 1;
+                        Err(e) => {
+                            if cancel_flag.load(Ordering::SeqCst) {
+                                log("Operation canceled by user.\n");
+                                return Ok(());
+                            }
+                            log(&format!(
+                                "ERROR: Failed to delete remote file {}: {}\n",
+                                rel, e
+                            ));
+                        }
                     }
                 }
             }
@@ -2334,6 +2664,123 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_retry_delay_grows_and_caps() {
+        let base = Duration::from_millis(100);
+        assert_eq!(retry_delay(1, base), Duration::from_millis(100));
+        assert_eq!(retry_delay(2, base), Duration::from_millis(200));
+        assert_eq!(retry_delay(3, base), Duration::from_millis(300));
+        assert_eq!(retry_delay(0, base), Duration::from_millis(100));
+        assert_eq!(
+            retry_delay(10_000, base),
+            Duration::from_millis(RETRY_MAX_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn test_retry_operation_recovers_from_transient_failures() {
+        let cancel = AtomicBool::new(false);
+        let attempts = std::cell::Cell::new(0u32);
+        let mut logs = String::new();
+        let result = retry_webdav_operation(
+            "PUT https://example.test/file.txt",
+            &cancel,
+            3,
+            Duration::ZERO,
+            |msg: &str| logs.push_str(msg),
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err(AttemptError::Transient("operation timed out".to_string()))
+                } else {
+                    Ok("uploaded")
+                }
+            },
+        );
+        assert_eq!(result, Ok("uploaded"));
+        assert_eq!(attempts.get(), 3);
+        assert!(logs.contains("attempt 1/3 hit a transient transport failure"));
+        assert!(logs.contains("recovered on attempt 3/3"));
+    }
+
+    #[test]
+    fn test_retry_operation_does_not_retry_permanent_failures() {
+        let cancel = AtomicBool::new(false);
+        let attempts = std::cell::Cell::new(0u32);
+        let result: Result<(), String> = retry_webdav_operation(
+            "MKCOL https://example.test/dir",
+            &cancel,
+            3,
+            Duration::ZERO,
+            |_| {},
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(AttemptError::Fatal("HTTP 403 Forbidden".to_string()))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn test_retry_operation_gives_up_after_max_attempts() {
+        let cancel = AtomicBool::new(false);
+        let attempts = std::cell::Cell::new(0u32);
+        let mut logs = String::new();
+        let result: Result<(), String> = retry_webdav_operation(
+            "GET https://example.test/file.bin",
+            &cancel,
+            2,
+            Duration::ZERO,
+            |msg: &str| logs.push_str(msg),
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(AttemptError::Transient("connection reset".to_string()))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 2);
+        assert!(logs.contains("giving up after 2 attempt(s)"));
+    }
+
+    #[test]
+    fn test_retry_operation_honors_cancellation_before_first_attempt() {
+        let cancel = AtomicBool::new(true);
+        let attempts = std::cell::Cell::new(0u32);
+        let result: Result<(), String> = retry_webdav_operation(
+            "GET https://example.test/file.bin",
+            &cancel,
+            5,
+            Duration::ZERO,
+            |_| {},
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err("Operation canceled by user.".to_string()));
+        assert_eq!(attempts.get(), 0);
+    }
+
+    #[test]
+    fn test_classify_io_error_retries_network_kinds_only() {
+        let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "socket timed out");
+        assert!(matches!(
+            classify_io_error("streaming GET x", &timed_out),
+            AttemptError::Transient(_)
+        ));
+        let truncated = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "body truncated");
+        assert!(matches!(
+            classify_io_error("streaming GET x", &truncated),
+            AttemptError::Transient(_)
+        ));
+        let disk_full = std::io::Error::new(std::io::ErrorKind::Other, "No space left on device");
+        assert!(matches!(
+            classify_io_error("streaming GET x", &disk_full),
+            AttemptError::Fatal(_)
+        ));
+    }
 
     #[test]
     fn test_parse_propfind() {
