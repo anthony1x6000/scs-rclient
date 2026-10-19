@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useRcloneExecution, type RcloneActionType } from "../hooks/useRcloneExecution";
 
 interface RcloneActionsProps {
@@ -33,14 +34,30 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
   // The webview starts sequential Tab navigation at the first control without ever
   // focusing it in the DOM, so the first Tab press lands on Download, not Upload
   // (blurring activeElement cannot fix this — the parked position is not DOM focus).
-  // Instead, grab the first bare Tab press before any user interaction and focus
-  // Upload explicitly. Any other key or pointer input disarms the shim, so normal
-  // tabbing is untouched afterwards.
+  // Instead, grab the first bare Tab press and focus Upload explicitly.
+  //
+  // That shim must also cover coming back to the window: the webview keeps the last
+  // clicked control as the Tab origin, so restoring from the taskbar resumed after
+  // whatever was clicked before. Re-arm and drop the stale control whenever the window
+  // loses focus or is minimized/hidden, making every refocus start from Upload again.
+  // A fresh pointer interaction disarms it so the user's new click becomes the origin.
   useEffect(() => {
     let armed = true;
+    let disposed = false;
+    let unlistenBlur: (() => void) | undefined;
+
+    const resetForRefocus = () => {
+      armed = true;
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && active !== document.body) {
+        active.blur();
+      }
+    };
+
     const disarm = () => {
       armed = false;
     };
+
     const onKeyDown = (e: KeyboardEvent) => {
       if (!armed) return;
       if (e.key !== "Tab" || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) {
@@ -53,9 +70,36 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
       e.preventDefault();
       upload.focus();
     };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible") resetForRefocus();
+    };
+
+    // The native window event is the reliable signal for "the app went away" on
+    // WebView2/WebKitGTK; the DOM events cover browsers and webviews that forward them.
+    try {
+      void getCurrentWindow()
+        .onFocusChanged(({ payload: focused }) => {
+          if (!focused) resetForRefocus();
+        })
+        .then((unlisten) => {
+          if (disposed) unlisten();
+          else unlistenBlur = unlisten;
+        })
+        .catch(() => {});
+    } catch {
+      // No Tauri runtime (plain browser); the DOM listeners below still apply.
+    }
+
+    window.addEventListener("blur", resetForRefocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
     window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("pointerdown", disarm, true);
     return () => {
+      disposed = true;
+      unlistenBlur?.();
+      window.removeEventListener("blur", resetForRefocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("keydown", onKeyDown, true);
       window.removeEventListener("pointerdown", disarm, true);
     };
