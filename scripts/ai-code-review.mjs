@@ -6,9 +6,9 @@ import { execSync } from "node:child_process";
 
 const action = process.argv[2];
 
-// Reviewer fleet, shared with socsdocs. Every workflow reads the same list, so
-// the models, their endpoints, and the secret each one needs are data in one
-// file instead of a curl block forked into each workflow.
+// Reviewer fleet. Every workflow reads the same list, so the models, their
+// endpoints, and the secret each one needs are data in one file instead of a
+// curl block forked into each workflow.
 const MODELS_FILE = process.env.AI_MODELS_FILE || ".github/ai-review-models.json";
 const REVIEW_USER_AGENT = "scs-rclient-ai-review/1.0";
 const OPENCODE_SESSION = "cicd-ai-review/1.0";
@@ -155,198 +155,151 @@ function perProviderPath(template, id) {
   return path.join(path.dirname(template), `${path.basename(template, ext)}.${id}${ext}`);
 }
 
-async function checkFailures() {
-  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-  const repo = process.env.REPO || process.env.GITHUB_REPOSITORY;
-  const headSha = process.env.HEAD_SHA || process.env.GITHUB_SHA;
-  const currentRunId = process.env.CURRENT_RUN_ID || process.env.GITHUB_RUN_ID;
-
-  if (!token || !repo || !headSha) {
-    console.error("missing required environment variables for check-failures (GITHUB_TOKEN, REPO, HEAD_SHA).");
-    process.exit(1);
+// The pull request check workflows whose completion the reviewers wait for.
+// The list is data in the workflow, not here, because the trigger list and the
+// gate have to stay identical: a workflow whose completion does not start this
+// workflow must not be waited on either, or the wait never ends.
+function gateWorkflowNames() {
+  const names = (process.env.GATE_WORKFLOWS || "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  if (names.length === 0) {
+    console.error("GATE_WORKFLOWS is empty; set it to the comma-separated workflow names this run waits for.");
+    process.exit(2);
   }
-
-  let res;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      res = await fetch(`https://api.github.com/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "scs-rclient-ai-review"
-        }
-      });
-      if (res.ok) break;
-    } catch (err) {
-      if (attempt === 3) {
-        console.error(`failed to query sibling check-runs after 3 attempts: ${err.message}`);
-        process.exit(1);
-      }
-      await new Promise((r) => setTimeout(r, 1000 * attempt));
-    }
-  }
-
-  if (!res || !res.ok) {
-    console.error(`github api check-runs returned status ${res?.status || "unknown"}`);
-    process.exit(1);
-  }
-
-  const body = await res.json();
-  const checkRuns = body.check_runs || [];
-  const failed = checkRuns.filter(
-    (r) =>
-      r.status === "completed" &&
-      ["failure", "timed_out", "cancelled", "action_required"].includes(r.conclusion) &&
-      (!currentRunId || (String(r.id) !== String(currentRunId) && String(r.run_id) !== String(currentRunId)))
-  );
-  if (failed.length > 0) {
-    console.error(`sibling check(s) already failed on commit ${headSha}: ${failed.map((f) => f.name).join(", ")}. skipping review.`);
-    process.exit(1);
-  }
-  process.exit(0);
+  return names;
 }
 
-async function waitChecks() {
+// Conclusions that are not failures. `skipped` passes: a workflow whose jobs
+// all skipped still reported, and it gates nothing on this commit.
+const GATE_PASSING_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
+
+// One snapshot, never a loop. This workflow is started by the completion of the
+// workflows below, so "still running" is a complete answer: this run ends and
+// the next completion starts another one. Nothing holds a runner while waiting,
+// which is the whole point; the poll loop this replaced occupied a self-hosted
+// runner for up to fifteen minutes and could deadlock against the very checks
+// it was waiting for.
+async function classifyGate() {
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   const repo = process.env.REPO || process.env.GITHUB_REPOSITORY;
   const headSha = process.env.HEAD_SHA || process.env.GITHUB_SHA;
-  const currentRunId = process.env.CURRENT_RUN_ID || process.env.GITHUB_RUN_ID;
-  const waitForSecurity = process.env.WAIT_FOR_SECURITY === "true";
 
   if (!token || !repo || !headSha) {
     console.error("missing required environment variables (GITHUB_TOKEN, REPO, HEAD_SHA).");
+    process.exit(2);
+  }
+
+  const watched = gateWorkflowNames();
+  const watchedNames = new Set(watched);
+
+  // Latest run per watched workflow on this commit. Only pull_request runs
+  // count: a manual dispatch of the same workflow on this branch is not a gate,
+  // and a re-run supersedes the attempt it replaces.
+  const latest = new Map();
+  for (let page = 1; page <= 5; page++) {
+    let runs = [];
+    try {
+      const res = await fetch(
+        `https://api.github.com/repos/${repo}/actions/runs?head_sha=${headSha}&per_page=100&page=${page}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "User-Agent": "scs-rclient-ai-review"
+          }
+        }
+      );
+      if (!res.ok) {
+        // Fail closed: a gate that cannot read the checks must not review or
+        // merge over checks it never saw.
+        console.error(`github api workflow runs query returned ${res.status}.`);
+        process.exit(2);
+      }
+      const body = await res.json();
+      runs = body.workflow_runs || [];
+    } catch (err) {
+      console.error(`failed to fetch workflow runs: ${err.message}.`);
+      process.exit(2);
+    }
+
+    for (const run of runs) {
+      if (run.event !== "pull_request") continue;
+      if (!watchedNames.has(run.name)) continue;
+      const seen = latest.get(run.name);
+      if (!seen || (run.run_number || 0) > (seen.run_number || 0)) {
+        latest.set(run.name, run);
+      }
+    }
+
+    if (runs.length < 100) break;
+  }
+
+  const passed = [];
+  const pending = [];
+  const failed = [];
+  for (const name of watched) {
+    const run = latest.get(name);
+    // A workflow that never ran for this commit was filtered out by its own
+    // paths trigger, so it was never a gate for it.
+    if (!run) continue;
+    if (run.status !== "completed") {
+      pending.push(name);
+    } else if (GATE_PASSING_CONCLUSIONS.has(run.conclusion)) {
+      passed.push(name);
+    } else {
+      failed.push(`${name} (${run.conclusion})`);
+    }
+  }
+
+  return {
+    state: failed.length > 0 ? "failed" : pending.length > 0 ? "wait" : "ready",
+    passed,
+    pending,
+    failed,
+    headSha
+  };
+}
+
+function reportGate(gate, verbose) {
+  if (verbose) {
+    const gates = gate.passed.length + gate.pending.length + gate.failed.length;
+    console.log(`commit ${gate.headSha}: ${gates} gating workflow run(s).`);
+    if (gate.pending.length > 0) console.log(`still running: ${gate.pending.join(", ")}.`);
+    if (gate.failed.length > 0) console.log(`failed: ${gate.failed.join(", ")}.`);
+    if (gate.passed.length > 0) console.log(`passed: ${gate.passed.join(", ")}.`);
+    console.log(`gate state: ${gate.state}.`);
+  }
+  if (process.env.GITHUB_OUTPUT) {
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `state=${gate.state}\n`);
+  }
+}
+
+// The gate job: red when a gate failed, green while the checks are still
+// running. A "wait" run produces no review, and the completion that makes the
+// last check green is what starts the run that does.
+async function gateAction() {
+  const gate = await classifyGate();
+  reportGate(gate, true);
+  if (gate.state === "failed") {
+    console.error(
+      `::error title=ai review skipped::other pr checks failed: ${gate.failed.join(", ")}. fix or re-run them; the next completion runs this gate again.`
+    );
     process.exit(1);
   }
-
-  console.log(`waiting for other PR builds, checks, and tests on commit ${headSha} (repo: ${repo}, waitForSecurity=${waitForSecurity})...`);
-
-  // Initial grace period to allow sibling checks to register
-  await new Promise((r) => setTimeout(r, 15000));
-
-  const maxWaitMs = 15 * 60 * 1000;
-  const pollIntervalMs = 10000;
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < maxWaitMs) {
-    // 1. Check parent workflow runs (e.g. Tauri Build) to ensure multi-job pipelines are complete
-    let workflowRuns = [];
-    try {
-      const res = await fetch(`https://api.github.com/repos/${repo}/actions/runs?head_sha=${headSha}&per_page=100`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "scs-rclient-ai-review"
-        }
-      });
-      if (res.ok) {
-        const body = await res.json();
-        workflowRuns = body.workflow_runs || [];
-      } else {
-        console.warn(`warning: github api workflow-runs query returned ${res.status}`);
-      }
-    } catch (err) {
-      console.warn("warning: failed to fetch workflow runs:", err.message);
-    }
-
-    const nonAiWorkflows = workflowRuns.filter((w) => {
-      if (currentRunId && String(w.id) === String(currentRunId)) return false;
-      const lower = (w.name || "").toLowerCase();
-      if (lower.includes("ai code review") || lower.includes("ai-code-review")) return false;
-      if (!waitForSecurity && (lower.includes("ai security review") || lower.includes("ai-security-review"))) return false;
-      return true;
-    });
-
-    const failedWorkflows = nonAiWorkflows.filter((w) => {
-      return (
-        w.status === "completed" &&
-        ["failure", "timed_out", "cancelled", "action_required"].includes(w.conclusion)
-      );
-    });
-
-    if (failedWorkflows.length > 0) {
-      console.error("other PR workflow(s) failed:");
-      for (const w of failedWorkflows) {
-        console.error(`- ${w.name}: conclusion=${w.conclusion}`);
-      }
-      console.error("agent must only be invoked after all other PR checks pass. halting.");
-      process.exit(2);
-    }
-
-    const inProgressWorkflows = nonAiWorkflows.filter((w) => w.status !== "completed");
-    if (inProgressWorkflows.length > 0) {
-      console.log(`waiting for ${inProgressWorkflows.length} workflow(s) to finish: ${inProgressWorkflows.map((w) => w.name).join(", ")}`);
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
-      continue;
-    }
-
-    // 2. Check individual job check-runs
-    let checkRuns = [];
-    try {
-      const res = await fetch(`https://api.github.com/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "scs-rclient-ai-review"
-        }
-      });
-      if (!res.ok) {
-        console.warn(`warning: github api check-runs query returned ${res.status}`);
-      } else {
-        const body = await res.json();
-        checkRuns = body.check_runs || [];
-      }
-    } catch (err) {
-      console.warn("warning: failed to fetch check runs:", err.message);
-    }
-
-    const otherRuns = checkRuns.filter((r) => {
-      if (currentRunId && String(r.id) === String(currentRunId)) return false;
-      const lower = (r.name || "").toLowerCase();
-      if (lower.includes("ai code review") || lower.includes("ai-code-review")) return false;
-      if (!waitForSecurity && (lower.includes("ai security review") || lower.includes("ai-security-review"))) return false;
-      return true;
-    });
-
-    if (nonAiWorkflows.length === 0 && otherRuns.length === 0) {
-      const elapsed = Date.now() - startTime;
-      if (elapsed < 30000) {
-        console.log("no other check runs detected yet. waiting for sibling jobs...");
-        await new Promise((r) => setTimeout(r, pollIntervalMs));
-        continue;
-      }
-      console.log("no other check runs detected for this commit. proceeding with review.");
-      process.exit(0);
-    }
-
-    const failed = otherRuns.filter((r) => {
-      return (
-        r.status === "completed" &&
-        ["failure", "timed_out", "cancelled", "action_required"].includes(r.conclusion)
-      );
-    });
-
-    if (failed.length > 0) {
-      console.error("other PR check(s) failed:");
-      for (const f of failed) {
-        console.error(`- ${f.name}: conclusion=${f.conclusion}`);
-      }
-      console.error("agent must only be invoked after all other PR checks pass. halting.");
-      process.exit(2);
-    }
-
-    const inProgress = otherRuns.filter((r) => r.status !== "completed");
-    if (inProgress.length > 0) {
-      console.log(`waiting for ${inProgress.length} check(s) to finish: ${inProgress.map((r) => r.name).join(", ")}`);
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
-      continue;
-    }
-
-    console.log(`all ${otherRuns.length} other PR check(s) and workflow(s) passed: ${otherRuns.map((r) => `${r.name} (${r.conclusion})`).join(", ")}`);
-    process.exit(0);
+  if (gate.state === "wait") {
+    console.log("other pr checks are still running; this run is done, the next completion re-runs it.");
   }
+}
 
-  console.error("timed out waiting for other PR checks to complete.");
-  process.exit(1);
+// The merge job asks the same question without failing on the answer: a check
+// that regressed after the gate opened must leave the pr open, not paint a
+// review that succeeded red. Prints the bare state on the last line.
+async function gateStateAction() {
+  const gate = await classifyGate();
+  reportGate(gate, false);
+  console.log(gate.state);
 }
 
 function readOptionalText(file) {
@@ -402,7 +355,7 @@ function preparePayload() {
     "4. style invariants: plain text only. Never use bold markdown asterisks (**). Never use emojis.",
     "5. review structure:",
     "   - tldr: write top-level summary in /caveman mode (1-3 sentences, drop articles, drop filler, ultra-compressed, exact facts, pattern: [thing] [action] [reason]. [status].).",
-    "   - findings: format findings as <file>:L<line>: <sev>: <problem>. <fix>. where <sev> is: critical (exploitable vulnerabilities, secret leakage), required (concrete reproducible runtime bugs, regressions, or unhandled exceptions; not platform environment design, compile-time assertions, or defense-in-depth suggestions), optional (defense-in-depth, refactor suggestion, non-blocking improvement), or nit (style, comment, doc polish). If no defects, output 'no critical or required issues found.'",
+    "   - findings: format findings as <file>:L<line>: <sev>: <problem>. <fix>. where <sev> is: critical (exploitable vulnerabilities, secret leakage), required (broken code, runtime bugs, regression), optional (refactor suggestion, non-blocking improvement), or nit (style, comment, doc polish). If no defects, output 'no critical or required issues found.'",
     "   - verdict: end review with explicit verdict on its own line: verdict: APPROVE or verdict: REQUEST CHANGES. Issue verdict: REQUEST CHANGES ONLY when critical or required defects are present. If findings are only optional suggestions or nits, issue verdict: APPROVE."
   ];
 
@@ -479,7 +432,7 @@ function preparePayload() {
 
 // Every reviewer is called concurrently, so the whole fleet costs roughly the
 // wall clock of the slowest one and the job stays inside the timeout budget the
-// workflow grants it.
+// code review grants its sibling checks.
 async function callModels() {
   const payloadFile = process.env.PAYLOAD_FILE || "/tmp/ai_review_payload.json";
   if (!fs.existsSync(payloadFile)) {
@@ -500,8 +453,8 @@ async function callModels() {
   const failed = results.filter((result) => !result.ok);
   console.log(`called ${results.length} reviewer(s), ${failed.length} failed.`);
   // A failed call is not fatal here: it is written as an error response so
-  // post-comment posts the reason on the PR and lets the reviewers that did
-  // answer decide the verdict. The merge gate stays in one place.
+  // post-comment posts the reason on the PR and fails the check, keeping the
+  // merge gate in one place.
 }
 
 async function callProvider(payload, provider) {
@@ -750,15 +703,15 @@ function publish(commentFile, body, prNumber, label) {
   }
 }
 
-if (action === "wait-checks") {
-  waitChecks().catch((err) => {
-    console.error("fatal in waitChecks:", err);
+if (action === "gate") {
+  gateAction().catch((err) => {
+    console.error("fatal in gateAction:", err);
     process.exit(1);
   });
-} else if (action === "check-failures") {
-  checkFailures().catch((err) => {
-    console.error("fatal in checkFailures:", err);
-    process.exit(0);
+} else if (action === "gate-state") {
+  gateStateAction().catch((err) => {
+    console.error("fatal in gateStateAction:", err);
+    process.exit(1);
   });
 } else if (action === "prepare-payload") {
   preparePayload();
@@ -770,6 +723,6 @@ if (action === "wait-checks") {
 } else if (action === "post-comment") {
   postComment();
 } else {
-  console.error("unknown action. Use: wait-checks, check-failures, prepare-payload, call, or post-comment.");
+  console.error("unknown action. Use: gate, gate-state, prepare-payload, call, or post-comment.");
   process.exit(1);
 }
