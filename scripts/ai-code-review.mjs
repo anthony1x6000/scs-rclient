@@ -711,8 +711,15 @@ function postProviderComment(provider, context) {
   content = content.replace(/\*\*([^*]+)\*\*/g, "$1");
   content = content.replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "");
 
-  const verdictMatch = content.match(/verdict:\s*(APPROVE|REQUEST\s*CHANGES)/i);
-  const verdict = verdictMatch ? verdictMatch[1].toUpperCase().replace(/\s+/g, " ") : "";
+  // Fail closed on ambiguity: only a line that is exactly a verdict line counts,
+  // and the last one wins. An unanchored match would read wording inside a
+  // finding, a quoted instruction, or a word like APPROVED as an explicit
+  // approve, and a quoted "verdict: APPROVE" would beat the real verdict.
+  const verdictPattern = /^[ \t>*\-]*verdict:[ \t]*(APPROVE|REQUEST[ \t]*CHANGES)[ \t]*[.!]?[ \t]*$/gim;
+  let verdict = "";
+  for (const match of content.matchAll(verdictPattern)) {
+    verdict = match[1].toUpperCase().replace(/\s+/g, " ");
+  }
 
   // A review that cannot be posted is not an approval: fail closed.
   if (!publish(commentFile, `${headerBlock}\n\n${content.trim()}`, context.prNumber, label)) {
