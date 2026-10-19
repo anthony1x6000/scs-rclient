@@ -144,6 +144,14 @@ export async function getScanConcurrency(): Promise<number> {
 
 export async function setScanConcurrency(threads: number): Promise<void> {
   const clamped = clampScanConcurrency(threads);
+  // Push the new limit to the backend so an operation already in flight resizes
+  // its worker pool instead of waiting for the next run.
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("set_scan_concurrency", { threads: clamped });
+  } catch (e) {
+    console.error("Failed to apply scan concurrency to the running operation:", e);
+  }
   await setWrapped(STORE_KEYS.scanConcurrency, clamped);
 }
 
