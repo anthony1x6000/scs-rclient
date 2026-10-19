@@ -4,14 +4,15 @@ name: AI Security Review
 # - Second AI reviewer. Runs an adversarial security audit of the pull request
 #   source diff and the pull request discussion, driven by the upstream
 #   Cloudflare security-audit skill fetched at a pinned commit.
-# - ENGINE: prompt assembly, the NVIDIA request payload, comment formatting,
+# - ENGINE: prompt assembly, the model request payload, comment formatting,
 #   verdict parsing, and the exit code all come from scripts/ai-code-review.mjs,
 #   the same engine ai-code-review.yml uses. This workflow only supplies the
 #   pinned skill, the diff, the pr discussion, and the security-specific prompt
 #   knobs, so no reviewer logic is forked here.
 # - GATING: This job is named "AI Security Review Agent". If it passes, it exits
 #   0 with an APPROVE verdict. If it finds security issues, it exits non-zero.
-# - SECRET/MODEL: same NVIDIA_NIM_KEY secret and same model as the code review.
+# - SECRET/MODEL: the same OCG_KEY secret and the same reviewer fleet as the code
+#   review, read from .github/ai-review-models.json.
 #
 # SECURITY: the diff and every discussion comment are untrusted input. The
 # shared engine wraps them as data and the prompt tells the model never to
@@ -51,8 +52,8 @@ jobs:
       SKILL_SHA: c1c8a8c1471069fb0e188eeaff69b8e8db6564a8
       SKILL_DIR: /tmp/security-audit-skill/skills/security-audit
       # Inputs and outputs of the shared engine. COMMENT_META is set from the
-      # verified sha in the fetch step below.
-      AI_MODEL: nvidia/nemotron-3-ultra-550b-a55b
+      # verified sha in the fetch step below. The models and their endpoints come
+      # from .github/ai-review-models.json, shared with the code review job.
       MAX_TOKENS: "8192"
       DIFF_FILE: /tmp/security_pr.diff
       SKILL_FILE: /tmp/security_review_skill.md
@@ -256,51 +257,11 @@ jobs:
         if: steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true'
         run: node scripts/ai-code-review.mjs prepare-payload
 
-      - name: Call Security Review Agent
+      - name: Call Security Review Models
         if: steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true'
         env:
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_NIM_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${NVIDIA_API_KEY:-}" ]; then
-            echo "::error::NVIDIA_NIM_KEY secret is not configured in repository secrets."
-            exit 1
-          fi
-
-          # Transient 503s and cold starts are common on this endpoint. A gating
-          # check must not fail a pull request on a single blip, so retry inside
-          # the 14 minute job budget: 3 attempts of 210s plus 15s/30s backoff.
-          MAX_ATTEMPTS=3
-          ATTEMPT=1
-          CURL_EXIT=0
-          HTTP_STATUS=0
-          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
-            CURL_EXIT=0
-            HTTP_STATUS=$(curl -s -S -w "%{http_code}" --max-time 210 -o "$RESPONSE_FILE" \
-              https://integrate.api.nvidia.com/v1/chat/completions \
-              -H "Content-Type: application/json" \
-              -H "Authorization: Bearer $NVIDIA_API_KEY" \
-              --data-binary "@$PAYLOAD_FILE") || CURL_EXIT=$?
-            echo "NVIDIA NIM attempt $ATTEMPT/$MAX_ATTEMPTS: HTTP $HTTP_STATUS (curl exit $CURL_EXIT)"
-            if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_STATUS" -eq 200 ]; then
-              break
-            fi
-            if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
-              BACKOFF=$((ATTEMPT * 15))
-              echo "retrying in ${BACKOFF}s."
-              sleep "$BACKOFF"
-            fi
-            ATTEMPT=$((ATTEMPT + 1))
-          done
-
-          if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_STATUS" -ne 200 ]; then
-            echo "::warning::NVIDIA NIM API request failed after $MAX_ATTEMPTS attempt(s) (curl exit $CURL_EXIT, HTTP $HTTP_STATUS)."
-            ERR_MSG="upstream NVIDIA NIM API request failed after $MAX_ATTEMPTS attempt(s) (HTTP $HTTP_STATUS, curl exit $CURL_EXIT)."
-            if [ -s "$RESPONSE_FILE" ]; then
-              ERR_MSG="$ERR_MSG response: $(cat "$RESPONSE_FILE")"
-            fi
-            jq -n --arg msg "$ERR_MSG" '{error: {message: $msg}}' > "$RESPONSE_FILE"
-          fi
+          OCG_KEY: ${{ secrets.OCG_KEY }}
+        run: node scripts/ai-code-review.mjs call
 
       - name: Post Security Review Comment and Verdict
         if: steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true'
@@ -308,8 +269,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          # The shared engine posts the comment, strips bold and emoji, parses
-          # the verdict, and exits non-zero unless it is an explicit APPROVE.
+          # The shared engine posts one comment per model, strips bold and emoji,
+          # parses each verdict, and exits non-zero if a reviewer that answered
+          # objected or if none approved. A model that returned no review text
+          # abstains instead of blocking.
           if node scripts/ai-code-review.mjs post-comment; then
             exit 0
           fi

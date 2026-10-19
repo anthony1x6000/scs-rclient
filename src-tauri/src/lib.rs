@@ -198,6 +198,15 @@ fn verify_webdav(
 #[tauri::command]
 fn cancel_webdav_action(state: tauri::State<'_, WebdavState>) -> Result<(), String> {
     state.cancel_flag.store(true, Ordering::SeqCst);
+    // Parked workers wait on a condvar without polling; wake them so they observe it.
+    webdav::wake_worker_pools();
+    Ok(())
+}
+
+/// Applies a new worker thread limit to scans and uploads that are already running.
+#[tauri::command]
+fn set_scan_concurrency(threads: usize) -> Result<(), String> {
+    webdav::set_scan_concurrency(threads);
     Ok(())
 }
 
@@ -205,7 +214,8 @@ fn cancel_webdav_action(state: tauri::State<'_, WebdavState>) -> Result<(), Stri
 ///
 /// Parameters:
 /// - `concurrency`: Optional number of worker threads for parallel remote directory traversal and concurrent uploads (1..64).
-///   When `None`, defaults to 6 (`DEFAULT_SCAN_CONCURRENCY`).
+///   When `None`, the current live limit is used (the environment default until changed).
+///   `set_scan_concurrency` resizes the pools while the action is still running.
 /// - `username`: Optional authenticated username, used for credential-scoped cache partitioning.
 /// - `backup`: When true, the local side is redirected under `<mount>/backups`, keeping an
 ///   operation off the working copy it is meant to leave alone.
@@ -353,6 +363,7 @@ pub fn run() {
             delete_credentials,
             verify_webdav,
             cancel_webdav_action,
+            set_scan_concurrency,
             run_webdav_action,
             clear_webdav_cache
         ])

@@ -127,7 +127,7 @@ export TEST_WEBDAV_PASS="testpass"
 echo "=== Running WebDAV lib unit tests ==="
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --nocapture
 
-echo "=== Running WebDAV integration & roundtrip E2E tests against simulated D2L endpoint ==="
-cargo test --manifest-path src-tauri/Cargo.toml --test webdav_e2e -- --nocapture --test-threads=1
+echo "=== Running WebDAV integration, roundtrip, and live concurrency tests against simulated D2L endpoint ==="
+cargo test --manifest-path src-tauri/Cargo.toml --test webdav_e2e --test live_concurrency -- --nocapture --test-threads=1
 
 echo "✓ All WebDAV tests passed successfully against D2L simulation setup!"

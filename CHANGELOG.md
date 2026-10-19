@@ -1,5 +1,9 @@
 # Changelog
 
+## Live Thread Changes
+
+- **Settings Apply Mid-Operation**: Changing the Settings "Threads" value while a scan or upload is running now resizes its worker pool immediately instead of waiting for the next operation. Pools dispatch up to the live limit and re-check it as each worker claims work, so raising the value adds workers right away and lowering it stops new work from being dispatched (requests already in flight finish normally).
+
 ## Timeout Resilience
 
 - **Retried Transient Requests**: Every WebDAV request (PROPFIND, MKCOL, PUT, GET, DELETE) now retries up to `REQUEST_MAX_ATTEMPTS` (3) times with a growing delay when it fails with a transient transport error — a timeout, connection reset, or truncated body. Permanent failures (bad credentials, 403, local disk errors) are not retried.

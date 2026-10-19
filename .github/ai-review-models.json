@@ -1,0 +1,22 @@
+[
+  {
+    "id": "opencode-go-longcat",
+    "model": "longcat-2.5-preview-free",
+    "endpoint": "https://opencode.ai/zen/go/v1/chat/completions",
+    "apiKeyEnv": "OCG_KEY",
+    "sessionHeader": true,
+    "reasoningEffort": "high",
+    "maxTokens": 32768,
+    "timeoutMs": 600000
+  },
+  {
+    "id": "opencode-go-deepseek",
+    "model": "deepseek-v4.1-flash",
+    "endpoint": "https://opencode.ai/zen/go/v1/chat/completions",
+    "apiKeyEnv": "OCG_KEY",
+    "sessionHeader": true,
+    "reasoningEffort": "high",
+    "maxTokens": 32768,
+    "timeoutMs": 600000
+  }
+]

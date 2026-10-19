@@ -3,13 +3,13 @@ use std::error::Error as StdError;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
-/// Default concurrency level for remote Depth: 1 folder scanning.
+/// Default worker concurrency for remote folder scanning and uploads.
 pub const DEFAULT_SCAN_CONCURRENCY: usize = 6;
-/// Maximum concurrency level for remote Depth: 1 folder scanning to prevent overwhelming the server.
+/// Maximum worker concurrency for remote folder scanning and uploads, to prevent overwhelming the server.
 pub const MAX_SCAN_CONCURRENCY: usize = 64;
 /// Safety limit on the number of traversed directories to guard against recursive symlink bombs or infinite trees.
 /// Set to 10,000 to comfortably accommodate very large course hierarchies (typical max depth ~10 * breadth ~100)
@@ -283,13 +283,64 @@ pub fn is_excluded_path(rel_path: &str, is_dir: bool, exclude_folders: &[String]
     })
 }
 
-/// Returns the concurrency limit for remote WebDAV folder scanning.
+/// Returns the environment-configured default concurrency limit.
 pub fn get_scan_concurrency() -> usize {
     std::env::var("WEBDAV_SCAN_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|v| v.clamp(1, MAX_SCAN_CONCURRENCY))
         .unwrap_or(DEFAULT_SCAN_CONCURRENCY)
+}
+
+/// Live worker limit shared by scans and uploads. `0` means "not set yet", so the
+/// environment-configured default applies until the user changes the setting.
+static LIVE_SCAN_CONCURRENCY: AtomicUsize = AtomicUsize::new(0);
+
+/// Cancellation and live-limit notification for one in-flight worker pool.
+///
+/// The closure locks the pool's own state mutex before calling `notify_all`, so a
+/// worker cannot check its wait condition and park in the gap before the notify.
+type PoolWake = dyn Fn() + Send + Sync;
+
+/// Wakers for every in-flight worker pool, so settings changes and cancellation
+/// can reach workers that are already parked.
+static CONCURRENCY_WAKEUPS: Mutex<Vec<Weak<PoolWake>>> = Mutex::new(Vec::new());
+
+/// Returns the live concurrency limit, falling back to the environment default.
+pub fn current_scan_concurrency() -> usize {
+    match LIVE_SCAN_CONCURRENCY.load(Ordering::Relaxed) {
+        0 => get_scan_concurrency(),
+        value => value.clamp(1, MAX_SCAN_CONCURRENCY),
+    }
+}
+
+/// Updates the live worker limit and wakes every in-flight worker pool, so a
+/// Settings change applies to the operation that is already running.
+pub fn set_scan_concurrency(threads: usize) {
+    LIVE_SCAN_CONCURRENCY.store(threads.clamp(1, MAX_SCAN_CONCURRENCY), Ordering::SeqCst);
+    wake_worker_pools();
+}
+
+/// Wakes every in-flight pool so workers re-check cancellation and the live limit.
+pub fn wake_worker_pools() {
+    let Ok(mut wakeups) = CONCURRENCY_WAKEUPS.lock() else {
+        return;
+    };
+    wakeups.retain(|weak| match weak.upgrade() {
+        Some(wake) => {
+            wake();
+            true
+        }
+        None => false,
+    });
+}
+
+/// Registers a pool's waker so [`wake_worker_pools`] can reach it.
+fn register_concurrency_wakeup(wake: &Arc<PoolWake>) {
+    if let Ok(mut wakeups) = CONCURRENCY_WAKEUPS.lock() {
+        wakeups.retain(|weak| weak.upgrade().is_some());
+        wakeups.push(Arc::downgrade(wake));
+    }
 }
 
 /// Retrieves maximum allowed WebDAV file size in bytes, configurable via MAX_WEBDAV_FILE_SIZE_BYTES.
@@ -1282,7 +1333,8 @@ where
 /// allowing concurrent Depth: 1 requests across worker threads.
 ///
 /// Parameters:
-/// - `concurrency`: Worker thread count (1..64). If `None`, defaults to `get_scan_concurrency()`.
+/// - `concurrency`: Worker thread count (1..64); updates the live limit when `Some`.
+///   `None` keeps the live limit (the environment default until the user changes it).
 /// - `auth_user`: Optional username for credential-scoped cache partitioning (CWE-287 / CWE-384).
 pub fn list_remote_recursive_with_concurrency_and_log<F>(
     client: &rustydav::client::Client,
@@ -1309,7 +1361,8 @@ where
 /// Recursively lists remote WebDAV items under remote_url with configurable worker concurrency, cache control, and streamed diagnostic logs.
 ///
 /// Parameters:
-/// - `concurrency`: Worker thread count (1..64). If `None`, defaults to `get_scan_concurrency()`.
+/// - `concurrency`: Worker thread count (1..64); updates the live limit when `Some`.
+///   `None` keeps the live limit (the environment default until the user changes it).
 /// - `auth_user`: Optional username for credential-scoped cache partitioning (CWE-287 / CWE-384).
 /// - `use_cache`: When true and cache is enabled, loads from/saves to remote listing cache. When false (e.g. GET), bypasses cache.
 ///
@@ -1457,12 +1510,11 @@ where
     // Fallback: Concurrent Breadth-First-Search traversal using Depth: 1
     log("Scanning directories using Depth: 1...\n");
 
-    let num_workers = concurrency
-        .map(|c| c.clamp(1, MAX_SCAN_CONCURRENCY))
-        .unwrap_or_else(get_scan_concurrency);
+    if let Some(requested) = concurrency {
+        set_scan_concurrency(requested);
+    }
     let remote_parsed = rustydav::prelude::Url::parse(remote_url)
         .map_err(|e| format!("Invalid remote URL: {}", e))?;
-    let remote_origin = remote_parsed.origin();
 
     let root_visited_key = remote_url.trim_end_matches('/').to_ascii_lowercase();
     let mut initial_visited = HashSet::new();
@@ -1515,42 +1567,34 @@ where
                 if state.stopped || state.error.is_some() {
                     return None;
                 }
-                if let Some(url) = state.queue.pop_front() {
-                    state.active_workers += 1;
-                    state.scanned_count += 1;
-                    let scan_idx = state.scanned_count;
-                    let guard = Self {
-                        state_ref,
-                        cvar_ref,
-                    };
-                    return Some((guard, url, scan_idx));
-                }
-                if state.active_workers == 0 {
-                    state.stopped = true;
-                    cvar_ref.notify_all();
-                    return None;
-                }
-                let res = cvar_ref.wait_timeout(state, Duration::from_millis(250));
-                match res {
-                    Ok((new_state, _)) => state = new_state,
-                    Err(poisoned) => {
-                        eprintln!("[webdav scan] Mutex poisoned during worker wait; recovering state.");
-                        let (new_state, _) = poisoned.into_inner();
-                        if new_state.stopped || new_state.error.is_some() {
-                            return None;
-                        }
-                        state = new_state;
+                // Only dispatch while below the live limit; excess workers park here
+                // and start as soon as the user raises the Settings "Threads" value.
+                if state.active_workers < current_scan_concurrency() {
+                    if let Some(url) = state.queue.pop_front() {
+                        state.active_workers += 1;
+                        state.scanned_count += 1;
+                        let scan_idx = state.scanned_count;
+                        let guard = Self {
+                            state_ref,
+                            cvar_ref,
+                        };
+                        return Some((guard, url, scan_idx));
                     }
                 }
-                // Check cancellation and stopped state immediately after reacquiring lock from wait
-                if cancel_flag.load(Ordering::SeqCst) {
+                if state.queue.is_empty() && state.active_workers == 0 {
                     state.stopped = true;
                     cvar_ref.notify_all();
                     return None;
                 }
-                if state.stopped || state.error.is_some() {
-                    return None;
-                }
+                // Every condition change notifies while holding this mutex, so the
+                // wait cannot miss a wakeup and needs no timeout polling.
+                state = match cvar_ref.wait(state) {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        eprintln!("[webdav scan] Mutex poisoned during worker wait; recovering state.");
+                        poisoned.into_inner()
+                    }
+                };
             }
         }
     }
@@ -1570,7 +1614,7 @@ where
         }
     }
 
-    let state_mutex = Mutex::new(ScanState {
+    let state_mutex = Arc::new(Mutex::new(ScanState {
         queue: initial_queue,
         active_workers: 0,
         visited: initial_visited,
@@ -1580,240 +1624,292 @@ where
         skipped_dirs: Vec::new(),
         error: None,
         stopped: false,
-    });
-    let cvar = Condvar::new();
+    }));
+    let cvar = Arc::new(Condvar::new());
+    let wake: Arc<PoolWake> = {
+        let state = Arc::clone(&state_mutex);
+        let cvar = Arc::clone(&cvar);
+        Arc::new(move || {
+            // Hold the pool lock while notifying so a worker cannot miss this
+            // wakeup between checking its condition and parking on the condvar.
+            let _held = state.lock().unwrap_or_else(|p| p.into_inner());
+            cvar.notify_all();
+        })
+    };
+    register_concurrency_wakeup(&wake);
 
-    let (log_tx, log_rx) = mpsc::channel::<String>();
+    let state_ref = state_mutex.as_ref();
+    let cvar_ref = cvar.as_ref();
 
-    std::thread::scope(|s| {
-        for _ in 0..num_workers {
-            let worker_log_tx = log_tx.clone();
-            let worker_remote_origin = remote_origin.clone();
-            let state_ref = &state_mutex;
-            let cvar_ref = &cvar;
+    // Spawns one scan worker; the controller below calls it as the live limit rises.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_scan_worker<'scope, 'env: 'scope>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        client: &'env rustydav::client::Client,
+        remote_url: &'env str,
+        remote_origin: rustydav::prelude::Url,
+        cancel_flag: &'env AtomicBool,
+        state_ref: &'env Mutex<ScanState>,
+        cvar_ref: &'env Condvar,
+        exclude_folders: &'env [String],
+        log_tx: mpsc::Sender<String>,
+    ) {
+        let worker_log_tx = log_tx;
+        let worker_remote_origin = remote_origin.origin();
+        scope.spawn(move || {
+            let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                loop {
+                    let (guard, current_url, scan_idx) = match WorkerGuard::acquire(
+                        state_ref,
+                        cvar_ref,
+                        cancel_flag,
+                    ) {
+                        Some(triple) => triple,
+                        None => return,
+                    };
 
-            s.spawn(move || {
-                let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    loop {
-                        let (guard, current_url, scan_idx) = match WorkerGuard::acquire(
-                            state_ref,
-                            cvar_ref,
-                            cancel_flag,
-                        ) {
-                            Some(triple) => triple,
-                            None => return,
-                        };
+                    let rel_folder = relative_item_path(remote_url, &current_url);
+                    let display_folder = if rel_folder.is_empty() {
+                        "/ (root)".to_string()
+                    } else {
+                        rel_folder
+                    };
 
-                        let rel_folder = relative_item_path(remote_url, &current_url);
-                        let display_folder = if rel_folder.is_empty() {
-                            "/ (root)".to_string()
+                    let _ = worker_log_tx.send(format!(
+                        "[{}] Scanning directory: {}...\n",
+                        scan_idx, display_folder
+                    ));
+
+                    // Check cancellation before issuing directory listing network request
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                        state.stopped = true;
+                        return;
+                    }
+
+                    let list_res = retry_webdav_operation(
+                        &format!("PROPFIND Depth: 1 {current_url}"),
+                        cancel_flag,
+                        REQUEST_MAX_ATTEMPTS,
+                        RETRY_DELAY,
+                        |msg: &str| {
+                            let _ = worker_log_tx.send(msg.to_string());
+                        },
+                        || {
+                            client.list(&current_url, "1").map_err(|e| {
+                                classify_reqwest_error(
+                                    &format!("PROPFIND Depth: 1 {current_url}"),
+                                    &e,
+                                )
+                            })
+                        },
+                    );
+
+                    // Check cancellation immediately after blocking network I/O returns to abort before parsing response body
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                        state.stopped = true;
+                        return;
+                    }
+
+                    let res = match list_res {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if scan_idx == 1 {
+                                // Without the root listing there is nothing to traverse, so the
+                                // scan still fails — but only after every retry has been spent.
+                                let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                                state.error = Some(format!(
+                                    "Root listing failed for {}: {}",
+                                    remote_url, e
+                                ));
+                                state.stopped = true;
+                                return;
+                            }
+                            // A flaky subfolder must not abort the whole scan: record it, warn
+                            // loudly, and let the remaining workers finish the traversal.
+                            {
+                                let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                                state.skipped_dirs.push(current_url.clone());
+                            }
+                            let _ = worker_log_tx.send(format!(
+                                "[{}] WARNING: giving up on {}; skipping this directory and continuing the scan. Files inside it are missing from this listing.\n",
+                                scan_idx, display_folder
+                            ));
+                            continue;
+                        }
+                    };
+
+                    let status = res.status();
+                    if !status.is_success() && status.as_u16() != 207 {
+                        let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                        if scan_idx == 1 && status.as_u16() == 404 {
+                            let _ = worker_log_tx.send(
+                                "Remote directory does not exist yet (404); starting with empty listing.\n"
+                                    .to_string(),
+                            );
+                            state.stopped = true;
+                            return;
+                        }
+                        state.error = Some(format!("Server returned HTTP {} for {}", status, current_url));
+                        state.stopped = true;
+                        return;
+                    }
+
+                    let body = res.text().unwrap_or_default();
+                    let items = parse_propfind_xml(&body);
+
+                    let mut children_in_dir = 0;
+                    let mut new_dirs = 0;
+                    let mut new_files = 0;
+
+                    let mut discovered_sub_urls = Vec::new();
+                    let mut discovered_items = Vec::new();
+
+                    for item in items {
+                        let rel = relative_item_path(&current_url, &item.href);
+                        if rel.is_empty() {
+                            // Skips current collection directory itself
+                            continue;
+                        }
+                        if !is_safe_relative_path(&rel) {
+                            continue;
+                        }
+
+                        // Resolve once so an href that is relative to the current
+                        // collection still yields a correct scan-root-relative path.
+                        let item_url = resolve_item_url(&current_url, &item.href);
+                        let rel_from_root = relative_item_path(remote_url, &item_url);
+
+                        // Excluded folders are pruned before they are enqueued, so no
+                        // request is ever issued for their contents. This also drops
+                        // descendants that a single listing may have returned.
+                        if is_excluded_path(&rel_from_root, item.is_dir, exclude_folders) {
+                            continue;
+                        }
+
+                        children_in_dir += 1;
+                        if item.is_dir {
+                            new_dirs += 1;
+                            if let Ok(parsed_sub) = rustydav::prelude::Url::parse(&item_url) {
+                                if parsed_sub.origin() == worker_remote_origin
+                                    && !rel_from_root.is_empty()
+                                    && is_safe_relative_path(&rel_from_root)
+                                    && validate_webdav_url(&item_url).is_ok()
+                                {
+                                    discovered_sub_urls.push(item_url);
+                                }
+                            }
+                            discovered_items.push(item);
                         } else {
-                            rel_folder
-                        };
+                            new_files += 1;
+                            discovered_items.push(item);
+                        }
+                    }
 
+                    if children_in_dir == 0 && current_url == remote_url {
+                        let snippet_len = body.len().min(400);
                         let _ = worker_log_tx.send(format!(
-                            "[{}] Scanning directory: {}...\n",
-                            scan_idx, display_folder
+                            "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
+                            &body[..snippet_len]
                         ));
+                    } else {
+                        let _ = worker_log_tx.send(format!(
+                            "   -> Found {} file(s) and {} subfolder(s) in {}\n",
+                            new_files, new_dirs, display_folder
+                        ));
+                    }
 
-                        // Check cancellation before issuing directory listing network request
-                        if cancel_flag.load(Ordering::SeqCst) {
-                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                            state.stopped = true;
+                    {
+                        let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                        if state.stopped || state.error.is_some() {
                             return;
                         }
 
-                        let list_res = retry_webdav_operation(
-                            &format!("PROPFIND Depth: 1 {current_url}"),
-                            cancel_flag,
-                            REQUEST_MAX_ATTEMPTS,
-                            RETRY_DELAY,
-                            |msg: &str| {
-                                let _ = worker_log_tx.send(msg.to_string());
-                            },
-                            || {
-                                client.list(&current_url, "1").map_err(|e| {
-                                    classify_reqwest_error(
-                                        &format!("PROPFIND Depth: 1 {current_url}"),
-                                        &e,
-                                    )
-                                })
-                            },
-                        );
-
-                        // Check cancellation immediately after blocking network I/O returns to abort before parsing response body
-                        if cancel_flag.load(Ordering::SeqCst) {
-                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                            state.stopped = true;
-                            return;
+                        for item in discovered_items {
+                            let key = (item.is_dir, item.href.clone());
+                            if state.seen_items.insert(key) {
+                                state.all_items.push(item);
+                            }
                         }
 
-                        let res = match list_res {
-                            Ok(r) => r,
-                            Err(e) => {
-                                if scan_idx == 1 {
-                                    // Without the root listing there is nothing to traverse, so the
-                                    // scan still fails — but only after every retry has been spent.
-                                    let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                        for sub_url in discovered_sub_urls {
+                            let sub_key = sub_url.trim_end_matches('/').to_ascii_lowercase();
+                            if !state.visited.contains(&sub_key) {
+                                if state.visited.len() >= MAX_SCANNED_DIRS_LIMIT {
                                     state.error = Some(format!(
-                                        "Root listing failed for {}: {}",
-                                        remote_url, e
+                                        "Directory traversal limit reached ({} folders). Aborting scan for security.",
+                                        MAX_SCANNED_DIRS_LIMIT
                                     ));
                                     state.stopped = true;
                                     return;
                                 }
-                                // A flaky subfolder must not abort the whole scan: record it, warn
-                                // loudly, and let the remaining workers finish the traversal.
-                                {
-                                    let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                                    state.skipped_dirs.push(current_url.clone());
-                                }
-                                let _ = worker_log_tx.send(format!(
-                                    "[{}] WARNING: giving up on {}; skipping this directory and continuing the scan. Files inside it are missing from this listing.\n",
-                                    scan_idx, display_folder
-                                ));
-                                continue;
-                            }
-                        };
-
-                        let status = res.status();
-                        if !status.is_success() && status.as_u16() != 207 {
-                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                            if scan_idx == 1 && status.as_u16() == 404 {
-                                let _ = worker_log_tx.send(
-                                    "Remote directory does not exist yet (404); starting with empty listing.\n"
-                                        .to_string(),
-                                );
-                                state.stopped = true;
-                                return;
-                            }
-                            state.error = Some(format!("Server returned HTTP {} for {}", status, current_url));
-                            state.stopped = true;
-                            return;
-                        }
-
-                        let body = res.text().unwrap_or_default();
-                        let items = parse_propfind_xml(&body);
-
-                        let mut children_in_dir = 0;
-                        let mut new_dirs = 0;
-                        let mut new_files = 0;
-
-                        let mut discovered_sub_urls = Vec::new();
-                        let mut discovered_items = Vec::new();
-
-                        for item in items {
-                            let rel = relative_item_path(&current_url, &item.href);
-                            if rel.is_empty() {
-                                // Skips current collection directory itself
-                                continue;
-                            }
-                            if !is_safe_relative_path(&rel) {
-                                continue;
-                            }
-
-                            // Resolve once so an href that is relative to the current
-                            // collection still yields a correct scan-root-relative path.
-                            let item_url = resolve_item_url(&current_url, &item.href);
-                            let rel_from_root = relative_item_path(remote_url, &item_url);
-
-                            // Excluded folders are pruned before they are enqueued, so no
-                            // request is ever issued for their contents. This also drops
-                            // descendants that a single listing may have returned.
-                            if is_excluded_path(&rel_from_root, item.is_dir, exclude_folders) {
-                                continue;
-                            }
-
-                            children_in_dir += 1;
-                            if item.is_dir {
-                                new_dirs += 1;
-                                if let Ok(parsed_sub) = rustydav::prelude::Url::parse(&item_url) {
-                                    if parsed_sub.origin() == worker_remote_origin
-                                        && !rel_from_root.is_empty()
-                                        && is_safe_relative_path(&rel_from_root)
-                                        && validate_webdav_url(&item_url).is_ok()
-                                    {
-                                        discovered_sub_urls.push(item_url);
-                                    }
-                                }
-                                discovered_items.push(item);
-                            } else {
-                                new_files += 1;
-                                discovered_items.push(item);
+                                state.visited.insert(sub_key);
+                                state.queue.push_back(sub_url);
                             }
                         }
-
-                        if children_in_dir == 0 && current_url == remote_url {
-                            let snippet_len = body.len().min(400);
-                            let _ = worker_log_tx.send(format!(
-                                "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
-                                &body[..snippet_len]
-                            ));
-                        } else {
-                            let _ = worker_log_tx.send(format!(
-                                "   -> Found {} file(s) and {} subfolder(s) in {}\n",
-                                new_files, new_dirs, display_folder
-                            ));
-                        }
-
-                        {
-                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                            if state.stopped || state.error.is_some() {
-                                return;
-                            }
-
-                            for item in discovered_items {
-                                let key = (item.is_dir, item.href.clone());
-                                if state.seen_items.insert(key) {
-                                    state.all_items.push(item);
-                                }
-                            }
-
-                            for sub_url in discovered_sub_urls {
-                                let sub_key = sub_url.trim_end_matches('/').to_ascii_lowercase();
-                                if !state.visited.contains(&sub_key) {
-                                    if state.visited.len() >= MAX_SCANNED_DIRS_LIMIT {
-                                        state.error = Some(format!(
-                                            "Directory traversal limit reached ({} folders). Aborting scan for security.",
-                                            MAX_SCANNED_DIRS_LIMIT
-                                        ));
-                                        state.stopped = true;
-                                        return;
-                                    }
-                                    state.visited.insert(sub_key);
-                                    state.queue.push_back(sub_url);
-                                }
-                            }
-                        }
-                        drop(guard);
                     }
-                }));
-
-                if run_result.is_err() {
-                    let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                    if state.error.is_none() {
-                        state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
-                    }
-                    state.stopped = true;
-                    cvar_ref.notify_all();
+                    drop(guard);
                 }
-            });
-        }
+            }));
 
-        drop(log_tx);
+            if run_result.is_err() {
+                let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                if state.error.is_none() {
+                    state.error = Some("WebDAV worker thread panicked unexpectedly.".to_string());
+                }
+                state.stopped = true;
+                cvar_ref.notify_all();
+            }
+        });
+    }
+
+    let (log_tx, log_rx) = mpsc::channel::<String>();
+
+    std::thread::scope(|s| {
+        // One controller thread owns spawning, so the pool starts at the current
+        // limit and grows as Settings raises it instead of pre-allocating 64 threads.
+        let controller = s.spawn(move || {
+            let mut spawned = 0usize;
+            loop {
+                let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                if state.stopped || state.error.is_some() {
+                    break;
+                }
+                let target = current_scan_concurrency();
+                if spawned < target {
+                    spawned += 1;
+                    drop(state);
+                    spawn_scan_worker(
+                        s,
+                        client,
+                        remote_url,
+                        remote_parsed.clone(),
+                        cancel_flag,
+                        state_ref,
+                        cvar_ref,
+                        exclude_folders,
+                        log_tx.clone(),
+                    );
+                    continue;
+                }
+                state = cvar_ref.wait(state).unwrap_or_else(|p| p.into_inner());
+            }
+        });
 
         while let Ok(msg) = log_rx.recv() {
             log(&msg);
         }
+        let _ = controller.join();
     });
 
-    let mut state = state_mutex.into_inner().unwrap_or_else(|p| p.into_inner());
+    let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
 
     if cancel_flag.load(Ordering::SeqCst) {
         return Err("Operation canceled by user.".to_string());
     }
 
-    if let Some(err) = state.error {
+    if let Some(err) = state.error.take() {
         return Err(err);
     }
 
@@ -1840,8 +1936,7 @@ where
         file_count, dir_count, state.scanned_count
     ));
 
-    Ok(state.all_items)
-
+    Ok(std::mem::take(&mut state.all_items))
 }
 
 /// Extracts modification time from std::fs::Metadata as UNIX timestamp (seconds).
@@ -2034,11 +2129,75 @@ enum UploadOutcome {
     Canceled,
 }
 
+/// Blocks a worker until the live limit has room, releasing the slot on drop.
+/// Mirrors the scan pool's dispatch gate so changing "Threads" affects uploads too.
+struct WorkerGate {
+    active: Arc<Mutex<usize>>,
+    cvar: Arc<Condvar>,
+    /// Kept alive so the global wakeup registry can reach this gate.
+    _wake: Arc<PoolWake>,
+}
+
+struct WorkerSlot<'a> {
+    gate: &'a WorkerGate,
+}
+
+impl WorkerGate {
+    fn new() -> Self {
+        let active = Arc::new(Mutex::new(0));
+        let cvar = Arc::new(Condvar::new());
+        let wake: Arc<PoolWake> = {
+            let active = Arc::clone(&active);
+            let cvar = Arc::clone(&cvar);
+            Arc::new(move || {
+                // Hold the gate lock while notifying so a worker cannot miss the
+                // wakeup between checking the limit and parking on the condvar.
+                let _held = active.lock().unwrap_or_else(|p| p.into_inner());
+                cvar.notify_all();
+            })
+        };
+        register_concurrency_wakeup(&wake);
+        Self {
+            active,
+            cvar,
+            _wake: wake,
+        }
+    }
+
+    fn acquire(&self, stop: &AtomicBool, cancel: &AtomicBool) -> Option<WorkerSlot<'_>> {
+        let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if stop.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
+                return None;
+            }
+            if *active < current_scan_concurrency() {
+                *active += 1;
+                return Some(WorkerSlot { gate: self });
+            }
+            active = self.cvar.wait(active).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// Wakes parked workers so they can observe a stop flag set by a panic.
+    fn wake(&self) {
+        let _held = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        self.cvar.notify_all();
+    }
+}
+
+impl Drop for WorkerSlot<'_> {
+    fn drop(&mut self) {
+        let mut active = self.gate.active.lock().unwrap_or_else(|p| p.into_inner());
+        *active = active.saturating_sub(1);
+        self.gate.cvar.notify_all();
+    }
+}
+
 /// Uploads a batch of local files to the remote URL concurrently.
 ///
-/// The worker pool is sized by `concurrency` (clamped to 1..=MAX_SCAN_CONCURRENCY,
-/// falling back to `get_scan_concurrency()` when `None`), mirroring the scan worker
-/// pool so the Settings "Threads" value governs both scanning and uploads.
+/// `concurrency` seeds the live limit (clamped to 1..=MAX_SCAN_CONCURRENCY) when
+/// `Some`; `None` keeps it. The scan and upload pools share that limit, and it is
+/// re-read for every claimed file, so a Settings change applies to an upload in flight.
 ///
 /// Design mirrors `list_remote_recursive_with_options_and_log`:
 /// - Work is distributed via a shared atomic cursor over `files`.
@@ -2071,10 +2230,12 @@ where
     if total == 0 {
         return Ok(UploadOutcome::Completed(0));
     }
-    let num_workers = concurrency
-        .map(|c| c.clamp(1, MAX_SCAN_CONCURRENCY))
-        .unwrap_or_else(get_scan_concurrency)
-        .min(total);
+    if let Some(requested) = concurrency {
+        set_scan_concurrency(requested);
+    }
+    // Grow the pool from the current limit as Settings raises it, instead of
+    // pre-allocating the full 64-thread ceiling up front.
+    let gate = WorkerGate::new();
 
     let next_idx = AtomicUsize::new(0);
     let copied = AtomicUsize::new(0);
@@ -2082,149 +2243,267 @@ where
     let error: Mutex<Option<String>> = Mutex::new(None);
     let cache_write_lock = Mutex::new(());
 
-    let (log_tx, log_rx) = mpsc::channel::<String>();
+    /// Live worker count plus the condvar that wakes the spawn controller.
+    struct UploadControl {
+        live_workers: usize,
+    }
 
-    std::thread::scope(|s| {
-        for _ in 0..num_workers {
-            let worker_log_tx = log_tx.clone();
-            let files_ref = &files;
-            let next_idx_ref = &next_idx;
-            let copied_ref = &copied;
-            let stop_ref = &stop;
-            let error_ref = &error;
-            let cache_write_lock_ref = &cache_write_lock;
+    let control = Arc::new((
+        Mutex::new(UploadControl { live_workers: 0 }),
+        Condvar::new(),
+    ));
+    let control_wake: Arc<PoolWake> = {
+        let control = Arc::clone(&control);
+        Arc::new(move || {
+            // Hold the control lock so the controller cannot miss this wakeup
+            // between checking live_workers and parking on the condvar.
+            let _held = control.0.lock().unwrap_or_else(|p| p.into_inner());
+            control.1.notify_all();
+        })
+    };
+    register_concurrency_wakeup(&control_wake);
+    let _control_wake = control_wake;
 
-            s.spawn(move || {
-                let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    loop {
-                        if stop_ref.load(Ordering::SeqCst)
-                            || cancel_flag.load(Ordering::SeqCst)
-                        {
-                            return;
-                        }
-                        let idx = next_idx_ref.fetch_add(1, Ordering::SeqCst);
-                        if idx >= total {
-                            return;
-                        }
-                        let (path, rel_str, size) = &files_ref[idx];
-                        let current_num = idx + 1;
-                        if *size > max_size {
-                            let _ = worker_log_tx.send(format!(
-                                "[{}/{}] ERROR: File {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
-                                current_num, total, rel_str, size, max_size
-                            ));
-                            continue;
-                        }
-                        let file_url = build_file_url(remote_url, rel_str);
+    struct LiveWorkerGuard {
+        control: Arc<(Mutex<UploadControl>, Condvar)>,
+    }
+
+    impl Drop for LiveWorkerGuard {
+        fn drop(&mut self) {
+            let mut control = self.control.0.lock().unwrap_or_else(|p| p.into_inner());
+            control.live_workers = control.live_workers.saturating_sub(1);
+            self.control.1.notify_all();
+        }
+    }
+
+    /// Per-batch state shared by every upload worker.
+    #[derive(Clone, Copy)]
+    struct UploadCtx<'a> {
+        client: &'a rustydav::client::Client,
+        remote_url: &'a str,
+        files: &'a [(PathBuf, String, u64)],
+        next_idx: &'a AtomicUsize,
+        copied: &'a AtomicUsize,
+        stop: &'a AtomicBool,
+        error: &'a Mutex<Option<String>>,
+        cache_write_lock: &'a Mutex<()>,
+        cancel_flag: &'a AtomicBool,
+        auth_user: Option<&'a str>,
+        gate: &'a WorkerGate,
+        total: usize,
+        max_size: u64,
+        with_checksum: bool,
+        done_label: &'a str,
+    }
+
+    let ctx = UploadCtx {
+        client,
+        remote_url,
+        files: &files,
+        next_idx: &next_idx,
+        copied: &copied,
+        stop: &stop,
+        error: &error,
+        cache_write_lock: &cache_write_lock,
+        cancel_flag,
+        auth_user,
+        gate: &gate,
+        total,
+        max_size,
+        with_checksum,
+        done_label,
+    };
+    let ctx_ref = &ctx;
+    let control_arc = Arc::clone(&control);
+
+    fn spawn_upload_worker<'scope, 'env: 'scope>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        ctx: &'env UploadCtx<'env>,
+        control: Arc<(Mutex<UploadControl>, Condvar)>,
+        log_tx: mpsc::Sender<String>,
+    ) {
+        let worker_log_tx = log_tx;
+        scope.spawn(move || {
+        let _live = LiveWorkerGuard { control };
+        let UploadCtx {
+            client,
+            remote_url,
+            files: files_ref,
+            next_idx: next_idx_ref,
+            copied: copied_ref,
+            stop: stop_ref,
+            error: error_ref,
+            cache_write_lock: cache_write_lock_ref,
+            cancel_flag,
+            auth_user,
+            gate: gate_ref,
+            total,
+            max_size,
+            with_checksum,
+            done_label,
+        } = *ctx;
+            let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                loop {
+                    let Some(_slot) = gate_ref.acquire(stop_ref, cancel_flag) else {
+                        return;
+                    };
+                    if stop_ref.load(Ordering::SeqCst)
+                        || cancel_flag.load(Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                    let idx = next_idx_ref.fetch_add(1, Ordering::SeqCst);
+                    if idx >= total {
+                        return;
+                    }
+                    let (path, rel_str, size) = &files_ref[idx];
+                    let current_num = idx + 1;
+                    if *size > max_size {
                         let _ = worker_log_tx.send(format!(
-                            "[{}/{}] Uploading: {} ({} bytes)...\n",
-                            current_num, total, rel_str, size
+                            "[{}/{}] ERROR: File {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
+                            current_num, total, rel_str, size, max_size
                         ));
-                        if let Err(e) = ensure_remote_parent_dirs(
-                            client,
-                            remote_url,
-                            rel_str,
-                            cancel_flag,
-                            &mut |msg: &str| {
-                                let _ = worker_log_tx.send(msg.to_string());
-                            },
-                        ) {
+                        continue;
+                    }
+                    let file_url = build_file_url(remote_url, rel_str);
+                    let _ = worker_log_tx.send(format!(
+                        "[{}/{}] Uploading: {} ({} bytes)...\n",
+                        current_num, total, rel_str, size
+                    ));
+                    if let Err(e) = ensure_remote_parent_dirs(
+                        client,
+                        remote_url,
+                        rel_str,
+                        cancel_flag,
+                        &mut |msg: &str| {
+                            let _ = worker_log_tx.send(msg.to_string());
+                        },
+                    ) {
+                        let _ = worker_log_tx.send(format!(
+                            "[{}/{}] ERROR: Failed creating remote directory for {}: {}\n",
+                            current_num, total, rel_str, e
+                        ));
+                        continue;
+                    }
+                    let checksum_str = if with_checksum {
+                        match compute_file_sha256(path) {
+                            Ok(hash) => format!(" (sha256: {})", hash),
+                            Err(_) => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let put_result = retry_webdav_operation(
+                        &format!("PUT {file_url}"),
+                        cancel_flag,
+                        REQUEST_MAX_ATTEMPTS,
+                        RETRY_DELAY,
+                        |msg: &str| {
+                            let _ = worker_log_tx.send(msg.to_string());
+                        },
+                        || {
+                            // PUT consumes the handle, so each attempt opens the file afresh.
+                            let file = std::fs::File::open(path).map_err(|e| {
+                                AttemptError::Fatal(format!(
+                                    "Failed to open {}: {}",
+                                    path.display(),
+                                    e
+                                ))
+                            })?;
+                            client.put(file, &file_url).map_err(|e| {
+                                classify_reqwest_error(&format!("PUT {file_url}"), &e)
+                            })
+                        },
+                    );
+                    let res = match put_result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if cancel_flag.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            // The file had every retry and still failed; skip it and keep
+                            // uploading the rest of the batch.
                             let _ = worker_log_tx.send(format!(
-                                "[{}/{}] ERROR: Failed creating remote directory for {}: {}\n",
+                                "[{}/{}] ERROR: Upload failed for {}: {}\n",
                                 current_num, total, rel_str, e
                             ));
                             continue;
                         }
-                        let checksum_str = if with_checksum {
-                            match compute_file_sha256(path) {
-                                Ok(hash) => format!(" (sha256: {})", hash),
-                                Err(_) => String::new(),
-                            }
-                        } else {
-                            String::new()
-                        };
-                        let put_result = retry_webdav_operation(
-                            &format!("PUT {file_url}"),
-                            cancel_flag,
-                            REQUEST_MAX_ATTEMPTS,
-                            RETRY_DELAY,
-                            |msg: &str| {
-                                let _ = worker_log_tx.send(msg.to_string());
-                            },
-                            || {
-                                // PUT consumes the handle, so each attempt opens the file afresh.
-                                let file = std::fs::File::open(path).map_err(|e| {
-                                    AttemptError::Fatal(format!(
-                                        "Failed to open {}: {}",
-                                        path.display(),
-                                        e
-                                    ))
-                                })?;
-                                client.put(file, &file_url).map_err(|e| {
-                                    classify_reqwest_error(&format!("PUT {file_url}"), &e)
-                                })
-                            },
-                        );
-                        let res = match put_result {
-                            Ok(r) => r,
-                            Err(e) => {
-                                if cancel_flag.load(Ordering::SeqCst) {
-                                    return;
-                                }
-                                // The file had every retry and still failed; skip it and keep
-                                // uploading the rest of the batch.
-                                let _ = worker_log_tx.send(format!(
-                                    "[{}/{}] ERROR: Upload failed for {}: {}\n",
-                                    current_num, total, rel_str, e
-                                ));
-                                continue;
-                            }
-                        };
-                        if res.status().is_success() {
-                            copied_ref.fetch_add(1, Ordering::SeqCst);
-                            if is_cache_enabled() {
-                                let mtime = std::fs::metadata(path)
-                                    .ok()
-                                    .and_then(|m| get_metadata_mtime(&m));
-                                // Serialize the cache read-modify-write across workers.
-                                let _guard = cache_write_lock_ref
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner());
-                                update_remote_cache_item(
-                                    remote_url,
-                                    auth_user,
-                                    rel_str,
-                                    *size,
-                                    mtime,
-                                );
-                            }
-                            let _ = worker_log_tx.send(format!(
-                                "[{}/{}] {}: {} ({} bytes){}\n",
-                                current_num, total, done_label, rel_str, size, checksum_str
-                            ));
-                        } else {
-                            let _ = worker_log_tx.send(format!(
-                                "[{}/{}] ERROR: Failed to copy {}: HTTP {}\n",
-                                current_num, total, rel_str, res.status()
-                            ));
+                    };
+                    if res.status().is_success() {
+                        copied_ref.fetch_add(1, Ordering::SeqCst);
+                        if is_cache_enabled() {
+                            let mtime = std::fs::metadata(path)
+                                .ok()
+                                .and_then(|m| get_metadata_mtime(&m));
+                            // Serialize the cache read-modify-write across workers.
+                            let _guard = cache_write_lock_ref
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            update_remote_cache_item(
+                                remote_url,
+                                auth_user,
+                                rel_str,
+                                *size,
+                                mtime,
+                            );
                         }
+                        let _ = worker_log_tx.send(format!(
+                            "[{}/{}] {}: {} ({} bytes){}\n",
+                            current_num, total, done_label, rel_str, size, checksum_str
+                        ));
+                    } else {
+                        let _ = worker_log_tx.send(format!(
+                            "[{}/{}] ERROR: Failed to copy {}: HTTP {}\n",
+                            current_num, total, rel_str, res.status()
+                        ));
                     }
-                }));
-                if run_result.is_err() {
-                    let mut err_slot = error_ref.lock().unwrap_or_else(|p| p.into_inner());
-                    if err_slot.is_none() {
-                        *err_slot = Some("Upload worker thread panicked unexpectedly.".to_string());
-                    }
-                    stop_ref.store(true, Ordering::SeqCst);
                 }
-            });
-        }
+            }));
+            if run_result.is_err() {
+                let mut err_slot = error_ref.lock().unwrap_or_else(|p| p.into_inner());
+                if err_slot.is_none() {
+                    *err_slot = Some("Upload worker thread panicked unexpectedly.".to_string());
+                }
+                stop_ref.store(true, Ordering::SeqCst);
+                gate_ref.wake();
+            }
+        });
+    }
 
-        drop(log_tx);
+    let (log_tx, log_rx) = mpsc::channel::<String>();
+
+    std::thread::scope(|s| {
+        // One controller thread owns spawning so the pool starts at the current
+        // limit and grows as Settings raises it.
+        let stop_ref = &stop;
+        let cancel_ref = cancel_flag;
+        let next_ref = &next_idx;
+        let controller = s.spawn(move || {
+            let mut control = control_arc.0.lock().unwrap_or_else(|p| p.into_inner());
+            loop {
+                if stop_ref.load(Ordering::SeqCst) || cancel_ref.load(Ordering::SeqCst) {
+                    break;
+                }
+                let target = current_scan_concurrency().min(total);
+                if control.live_workers < target && next_ref.load(Ordering::SeqCst) < total {
+                    control.live_workers += 1;
+                    drop(control);
+                    spawn_upload_worker(s, ctx_ref, Arc::clone(&control_arc), log_tx.clone());
+                    control = control_arc.0.lock().unwrap_or_else(|p| p.into_inner());
+                    continue;
+                }
+                if control.live_workers == 0 {
+                    break;
+                }
+                control = control_arc.1.wait(control).unwrap_or_else(|p| p.into_inner());
+            }
+        });
 
         while let Ok(msg) = log_rx.recv() {
             log(&msg);
         }
+        let _ = controller.join();
     });
 
     let copied = copied.load(Ordering::SeqCst);
@@ -2255,8 +2534,9 @@ where
 
 /// Executes a native WebDAV action with custom options (such as worker concurrency and auth context) and streams logs.
 ///
-/// `concurrency` sizes both the remote scan worker pool and the upload worker
-/// pool (put/sync), so the Settings "Threads" value governs each phase.
+/// `concurrency` seeds the live limit shared by the remote scan and upload worker
+/// pools (put/sync). The limit is re-read while they run, so a Settings "Threads"
+/// change applies to the phase that is already in progress.
 pub fn execute_webdav_action_with_options<F>(
     client: &rustydav::client::Client,
     action: &str,
@@ -2303,6 +2583,11 @@ where
     F: FnMut(&str),
 {
     validate_webdav_url(remote_url)?;
+    // Seed the live limit once per action. Passing `None` to the phase helpers
+    // below keeps a Settings change made mid-action from being overwritten.
+    if let Some(requested) = concurrency {
+        set_scan_concurrency(requested);
+    }
     if !exclude_folders.is_empty() {
         log(&format!(
             "Excluding folder(s): {}\n",
@@ -2319,7 +2604,7 @@ where
                 client,
                 remote_url,
                 cancel_flag,
-                concurrency,
+                None,
                 auth_user,
                 true,
                 exclude_folders,
@@ -2401,7 +2686,7 @@ where
                 client,
                 remote_url,
                 cancel_flag,
-                concurrency,
+                None,
                 auth_user,
                 true,
                 exclude_folders,
@@ -2485,7 +2770,7 @@ where
                 remote_url,
                 files_to_upload,
                 cancel_flag,
-                concurrency,
+                None,
                 auth_user,
                 max_size,
                 with_checksum,
@@ -2513,7 +2798,7 @@ where
                 client,
                 remote_url,
                 cancel_flag,
-                concurrency,
+                None,
                 auth_user,
                 false,
                 exclude_folders,
@@ -2745,7 +3030,7 @@ where
                 client,
                 remote_url,
                 cancel_flag,
-                concurrency,
+                None,
                 auth_user,
                 true,
                 exclude_folders,
@@ -2807,7 +3092,7 @@ where
                 client,
                 remote_url,
                 cancel_flag,
-                concurrency,
+                None,
                 auth_user,
                 true,
                 exclude_folders,
@@ -2847,7 +3132,7 @@ where
                 remote_url,
                 files_to_upload,
                 cancel_flag,
-                concurrency,
+                None,
                 auth_user,
                 max_size,
                 false,
@@ -3446,6 +3731,41 @@ mod tests {
         assert_eq!(MAX_SCANNED_DIRS_LIMIT, 10_000);
         let concurrency = get_scan_concurrency();
         assert!(concurrency >= 1 && concurrency <= MAX_SCAN_CONCURRENCY);
+    }
+
+    #[test]
+    fn test_set_scan_concurrency_updates_live_value_and_gates_workers() {
+        set_scan_concurrency(MAX_SCAN_CONCURRENCY + 100);
+        assert_eq!(current_scan_concurrency(), MAX_SCAN_CONCURRENCY);
+        set_scan_concurrency(0);
+        assert_eq!(current_scan_concurrency(), 1);
+        set_scan_concurrency(3);
+        assert_eq!(current_scan_concurrency(), 3);
+
+        // A gated worker must stay parked at the limit and be admitted when it rises.
+        set_scan_concurrency(1);
+        let gate = WorkerGate::new();
+        let stop = AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        let held = gate.acquire(&stop, &cancel).expect("first slot");
+        let admitted = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _slot = gate.acquire(&stop, &cancel);
+                admitted.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!admitted.load(Ordering::SeqCst), "worker exceeded the live limit");
+            set_scan_concurrency(2);
+        });
+        assert!(admitted.load(Ordering::SeqCst), "worker was not admitted after the limit was raised");
+        drop(held);
+
+        // Cancellation must release parked workers even when no slot is free.
+        cancel.store(true, Ordering::SeqCst);
+        assert!(gate.acquire(&stop, &cancel).is_none(), "cancel must win over the wait");
+
+        set_scan_concurrency(DEFAULT_SCAN_CONCURRENCY);
     }
 
     #[test]
