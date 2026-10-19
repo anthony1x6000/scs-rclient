@@ -9,6 +9,7 @@ export interface RcloneSettings {
   selectedSubdir: string;
   targetSubdir: string;
   scanConcurrency: number;
+  excludedFolders: string[];
 }
 
 export type RcloneActionType = 'put' | 'get' | 'get-backup' | 'get-backup-dated' | 'put-dry' | 'get-dry' | 'put-checksum' | 'get-checksum' | 'ls' | 'lsd' | 'check' | 'sync';
@@ -39,6 +40,7 @@ export async function loadSettings(): Promise<RcloneSettings> {
     selectedSubdir: s.selectedSubdir,
     targetSubdir: s.targetSubdir,
     scanConcurrency: s.scanConcurrency,
+    excludedFolders: s.excludedFolders,
   };
 }
 
@@ -139,6 +141,7 @@ export function useRcloneExecution(
         concurrency: settings.scanConcurrency,
         backup: isBackup || undefined,
         backupDated: isDatedBackup || undefined,
+        excludeFolders: settings.excludedFolders,
       });
 
       log(`\nWebDAV operation finished successfully.\n`);

@@ -15,6 +15,10 @@ pub const MAX_SCAN_CONCURRENCY: usize = 64;
 /// Set to 10,000 to comfortably accommodate very large course hierarchies (typical max depth ~10 * breadth ~100)
 /// while bounding memory usage and avoiding infinite traversal cycles.
 pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
+/// Maximum number of excluded folder patterns applied to a single action.
+pub const MAX_EXCLUDE_PATTERNS: usize = 64;
+/// Maximum length (in characters) of one excluded folder pattern.
+pub const MAX_EXCLUDE_PATTERN_CHARS: usize = 256;
 /// Default number of attempts for a single WebDAV request before it is treated as failed.
 /// Retrying absorbs transient transport failures (timeouts, connection resets, truncated
 /// bodies) so one flaky request cannot abort an entire multi-file transfer.
@@ -194,6 +198,88 @@ where
         "[webdav] {operation}: giving up after {max_attempts} attempt(s).\n"
     ));
     Err(last_failure)
+}
+
+/// Normalizes one user-supplied excluded folder pattern into a slash-separated path.
+///
+/// Leading/trailing slashes, `.` segments, backslashes, and repeated separators are
+/// dropped, so `.git/`, `/.git`, and `.git` all normalize to `.git`. Patterns that are
+/// empty, escape with `..`, contain NUL, or exceed [`MAX_EXCLUDE_PATTERN_CHARS`] are
+/// rejected. Matching itself is relative to the scan root, so a normalized pattern can
+/// never address anything outside the selected remote subdirectory.
+pub fn normalize_exclude_pattern(raw: &str) -> Option<String> {
+    let replaced = raw.trim().replace('\\', "/");
+    let parts: Vec<&str> = replaced
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if parts
+        .iter()
+        .any(|part| *part == ".." || part.contains('\0'))
+    {
+        return None;
+    }
+    let normalized = parts.join("/");
+    if normalized.is_empty() || normalized.chars().count() > MAX_EXCLUDE_PATTERN_CHARS {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+/// Normalizes, validates, and deduplicates exclusion patterns while preserving their order.
+pub fn normalize_exclude_folders(raw: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for entry in raw {
+        if normalized.len() >= MAX_EXCLUDE_PATTERNS {
+            break;
+        }
+        if let Some(pattern) = normalize_exclude_pattern(entry) {
+            if seen.insert(pattern.clone()) {
+                normalized.push(pattern);
+            }
+        }
+    }
+    normalized
+}
+
+/// Returns true when a scan-root-relative path lives in an excluded folder.
+///
+/// - A pattern containing `/` matches that relative folder and everything under it, so
+///   `assets/cache` excludes `assets/cache/` and `assets/cache/data.bin`.
+/// - A pattern without `/` matches that folder name at any depth, so `.git` excludes
+///   `.git/`, `sub/.git/`, and their contents.
+///
+/// `is_dir` distinguishes the path itself from its descendants: a *file* named `.git`
+/// is not an excluded folder, while a file under `.git/` still is. Matching is
+/// case-sensitive and only considers path components: it never resolves the path, so
+/// it cannot be used to escape the scan root.
+pub fn is_excluded_path(rel_path: &str, is_dir: bool, exclude_folders: &[String]) -> bool {
+    if exclude_folders.is_empty() {
+        return false;
+    }
+    let normalized = rel_path.trim_matches('/').replace('\\', "/");
+    if normalized.is_empty() {
+        return false;
+    }
+    let segments: Vec<&str> = normalized.split('/').collect();
+    exclude_folders.iter().any(|pattern| {
+        if pattern.contains('/') {
+            if normalized == *pattern {
+                return is_dir;
+            }
+            normalized
+                .strip_prefix(pattern.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        } else {
+            segments.iter().enumerate().any(|(index, segment)| {
+                // An intermediate matching component is always a directory; the final
+                // component only counts when the path itself is a directory.
+                *segment == pattern && (is_dir || index + 1 < segments.len())
+            })
+        }
+    })
 }
 
 /// Returns the concurrency limit for remote WebDAV folder scanning.
@@ -1225,6 +1311,9 @@ where
 /// - `concurrency`: Worker thread count (1..64). If `None`, defaults to `get_scan_concurrency()`.
 /// - `auth_user`: Optional username for credential-scoped cache partitioning (CWE-287 / CWE-384).
 /// - `use_cache`: When true and cache is enabled, loads from/saves to remote listing cache. When false (e.g. GET), bypasses cache.
+///
+/// This is the exclusion-free variant; [`list_remote_recursive_with_exclusions_and_log`]
+/// additionally prunes excluded folders from the traversal.
 pub fn list_remote_recursive_with_options_and_log<F>(
     client: &rustydav::client::Client,
     remote_url: &str,
@@ -1232,6 +1321,41 @@ pub fn list_remote_recursive_with_options_and_log<F>(
     concurrency: Option<usize>,
     auth_user: Option<&str>,
     use_cache: bool,
+    log: F,
+) -> Result<Vec<WebdavItem>, String>
+where
+    F: FnMut(&str),
+{
+    list_remote_recursive_with_exclusions_and_log(
+        client,
+        remote_url,
+        cancel_flag,
+        concurrency,
+        auth_user,
+        use_cache,
+        &[],
+        log,
+    )
+}
+
+/// Recursively lists remote WebDAV items under remote_url, pruning excluded folders.
+///
+/// Excluded directories are never enqueued for traversal (so their contents are never
+/// requested) and any items under them are dropped from the result — including results
+/// of a `Depth: infinity` response, which the server may expand on its own.
+///
+/// Parameters:
+/// - `exclude_folders`: Normalized patterns (see [`normalize_exclude_folders`]).
+/// - `use_cache`: Listing cache is bypassed while exclusions are active, because a cached
+///   listing cannot be reconciled with patterns added or removed since it was saved.
+pub fn list_remote_recursive_with_exclusions_and_log<F>(
+    client: &rustydav::client::Client,
+    remote_url: &str,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
+    auth_user: Option<&str>,
+    use_cache: bool,
+    exclude_folders: &[String],
     mut log: F,
 ) -> Result<Vec<WebdavItem>, String>
 where
@@ -1241,6 +1365,7 @@ where
     if cancel_flag.load(Ordering::SeqCst) {
         return Err("Operation canceled by user.".to_string());
     }
+    let use_cache = use_cache && exclude_folders.is_empty();
 
     if use_cache && is_cache_enabled() {
         if let Some(cached_items) = load_remote_cache(remote_url, auth_user) {
@@ -1275,7 +1400,18 @@ where
             let status = res.status();
             if status.is_success() || status.as_u16() == 207 {
                 let body = res.text().unwrap_or_default();
-                let items = parse_propfind_xml(&body);
+                let items: Vec<WebdavItem> = parse_propfind_xml(&body)
+                    .into_iter()
+                    // A Depth: infinity response is expanded server-side, so drop excluded
+                    // folders and everything under them before they can be cached or used.
+                    .filter(|item| {
+                        !is_excluded_path(
+                            &relative_item_path(remote_url, &item.href),
+                            item.is_dir,
+                            exclude_folders,
+                        )
+                    })
+                    .collect();
                 // Depth: infinity is only accepted if it returned child items (not just the root collection itself)
                 let child_count = items
                     .iter()
@@ -1569,18 +1705,28 @@ where
                                 continue;
                             }
 
+                            // Resolve once so an href that is relative to the current
+                            // collection still yields a correct scan-root-relative path.
+                            let item_url = resolve_item_url(&current_url, &item.href);
+                            let rel_from_root = relative_item_path(remote_url, &item_url);
+
+                            // Excluded folders are pruned before they are enqueued, so no
+                            // request is ever issued for their contents. This also drops
+                            // descendants that a single listing may have returned.
+                            if is_excluded_path(&rel_from_root, item.is_dir, exclude_folders) {
+                                continue;
+                            }
+
                             children_in_dir += 1;
                             if item.is_dir {
                                 new_dirs += 1;
-                                let sub_url = resolve_item_url(&current_url, &item.href);
-                                if let Ok(parsed_sub) = rustydav::prelude::Url::parse(&sub_url) {
-                                    if parsed_sub.origin() == worker_remote_origin {
-                                        let rel_from_root = relative_item_path(remote_url, &sub_url);
-                                        if !rel_from_root.is_empty() && is_safe_relative_path(&rel_from_root) {
-                                            if validate_webdav_url(&sub_url).is_ok() {
-                                                discovered_sub_urls.push(sub_url);
-                                            }
-                                        }
+                                if let Ok(parsed_sub) = rustydav::prelude::Url::parse(&item_url) {
+                                    if parsed_sub.origin() == worker_remote_origin
+                                        && !rel_from_root.is_empty()
+                                        && is_safe_relative_path(&rel_from_root)
+                                        && validate_webdav_url(&item_url).is_ok()
+                                    {
+                                        discovered_sub_urls.push(item_url);
                                     }
                                 }
                                 discovered_items.push(item);
@@ -1703,6 +1849,17 @@ pub fn get_metadata_mtime(metadata: &std::fs::Metadata) -> Option<u64> {
 /// Walks a local directory recursively and returns (path, rel_path, size, mtime).
 /// Skips symlinks to prevent directory traversal and arbitrary file disclosure.
 pub fn collect_local_files_with_mtime(dir: &Path) -> Vec<(PathBuf, String, u64, Option<u64>)> {
+    collect_local_files_with_mtime_excluding(dir, &[])
+}
+
+/// Walks a local directory recursively, pruning excluded folders before descending.
+///
+/// An excluded directory is never read, so files inside it cannot be uploaded, mirrored,
+/// or reported as missing by comparison actions. Symlinks are skipped as before.
+pub fn collect_local_files_with_mtime_excluding(
+    dir: &Path,
+    exclude_folders: &[String],
+) -> Vec<(PathBuf, String, u64, Option<u64>)> {
     let mut files = Vec::new();
     if !dir.exists() || !dir.is_dir() {
         return files;
@@ -1727,6 +1884,12 @@ pub fn collect_local_files_with_mtime(dir: &Path) -> Vec<(PathBuf, String, u64, 
                     Err(_) => continue,
                 };
                 if symlink_meta.is_dir() {
+                    if let Ok(rel) = path.strip_prefix(dir) {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if is_excluded_path(&rel_str, true, exclude_folders) {
+                            continue;
+                        }
+                    }
                     stack.push(path);
                 } else if symlink_meta.is_file() {
                     if let Ok(canonical_path) = path.canonicalize() {
@@ -1736,6 +1899,9 @@ pub fn collect_local_files_with_mtime(dir: &Path) -> Vec<(PathBuf, String, u64, 
                     }
                     if let Ok(rel) = path.strip_prefix(dir) {
                         let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if is_excluded_path(&rel_str, false, exclude_folders) {
+                            continue;
+                        }
                         let meta = entry.metadata().ok();
                         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
                         let mtime = meta.as_ref().and_then(get_metadata_mtime);
@@ -1751,7 +1917,15 @@ pub fn collect_local_files_with_mtime(dir: &Path) -> Vec<(PathBuf, String, u64, 
 
 /// Walks a local directory recursively and returns (path, rel_path, size).
 pub fn collect_local_files(dir: &Path) -> Vec<(PathBuf, String, u64)> {
-    collect_local_files_with_mtime(dir)
+    collect_local_files_excluding(dir, &[])
+}
+
+/// Walks a local directory recursively while pruning excluded folders.
+pub fn collect_local_files_excluding(
+    dir: &Path,
+    exclude_folders: &[String],
+) -> Vec<(PathBuf, String, u64)> {
+    collect_local_files_with_mtime_excluding(dir, exclude_folders)
         .into_iter()
         .map(|(p, r, s, _)| (p, r, s))
         .collect()
@@ -2084,20 +2258,65 @@ pub fn execute_webdav_action_with_options<F>(
     cancel_flag: &AtomicBool,
     concurrency: Option<usize>,
     auth_user: Option<&str>,
+    log: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str),
+{
+    execute_webdav_action_with_exclusions(
+        client,
+        action,
+        remote_url,
+        local_dir,
+        cancel_flag,
+        concurrency,
+        auth_user,
+        &[],
+        log,
+    )
+}
+
+/// Executes a native WebDAV action, pruning `exclude_folders` from every scan.
+///
+/// Excluded folders are skipped on both sides of an operation: the local walk never
+/// descends into them and the remote traversal never requests them. As a result they
+/// are never uploaded, downloaded, compared, or deleted by a mirror (`sync`).
+pub fn execute_webdav_action_with_exclusions<F>(
+    client: &rustydav::client::Client,
+    action: &str,
+    remote_url: &str,
+    local_dir: &Path,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
+    auth_user: Option<&str>,
+    exclude_folders: &[String],
     mut log: F,
 ) -> Result<(), String>
 where
     F: FnMut(&str),
 {
     validate_webdav_url(remote_url)?;
+    if !exclude_folders.is_empty() {
+        log(&format!(
+            "Excluding folder(s): {}\n",
+            exclude_folders.join(", ")
+        ));
+    }
     match action {
         "ls" => {
             log(&format!(
                 "Listing remote files and folders in {}...\n",
                 remote_url
             ));
-            let items = list_remote_recursive_with_concurrency_and_log(
-                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
+            let items = list_remote_recursive_with_exclusions_and_log(
+                client,
+                remote_url,
+                cancel_flag,
+                concurrency,
+                auth_user,
+                true,
+                exclude_folders,
+                &mut log,
             )?;
             let mut file_count = 0;
             let mut dir_count = 0;
@@ -2147,7 +2366,7 @@ where
                     continue;
                 }
                 let rel = relative_item_path(remote_url, &item.href);
-                if rel.is_empty() {
+                if rel.is_empty() || is_excluded_path(&rel, item.is_dir, exclude_folders) {
                     continue;
                 }
                 log(&format!("{:>9} {}/\n", -1, rel));
@@ -2160,7 +2379,7 @@ where
             let is_dry = action == "put-dry";
             let with_checksum = action == "put-checksum";
             log(&format!("Reading local files in {}...\n", local_dir.display()));
-            let local_files = collect_local_files_with_mtime(local_dir);
+            let local_files = collect_local_files_with_mtime_excluding(local_dir, exclude_folders);
             if local_files.is_empty() {
                 log("No local files found to copy.\n");
                 return Ok(());
@@ -2171,8 +2390,15 @@ where
                 local_files.len(),
                 remote_url
             ));
-            let remote_items = list_remote_recursive_with_concurrency_and_log(
-                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
+            let remote_items = list_remote_recursive_with_exclusions_and_log(
+                client,
+                remote_url,
+                cancel_flag,
+                concurrency,
+                auth_user,
+                true,
+                exclude_folders,
+                &mut log,
             )?;
             let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
             for item in remote_items {
@@ -2276,8 +2502,15 @@ where
             let with_checksum = action == "get-checksum";
             log(&format!("Querying remote files in {} with parallel scan...\n", remote_url));
             // Caching does not apply for GET; bypass cache to ensure fresh remote scan
-            let items = list_remote_recursive_with_options_and_log(
-                client, remote_url, cancel_flag, concurrency, auth_user, false, &mut log,
+            let items = list_remote_recursive_with_exclusions_and_log(
+                client,
+                remote_url,
+                cancel_flag,
+                concurrency,
+                auth_user,
+                false,
+                exclude_folders,
+                &mut log,
             )?;
             let remote_files: Vec<(&WebdavItem, String)> = items
                 .iter()
@@ -2293,7 +2526,7 @@ where
                 .collect();
 
             log(&format!("Scanning local files in {}...\n", local_dir.display()));
-            let local_files = collect_local_files_with_mtime(local_dir);
+            let local_files = collect_local_files_with_mtime_excluding(local_dir, exclude_folders);
             let mut local_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
             for (_, rel, size, mtime) in local_files {
                 local_map.insert(rel, (size, mtime));
@@ -2501,8 +2734,15 @@ where
         }
         "check" => {
             log(&format!("Comparing local files with remote in {}...\n", remote_url));
-            let remote_items = list_remote_recursive_with_concurrency_and_log(
-                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
+            let remote_items = list_remote_recursive_with_exclusions_and_log(
+                client,
+                remote_url,
+                cancel_flag,
+                concurrency,
+                auth_user,
+                true,
+                exclude_folders,
+                &mut log,
             )?;
             let mut remote_map: HashMap<String, u64> = HashMap::new();
             for item in remote_items {
@@ -2514,7 +2754,7 @@ where
                     remote_map.insert(rel, item.size);
                 }
             }
-            let local_files = collect_local_files(local_dir);
+            let local_files = collect_local_files_excluding(local_dir, exclude_folders);
             let mut matching = 0;
             let mut differences = 0;
             for (_, rel, local_size) in &local_files {
@@ -2552,12 +2792,19 @@ where
                 local_dir.display(),
                 remote_url
             ));
-            let local_files = collect_local_files_with_mtime(local_dir);
+            let local_files = collect_local_files_with_mtime_excluding(local_dir, exclude_folders);
             let mut local_set: HashSet<String> = HashSet::new();
 
             log(&format!("Querying remote files in {} to detect changes...\n", remote_url));
-            let remote_items = list_remote_recursive_with_concurrency_and_log(
-                client, remote_url, cancel_flag, concurrency, auth_user, &mut log,
+            let remote_items = list_remote_recursive_with_exclusions_and_log(
+                client,
+                remote_url,
+                cancel_flag,
+                concurrency,
+                auth_user,
+                true,
+                exclude_folders,
+                &mut log,
             )?;
             let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
             for item in &remote_items {
@@ -3281,6 +3528,124 @@ mod tests {
         // Missing timestamp -> skip if sizes match
         assert!(!should_download_file(100, None, 100, Some(1000)));
         assert!(!should_download_file(100, Some(1000), 100, None));
+    }
+
+    #[test]
+    fn test_normalize_exclude_folders() {
+        let raw = vec![
+            " .git/ ".to_string(),
+            "/node_modules/".to_string(),
+            "assets\\cache".to_string(),
+            "assets//cache".to_string(),
+            ".".to_string(),
+            "..".to_string(),
+            "a/../b".to_string(),
+            "".to_string(),
+            "build/".to_string(),
+        ];
+        assert_eq!(
+            normalize_exclude_folders(&raw),
+            vec![
+                ".git".to_string(),
+                "node_modules".to_string(),
+                "assets/cache".to_string(),
+                "build".to_string(),
+            ]
+        );
+        assert_eq!(
+            normalize_exclude_pattern("  ./.git/  "),
+            Some(".git".to_string())
+        );
+        assert_eq!(normalize_exclude_pattern(".."), None);
+        assert_eq!(normalize_exclude_pattern("a/../b"), None);
+        assert_eq!(normalize_exclude_pattern("/"), None);
+        assert_eq!(
+            normalize_exclude_pattern(&"x".repeat(MAX_EXCLUDE_PATTERN_CHARS + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_excluded_path_matches_names_and_relative_paths() {
+        let patterns = normalize_exclude_folders(&[
+            ".git".to_string(),
+            "node_modules".to_string(),
+            "assets/cache".to_string(),
+        ]);
+
+        // Name-only patterns match a folder at any depth and everything inside it.
+        assert!(is_excluded_path(".git", true, &patterns));
+        assert!(is_excluded_path(".git/config", false, &patterns));
+        assert!(is_excluded_path("sub/.git/HEAD", false, &patterns));
+        assert!(is_excluded_path("sub/.git", true, &patterns));
+        assert!(is_excluded_path("node_modules/pkg/index.js", false, &patterns));
+
+        // Path patterns match only that relative folder and its descendants.
+        assert!(is_excluded_path("assets/cache", true, &patterns));
+        assert!(is_excluded_path("assets/cache/data.bin", false, &patterns));
+
+        // A *file* whose name matches a folder pattern is not an excluded folder.
+        assert!(!is_excluded_path(".git", false, &patterns));
+        assert!(!is_excluded_path("sub/.git", false, &patterns));
+        assert!(!is_excluded_path("assets/cache", false, &patterns));
+
+        // Similar names and prefixes must not be excluded.
+        assert!(!is_excluded_path("assets/cache2/data.bin", false, &patterns));
+        assert!(!is_excluded_path(".gitlab/config", false, &patterns));
+        assert!(!is_excluded_path("assets/keep.txt", false, &patterns));
+        assert!(!is_excluded_path("", true, &patterns));
+        assert!(!is_excluded_path(".git", true, &[]));
+    }
+
+    #[test]
+    fn test_collect_local_files_prunes_excluded_folders() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "scs_exclude_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let write = |rel: &str| {
+            let path = temp_dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"data").unwrap();
+        };
+        write("keep.txt");
+        write("assets/keep.txt");
+        write("assets/cache/data.bin");
+        write("assets/cache2/keep.txt");
+        write(".git/config");
+        write("sub/.git/HEAD");
+        write("node_modules/pkg/index.js");
+        // A regular file named like a folder pattern must still be collected.
+        write("logs");
+        write("nested/logs/keep.txt");
+
+        let patterns = normalize_exclude_folders(&[
+            ".git/".to_string(),
+            "node_modules".to_string(),
+            "assets/cache".to_string(),
+            "logs".to_string(),
+        ]);
+        let mut collected: Vec<String> = collect_local_files_excluding(&temp_dir, &patterns)
+            .into_iter()
+            .map(|(_, rel, _)| rel)
+            .collect();
+        collected.sort();
+        assert_eq!(
+            collected,
+            vec![
+                "assets/cache2/keep.txt".to_string(),
+                "assets/keep.txt".to_string(),
+                "keep.txt".to_string(),
+                "logs".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 
