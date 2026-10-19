@@ -42,10 +42,16 @@ on:
         type: string
 
 concurrency:
-  # Per branch, so a new push cancels the review of the commit it replaced. A
-  # manual run is keyed by its target pr instead: every dispatch on main shares
-  # one ref, and keying by ref would make each hand-run review cancel the last.
-  group: ai-review-${{ github.event.inputs.pr_number || github.event.workflow_run.head_branch || github.ref }}
+  # Per branch and per trigger, so a new push cancels the review of the commit it
+  # replaced. The trigger belongs in the key because Tauri Build reports twice
+  # for one push to a pr branch, once as a push and once as a pull_request, and
+  # both completions start this workflow. Keying by branch alone put those two
+  # runs in one group, so the push-triggered run — the one whose gate is skipped
+  # and which reviews nothing — cancelled the pull_request-triggered run that was
+  # actually reviewing. A manual run is keyed by its target pr instead: every
+  # dispatch on main shares one ref, and keying by ref would make each hand-run
+  # review cancel the last.
+  group: ai-review-${{ github.event.workflow_run.event || 'dispatch' }}-${{ github.event.inputs.pr_number || github.event.workflow_run.head_branch || github.ref }}
   cancel-in-progress: true
 
 jobs:
