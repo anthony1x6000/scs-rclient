@@ -11,7 +11,10 @@ name: AI Code Review
 #   `workflow_run`. That event is delivered only to a workflow file that exists
 #   on the default branch, and the copy that executes is the default branch's,
 #   so main has to stay the default branch. A pull request that predates this
-#   file landing gets no automatic review; dispatch this workflow by hand.
+#   file landing gets no automatic review; dispatch this workflow by hand with
+#   the pr number. A manual run is review-only: it never merges, because the pr
+#   it names may already be merged or may be a fork's, which the automatic path
+#   deliberately never merges.
 # - GATE: GATE_WORKFLOWS is both what the trigger watches and what "tests
 #   passed" means, and the two lists must stay identical or the wait never ends.
 #   A gating workflow that did not run for this commit (its `paths` filter) was
@@ -32,10 +35,17 @@ on:
     branches-ignore:
       - main
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: pull request number to review by hand; the run posts reviews and never merges
+        required: true
+        type: string
 
 concurrency:
-  # Per branch, so a new push cancels the review of the commit it replaced.
-  group: ai-review-${{ github.event.workflow_run.head_branch || github.ref }}
+  # Per branch, so a new push cancels the review of the commit it replaced. A
+  # manual run is keyed by its target pr instead: every dispatch on main shares
+  # one ref, and keying by ref would make each hand-run review cancel the last.
+  group: ai-review-${{ github.event.inputs.pr_number || github.event.workflow_run.head_branch || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -57,6 +67,7 @@ jobs:
       state: ${{ steps.checks.outputs.state }}
       runner: ${{ steps.target.outputs.runner }}
       open: ${{ steps.target.outputs.open }}
+      manual: ${{ steps.target.outputs.manual }}
       pr_number: ${{ steps.target.outputs.pr_number }}
       head_sha: ${{ steps.target.outputs.head_sha }}
       base_ref: ${{ steps.target.outputs.base_ref }}
@@ -73,6 +84,7 @@ jobs:
           PAYLOAD_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           PAYLOAD_PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
           DISPATCH_SHA: ${{ github.sha }}
+          DISPATCH_PR_NUMBER: ${{ github.event.inputs.pr_number }}
         run: |
           set -euo pipefail
           # workflow_run carries the pull requests it is associated with, but
@@ -83,8 +95,17 @@ jobs:
           HEAD_SHA="${PAYLOAD_HEAD_SHA:-$DISPATCH_SHA}"
           BASE_REF="main"
           PR_JSON=""
+          MANUAL=false
           if [ -n "$PAYLOAD_PR_NUMBER" ]; then
             PR_JSON=$(gh pr view "$PAYLOAD_PR_NUMBER" --repo "$REPO" --json number,state,author,baseRefName)
+          elif [ -n "${DISPATCH_PR_NUMBER:-}" ]; then
+            # A manual dispatch names its target; there is no workflow_run
+            # payload to read one from. The reviewed commit is the pr's head, not
+            # this run's sha, and only a user with write access can dispatch, so
+            # this is the one path that can name a pr the trigger would not.
+            MANUAL=true
+            PR_JSON=$(gh pr view "$DISPATCH_PR_NUMBER" --repo "$REPO" \
+              --json number,state,author,baseRefName,headRefOid)
           elif [ -n "$PAYLOAD_HEAD_BRANCH" ]; then
             # The open pr first; a merged or closed one is only needed to say so.
             PR_JSON=$(gh pr list --repo "$REPO" --head "$PAYLOAD_HEAD_BRANCH" --state open \
@@ -101,14 +122,27 @@ jobs:
             PR_NUMBER=$(jq -r '.number // empty' <<<"$PR_JSON")
             PR_STATE=$(jq -r '.state // empty' <<<"$PR_JSON")
             BASE_REF=$(jq -r '.baseRefName // "main"' <<<"$PR_JSON")
+            if [ "$MANUAL" = "true" ]; then
+              PR_HEAD_SHA=$(jq -r '.headRefOid // empty' <<<"$PR_JSON")
+              if [ -z "$PR_HEAD_SHA" ]; then
+                echo "::error title=manual review target::pr #$PR_NUMBER returned no head sha to review."
+                exit 1
+              fi
+              HEAD_SHA="$PR_HEAD_SHA"
+            fi
           fi
 
           # A run that lands after the pr merged is a stale completion: the
-          # verdict already exists and the commit is in the base branch.
+          # verdict already exists and the commit is in the base branch. A manual
+          # run is the exception: naming a merged or closed pr is the whole point.
           OPEN=true
           if [ -n "$PR_STATE" ] && [ "$PR_STATE" != "OPEN" ]; then
             OPEN=false
-            echo "pr #$PR_NUMBER is $PR_STATE; nothing to review or merge."
+            if [ "$MANUAL" = "true" ]; then
+              echo "pr #$PR_NUMBER is $PR_STATE; reviewing it by hand at its head commit, and this run will not merge."
+            else
+              echo "pr #$PR_NUMBER is $PR_STATE; nothing to review or merge."
+            fi
           fi
 
           # Every job in this repository runs on GitHub's pool; there is no
@@ -119,6 +153,7 @@ jobs:
           echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "open=$OPEN" >> "$GITHUB_OUTPUT"
+          echo "manual=$MANUAL" >> "$GITHUB_OUTPUT"
           echo "runner=$RUNNER" >> "$GITHUB_OUTPUT"
           echo "reviewing pr #${PR_NUMBER:-<none>} at $HEAD_SHA against $BASE_REF on $RUNNER."
 
@@ -134,7 +169,9 @@ jobs:
   code-review:
     name: AI Code Review Agent
     needs: gate
-    if: needs.gate.outputs.state == 'ready' && needs.gate.outputs.open == 'true'
+    if: >-
+      needs.gate.outputs.state == 'ready' &&
+      (needs.gate.outputs.open == 'true' || needs.gate.outputs.manual == 'true')
     runs-on: ${{ needs.gate.outputs.runner }}
     permissions:
       contents: read
@@ -280,7 +317,9 @@ jobs:
   security-review:
     name: AI Security Review Agent
     needs: gate
-    if: needs.gate.outputs.state == 'ready' && needs.gate.outputs.open == 'true'
+    if: >-
+      needs.gate.outputs.state == 'ready' &&
+      (needs.gate.outputs.open == 'true' || needs.gate.outputs.manual == 'true')
     runs-on: ${{ needs.gate.outputs.runner }}
     permissions:
       contents: read
@@ -537,12 +576,16 @@ jobs:
 
   # The merge is its own job so that it waits on `needs` rather than on a
   # polling step: GitHub holds it in the queue, holding no runner, until both
-  # reviewers have finished, and it runs only when both succeeded.
+  # reviewers have finished, and it runs only when both succeeded. A manual run
+  # is review-only, so it never reaches this job: the pr it names may already be
+  # merged, and the fork guard the automatic path relies on does not apply to a
+  # target a human picked.
   merge:
     name: AI Review Merge
     needs: [gate, code-review, security-review]
     if: >-
       needs.gate.outputs.open == 'true' &&
+      needs.gate.outputs.manual != 'true' &&
       needs.gate.outputs.pr_number != '' &&
       needs.code-review.result == 'success' &&
       needs.security-review.result == 'success' &&
