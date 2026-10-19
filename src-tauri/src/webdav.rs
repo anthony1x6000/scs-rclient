@@ -1115,6 +1115,19 @@ pub fn build_remote_url(base_url: &str, subdir: &str) -> String {
     }
 }
 
+/// True only when `target_url` shares the scheme/host/port origin of the
+/// configured `remote_url`, so a server-supplied href cannot redirect an
+/// authenticated request to another host.
+fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
+    matches!(
+        (
+            rustydav::prelude::Url::parse(remote_url),
+            rustydav::prelude::Url::parse(target_url),
+        ),
+        (Ok(a), Ok(b)) if a.origin() == b.origin()
+    )
+}
+
 /// Builds the URL for a specific file under a collection, ensuring proper percent-encoding.
 pub fn build_file_url(collection_url: &str, rel_path: &str) -> String {
     if let Ok(mut base) = rustydav::prelude::Url::parse(collection_url) {
@@ -1178,49 +1191,94 @@ pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Resu
         return Err("Access to internal/loopback hostname is blocked for security.".to_string());
     }
 
-    // Check IP addresses for private / loopback / link-local / metadata ranges
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(ipv4) => {
-                if ipv4.is_loopback() {
-                    return Err("Access to loopback IP is blocked for security.".to_string());
-                }
-                if ipv4.is_link_local() {
-                    return Err("Access to link-local IP (cloud metadata) is blocked for security.".to_string());
-                }
-                if ipv4.is_private() {
-                    return Err("Access to private RFC 1918 IP is blocked for security.".to_string());
-                }
-                if ipv4.is_broadcast() || ipv4.is_unspecified() {
-                    return Err("Access to broadcast/unspecified IP is blocked for security.".to_string());
-                }
-                let octets = ipv4.octets();
-                // 100.64.0.0/10 Carrier-grade NAT
-                if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
-                    return Err("Access to shared carrier-grade NAT IP is blocked for security.".to_string());
-                }
-            }
-            std::net::IpAddr::V6(ipv6) => {
-                if ipv6.is_loopback() {
-                    return Err("Access to loopback IPv6 is blocked for security.".to_string());
-                }
-                if ipv6.is_unspecified() {
-                    return Err("Access to unspecified IPv6 is blocked for security.".to_string());
-                }
-                let segments = ipv6.segments();
-                // fe80::/10 link-local
-                if (segments[0] & 0xffc0) == 0xfe80 {
-                    return Err("Access to link-local IPv6 is blocked for security.".to_string());
-                }
-                // fc00::/7 unique local address
-                if (segments[0] & 0xfe00) == 0xfc00 {
-                    return Err("Access to unique local IPv6 is blocked for security.".to_string());
+    // Check IP addresses for private / loopback / link-local / metadata ranges.
+    // `host_str()` returns IPv6 hosts bracketed ([::1]), so strip the brackets
+    // before parsing — the old bare `host.parse()` never matched IPv6 literals.
+    let unbracketed = lower_host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        if let Some(reason) = blocked_ip_reason(ip) {
+            return Err(reason.to_string());
+        }
+    } else {
+        // Resolve DNS names and reject any address in a blocked private range.
+        // Closes the hostname-resolving-to-private-IP gap; the residual DNS
+        // rebinding TOCTOU needs a reqwest custom resolver for a full fix.
+        use std::net::ToSocketAddrs;
+        let resolution_target = format!("{unbracketed}:0");
+        if let Ok(addrs) = resolution_target.to_socket_addrs() {
+            for addr in addrs {
+                if let Some(reason) = blocked_ip_reason(addr.ip()) {
+                    return Err(reason.to_string());
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Returns the block reason when the IP falls in a range the client must not
+/// reach, including via IPv4-mapped IPv6 (::ffff:a.b.c.d) and NAT64
+/// (64:ff9b::a.b.c.d) spellings of those ranges.
+fn blocked_ip_reason(ip: std::net::IpAddr) -> Option<&'static str> {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            if ipv4.is_loopback() {
+                return Some("Access to loopback IP is blocked for security.");
+            }
+            if ipv4.is_link_local() {
+                return Some("Access to link-local IP (cloud metadata) is blocked for security.");
+            }
+            if ipv4.is_private() {
+                return Some("Access to private RFC 1918 IP is blocked for security.");
+            }
+            if ipv4.is_broadcast() || ipv4.is_unspecified() {
+                return Some("Access to broadcast/unspecified IP is blocked for security.");
+            }
+            let octets = ipv4.octets();
+            // 100.64.0.0/10 Carrier-grade NAT
+            if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+                return Some("Access to shared carrier-grade NAT IP is blocked for security.");
+            }
+            None
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            if ipv6.is_loopback() {
+                return Some("Access to loopback IPv6 is blocked for security.");
+            }
+            if ipv6.is_unspecified() {
+                return Some("Access to unspecified IPv6 is blocked for security.");
+            }
+            let segments = ipv6.segments();
+            // fe80::/10 link-local
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return Some("Access to link-local IPv6 is blocked for security.");
+            }
+            // fc00::/7 unique local address
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return Some("Access to unique local IPv6 is blocked for security.");
+            }
+            // IPv4-mapped (::ffff:a.b.c.d)
+            if let Some(v4) = ipv6.to_ipv4() {
+                if let Some(reason) = blocked_ip_reason(std::net::IpAddr::V4(v4)) {
+                    return Some(reason);
+                }
+            }
+            // NAT64 well-known prefix 64:ff9b::/96 embedding a blocked IPv4
+            if segments[0] == 0x64 && segments[1] == 0xff9b && (segments[2] | segments[3]) == 0 {
+                let v4 = std::net::Ipv4Addr::new(
+                    (segments[4] >> 8) as u8,
+                    segments[4] as u8,
+                    (segments[5] >> 8) as u8,
+                    segments[5] as u8,
+                );
+                if let Some(reason) = blocked_ip_reason(std::net::IpAddr::V4(v4)) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Ensures all parent collections exist for a relative file path prior to PUT.
@@ -1808,10 +1866,13 @@ where
                     }
 
                     if children_in_dir == 0 && current_url == remote_url {
-                        let snippet_len = body.len().min(400);
+                        // Char-based truncation: a fixed byte index can split a
+                        // multi-byte UTF-8 code point in a server-controlled body,
+                        // which panics and aborts the whole scan.
+                        let preview: String = body.chars().take(400).collect();
                         let _ = worker_log_tx.send(format!(
                             "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
-                            &body[..snippet_len]
+                            preview
                         ));
                     } else {
                         let _ = worker_log_tx.send(format!(
@@ -2910,6 +2971,18 @@ where
                     }
                 }
                 let download_url = resolve_item_url(remote_url, &item.href);
+                // A server-supplied href must not redirect an authenticated
+                // GET to another host: require the same origin as the
+                // configured remote and pass the SSRF guard.
+                if !same_remote_origin(remote_url, &download_url)
+                    || validate_webdav_url(&download_url).is_err()
+                {
+                    log(&format!(
+                        "[{}/{}] ERROR: Skipping {}: href resolves outside the configured remote origin\n",
+                        current_num, total_files, rel
+                    ));
+                    continue;
+                }
                 let download_result = retry_webdav_operation(
                     &format!("GET {download_url}"),
                     cancel_flag,
@@ -3157,6 +3230,17 @@ where
                         return Ok(());
                     }
                     let file_url = resolve_item_url(remote_url, &item.href);
+                    // A server-supplied href must not redirect the
+                    // authenticated DELETE to another host.
+                    if !same_remote_origin(remote_url, &file_url)
+                        || validate_webdav_url(&file_url).is_err()
+                    {
+                        log(&format!(
+                            "ERROR: Skipping delete of {}: href resolves outside the configured remote origin\n",
+                            rel
+                        ));
+                        continue;
+                    }
                     let del_res = retry_webdav_operation(
                         &format!("DELETE {file_url}"),
                         cancel_flag,
@@ -3672,6 +3756,50 @@ mod tests {
 
         // In test / dev mode (allow_insecure = true):
         assert!(validate_webdav_url_internal("http://127.0.0.1:3923/content/", true).is_ok());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_ipv6_literals_and_mapped_ranges() {
+        // Bracketed IPv6 literals reach the IP check (host_str returns them
+        // bracketed, which the old bare host.parse() never matched).
+        assert!(validate_webdav_url_internal("https://[::1]/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://[fe80::1]/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://[fd00::1]/dav", false).is_err());
+        // IPv4-mapped IPv6 spellings of blocked ranges must not pass.
+        assert!(validate_webdav_url_internal("https://[::ffff:127.0.0.1]/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://[::ffff:10.0.0.1]/dav", false).is_err());
+        assert!(validate_webdav_url_internal(
+            "https://[::ffff:169.254.169.254]/latest/meta-data",
+            false
+        )
+        .is_err());
+        // NAT64 well-known prefix embedding a blocked IPv4.
+        assert!(validate_webdav_url_internal("https://[64:ff9b::a00:1]/dav", false).is_err());
+        // A public IPv6 literal is still accepted.
+        assert!(validate_webdav_url_internal("https://[2606:4700::6810:85e5]/dav", false).is_ok());
+    }
+
+    #[test]
+    fn test_same_remote_origin_rejects_crosshost_hrefs() {
+        let base = "https://example.com/remote.php/webdav/folder/";
+        // Same-origin absolute hrefs pass.
+        assert!(same_remote_origin(
+            base,
+            "https://example.com/remote.php/webdav/folder/file.txt"
+        ));
+        assert!(same_remote_origin(base, "https://example.com/other/path"));
+        // Cross-host hrefs are rejected — the SSRF/credential-leak guard.
+        assert!(!same_remote_origin(base, "https://attacker.example/harvest"));
+        assert!(!same_remote_origin(
+            base,
+            "http://169.254.169.254/latest/meta-data"
+        ));
+        assert!(!same_remote_origin(base, "http://localhost:9000/bucket/obj"));
+        // Scheme change is a different origin.
+        assert!(!same_remote_origin(
+            base,
+            "http://example.com/remote.php/webdav/folder/file.txt"
+        ));
     }
 
     #[test]
