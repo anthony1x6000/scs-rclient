@@ -1,7 +1,9 @@
 use scs_rclient_lib::webdav::{
-    build_file_url, collect_local_files, compute_sha256, execute_webdav_action,
-    list_remote_recursive, parse_propfind_xml, parse_webdav_date, relative_item_path,
-    resolve_item_url, should_download_file, should_upload_file, verify_webdav_auth,
+    build_file_url, collect_local_files, collect_local_files_excluding, compute_sha256,
+    execute_webdav_action, execute_webdav_action_with_exclusions, list_remote_recursive,
+    list_remote_recursive_with_exclusions_and_log, normalize_exclude_folders,
+    parse_propfind_xml, parse_webdav_date, relative_item_path, resolve_item_url,
+    should_download_file, should_upload_file, verify_webdav_auth,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -1269,6 +1271,453 @@ fn test_concurrent_scanning_stress_1_to_64_threads() {
     }
 
     // Cleanly stop mock server
+    is_running.store(false, Ordering::SeqCst);
+    let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
+    let _ = server_handle.join();
+}
+
+#[test]
+fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
+    let base_url = match std::env::var("TEST_WEBDAV_URL") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            eprintln!(
+                "SKIPPED: TEST_WEBDAV_URL not set; skipping live excluded-folder test."
+            );
+            return;
+        }
+    };
+    let username = std::env::var("TEST_WEBDAV_USER").unwrap_or_else(|_| "testuser".to_string());
+    let password = std::env::var("TEST_WEBDAV_PASS").unwrap_or_else(|_| "testpass".to_string());
+    let client = rustydav::client::Client::init(&username, &password);
+    let cancel_flag = AtomicBool::new(false);
+    let mut log_output = String::new();
+
+    // Dedicated collection so the test never disturbs the other live tests.
+    let test_url = format!("{}/excluded_test/", base_url.trim_end_matches('/'));
+    let _ = client.delete(&test_url);
+    let _ = client.mkcol(&test_url);
+
+    let temp_root = std::env::temp_dir().join(format!(
+        "scs_exclude_e2e_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let seed_dir = temp_root.join("seed");
+    let project_dir = temp_root.join("project");
+    let download_dir = temp_root.join("download");
+
+    let write = |root: &std::path::Path, rel: &str, contents: &[u8]| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    };
+
+    // Seed remote content that lives inside the folders we are about to exclude, using a
+    // normal PUT so it is genuinely present on the server before exclusions take effect.
+    write(&seed_dir, ".git/config", b"seeded git config");
+    write(&seed_dir, "build/cache/artifact.bin", b"seeded artifact");
+    let seed_res = execute_webdav_action(
+        &client,
+        "put",
+        &test_url,
+        &seed_dir,
+        &cancel_flag,
+        |_| {},
+    );
+    assert!(
+        seed_res.is_ok(),
+        "Seeding remote excluded folders failed: {:?}",
+        seed_res
+    );
+
+    // Local working copy contains both excluded and included content.
+    write(&project_dir, "keep.txt", b"keep");
+    write(&project_dir, "src/main.rs", b"fn main() {}");
+    write(&project_dir, ".git/config", b"local git config");
+    write(&project_dir, "build/cache/artifact.bin", b"local artifact");
+
+    let exclusions = normalize_exclude_folders(&[".git/".to_string(), "build/cache".to_string()]);
+
+    // 1. Upload: excluded local folders must not be copied, and the remote scan must not
+    //    descend into them (the scan log below proves they were never requested).
+    log_output.clear();
+    let put_res = execute_webdav_action_with_exclusions(
+        &client,
+        "put",
+        &test_url,
+        &project_dir,
+        &cancel_flag,
+        None,
+        None,
+        &exclusions,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(put_res.is_ok(), "PUT with exclusions failed: {:?}", put_res);
+    assert!(
+        log_output.contains("Copied: keep.txt"),
+        "keep.txt must upload: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("Copied: src/main.rs"),
+        "src/main.rs must upload: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Copied: .git/config"),
+        ".git must not upload: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Copied: build/cache/artifact.bin"),
+        "build/cache must not upload: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Scanning directory: .git"),
+        ".git must not be scanned: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Scanning directory: build/cache"),
+        "build/cache must not be scanned: {}",
+        log_output
+    );
+
+    // The seeded content still exists on the remote even though the pruned scan never saw it.
+    let remote_paths = |url: &str| -> HashSet<String> {
+        list_remote_recursive(&client, url, &cancel_flag)
+            .unwrap()
+            .iter()
+            .filter(|item| !item.is_dir)
+            .map(|item| relative_item_path(url, &item.href))
+            .collect()
+    };
+    let seeded = remote_paths(&test_url);
+    assert!(
+        seeded.contains(".git/config"),
+        "seeded .git/config must exist remotely: {:?}",
+        seeded
+    );
+    assert!(
+        seeded.contains("build/cache/artifact.bin"),
+        "seeded build/cache must exist remotely: {:?}",
+        seeded
+    );
+    assert!(seeded.contains("keep.txt"), "keep.txt must exist remotely: {:?}", seeded);
+    assert!(seeded.contains("src/main.rs"), "src/main.rs must exist remotely: {:?}", seeded);
+
+    // 2. Download into an empty directory: excluded remote folders must be skipped.
+    fs::create_dir_all(&download_dir).unwrap();
+    log_output.clear();
+    let get_res = execute_webdav_action_with_exclusions(
+        &client,
+        "get",
+        &test_url,
+        &download_dir,
+        &cancel_flag,
+        None,
+        None,
+        &exclusions,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(get_res.is_ok(), "GET with exclusions failed: {:?}", get_res);
+    assert!(
+        log_output.contains("Downloaded: keep.txt"),
+        "keep.txt must download: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("Downloaded: src/main.rs"),
+        "src/main.rs must download: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Downloaded: .git/config"),
+        ".git must not download: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Downloaded: build/cache/artifact.bin"),
+        "build/cache must not download: {}",
+        log_output
+    );
+    assert!(
+        !download_dir.join(".git").exists(),
+        ".git must not be created locally"
+    );
+    assert!(
+        !download_dir.join("build").join("cache").exists(),
+        "build/cache must not be created locally"
+    );
+    let mut downloaded: Vec<String> = collect_local_files_excluding(&download_dir, &exclusions)
+        .into_iter()
+        .map(|(_, rel, _)| rel)
+        .collect();
+    downloaded.sort();
+    assert_eq!(
+        downloaded,
+        vec!["keep.txt".to_string(), "src/main.rs".to_string()]
+    );
+
+    // 3. Sync must not delete remote files inside excluded folders.
+    fs::remove_file(download_dir.join("src/main.rs")).unwrap();
+    log_output.clear();
+    let sync_res = execute_webdav_action_with_exclusions(
+        &client,
+        "sync",
+        &test_url,
+        &download_dir,
+        &cancel_flag,
+        None,
+        None,
+        &exclusions,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(sync_res.is_ok(), "SYNC with exclusions failed: {:?}", sync_res);
+    assert!(
+        log_output.contains("Deleted remote file not in local: src/main.rs"),
+        "sync should delete src/main.rs: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Deleted remote file not in local: .git/config"),
+        "sync must not delete excluded .git/config: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Deleted remote file not in local: build/cache/artifact.bin"),
+        "sync must not delete excluded build/cache: {}",
+        log_output
+    );
+    let after_sync = remote_paths(&test_url);
+    assert!(
+        after_sync.contains(".git/config"),
+        ".git/config must survive sync: {:?}",
+        after_sync
+    );
+    assert!(
+        after_sync.contains("build/cache/artifact.bin"),
+        "build/cache must survive sync: {:?}",
+        after_sync
+    );
+    assert!(
+        !after_sync.contains("src/main.rs"),
+        "src/main.rs should be deleted: {:?}",
+        after_sync
+    );
+
+    // Cleanup: remove the dedicated remote collection and local temp tree.
+    if let Ok(items) = list_remote_recursive(&client, &test_url, &cancel_flag) {
+        for item in items {
+            let rel = relative_item_path(&test_url, &item.href);
+            if !rel.is_empty() {
+                let _ = client.delete(&resolve_item_url(&test_url, &item.href));
+            }
+        }
+    }
+    let _ = client.delete(&test_url);
+    let _ = fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_scan_prunes_excluded_folders_without_requesting_them() {
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    // The mock server runs on loopback, which SSRF validation blocks unless allowed.
+    std::env::set_var("ALLOW_INSECURE_WEBDAV", "1");
+
+    // Remote tree:
+    //   keep.txt
+    //   .git/config                  <- excluded by name
+    //   build/keep.txt               <- included: only build/cache is excluded
+    //   build/cache/artifact.bin     <- excluded by relative path
+    //   src/main.rs                  <- included
+    type Entry = (Vec<&'static str>, Vec<(&'static str, u64)>);
+    let mut dirs: HashMap<&'static str, Entry> = HashMap::new();
+    dirs.insert(
+        "/exclude-course/",
+        (
+            vec![".git/", "build/", "src/"],
+            vec![("keep.txt", 10)],
+        ),
+    );
+    dirs.insert("/exclude-course/.git/", (vec![], vec![("config", 20)]));
+    dirs.insert(
+        "/exclude-course/build/",
+        (vec!["cache/"], vec![("keep.txt", 30)]),
+    );
+    dirs.insert(
+        "/exclude-course/build/cache/",
+        (vec![], vec![("artifact.bin", 40)]),
+    );
+    dirs.insert("/exclude-course/src/", (vec![], vec![("main.rs", 50)]));
+
+    let mut responses: HashMap<String, Vec<u8>> = HashMap::new();
+    for (dir_path, (subfolders, files)) in &dirs {
+        let mut xml = String::new();
+        xml.push_str(r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">"#);
+        xml.push_str(&format!(
+            r#"<D:response><D:href>{}</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"#,
+            dir_path
+        ));
+        for sub in subfolders {
+            let full_sub = format!("{}{}", dir_path, sub);
+            xml.push_str(&format!(
+                r#"<D:response><D:href>{}</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"#,
+                full_sub
+            ));
+        }
+        for (file, size) in files {
+            let full_file = format!("{}{}", dir_path, file);
+            xml.push_str(&format!(
+                r#"<D:response><D:href>{}</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>{}</D:getcontentlength><D:getlastmodified>Mon, 28 Sep 2026 12:00:00 GMT</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"#,
+                full_file, size
+            ));
+        }
+        xml.push_str("</D:multistatus>");
+
+        let response = format!(
+            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            xml.len(),
+            xml
+        );
+        responses.insert(
+            dir_path.trim_end_matches('/').to_ascii_lowercase(),
+            response.into_bytes(),
+        );
+    }
+
+    let responses = Arc::new(responses);
+    let requested: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let is_running = Arc::new(AtomicBool::new(true));
+
+    let server_running = is_running.clone();
+    let server_responses = responses.clone();
+    let server_requested = requested.clone();
+    let server_handle = std::thread::spawn(move || {
+        while server_running.load(Ordering::SeqCst) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            if !server_running.load(Ordering::SeqCst) {
+                break;
+            }
+            let resp_map = server_responses.clone();
+            let requested_map = server_requested.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let n = match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => n,
+                    _ => return,
+                };
+                let request = String::from_utf8_lossy(&buf[..n]);
+
+                // Match the D2L/IIS behavior the app falls back from: Depth: infinity is refused.
+                if request.to_ascii_lowercase().contains("depth: infinity") {
+                    let forbidden =
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(forbidden.as_bytes());
+                    return;
+                }
+
+                let first_line = request.lines().next().unwrap_or("");
+                let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+                let lookup_key = path.trim_end_matches('/').to_ascii_lowercase();
+                if let Ok(mut guard) = requested_map.lock() {
+                    guard.insert(lookup_key.clone());
+                }
+
+                if let Some(response) = resp_map.get(&lookup_key) {
+                    let _ = stream.write_all(response);
+                } else {
+                    let not_found =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(not_found.as_bytes());
+                }
+            });
+        }
+    });
+
+    let base_url = format!("http://127.0.0.1:{}/exclude-course/", port);
+    let client = rustydav::client::Client::init("testuser", "testpass");
+    let cancel_flag = AtomicBool::new(false);
+    let exclusions = normalize_exclude_folders(&[".git/".to_string(), "build/cache".to_string()]);
+    let mut log_output = String::new();
+
+    let items = list_remote_recursive_with_exclusions_and_log(
+        &client,
+        &base_url,
+        &cancel_flag,
+        Some(4),
+        None,
+        true,
+        &exclusions,
+        |msg| log_output.push_str(msg),
+    )
+    .expect("scan with exclusions failed");
+
+    let mut found: Vec<String> = items
+        .iter()
+        .filter(|item| !item.is_dir)
+        .map(|item| relative_item_path(&base_url, &item.href))
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            "build/keep.txt".to_string(),
+            "keep.txt".to_string(),
+            "src/main.rs".to_string(),
+        ],
+        "excluded folders and their contents must not appear in the listing"
+    );
+
+    // The strongest guarantee: the excluded collections were never requested at all.
+    let requested = requested.lock().unwrap().clone();
+    for skipped in ["/exclude-course/.git", "/exclude-course/build/cache"] {
+        assert!(
+            !requested.contains(skipped),
+            "excluded folder {} must not be requested; requested: {:?}",
+            skipped,
+            requested
+        );
+    }
+    for scanned in [
+        "/exclude-course",
+        "/exclude-course/build",
+        "/exclude-course/src",
+    ] {
+        assert!(
+            requested.contains(scanned),
+            "included folder {} must be scanned; requested: {:?}",
+            scanned,
+            requested
+        );
+    }
+    assert!(
+        !log_output.contains("Scanning directory: .git"),
+        "excluded .git must not be scanned: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Scanning directory: build/cache"),
+        "excluded build/cache must not be scanned: {}",
+        log_output
+    );
+
     is_running.store(false, Ordering::SeqCst);
     let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
     let _ = server_handle.join();
