@@ -151,7 +151,8 @@ export async function setScanConcurrency(threads: number): Promise<void> {
  * Normalizes a user-supplied excluded folder into a slash-separated relative path.
  * Leading/trailing slashes, `.` segments, backslashes, and repeated separators are
  * dropped, so `.git/`, `/.git`, and `.git` all become `.git`. Returns null for empty
- * input, `..` escapes, or over-long patterns. Matching itself happens in Rust.
+ * input, `..` escapes, control characters, or over-long patterns. Matching itself happens
+ * in Rust.
  */
 export function normalizeExcludedFolder(raw: string): string | null {
   const parts = raw
@@ -159,7 +160,7 @@ export function normalizeExcludedFolder(raw: string): string | null {
     .replace(/\\/g, "/")
     .split("/")
     .filter((part) => part.length > 0 && part !== ".");
-  if (parts.some((part) => part === ".." || part.includes("\0"))) return null;
+  if (parts.some((part) => part === ".." || /[\u0000-\u001f\u007f]/.test(part))) return null;
   const normalized = parts.join("/");
   if (!normalized || normalized.length > MAX_EXCLUDED_FOLDER_LENGTH) return null;
   return normalized;
