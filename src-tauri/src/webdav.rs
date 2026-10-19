@@ -204,9 +204,10 @@ where
 ///
 /// Leading/trailing slashes, `.` segments, backslashes, and repeated separators are
 /// dropped, so `.git/`, `/.git`, and `.git` all normalize to `.git`. Patterns that are
-/// empty, escape with `..`, contain NUL, or exceed [`MAX_EXCLUDE_PATTERN_CHARS`] are
-/// rejected. Matching itself is relative to the scan root, so a normalized pattern can
-/// never address anything outside the selected remote subdirectory.
+/// empty, escape with `..`, contain control characters, or exceed
+/// [`MAX_EXCLUDE_PATTERN_CHARS`] are rejected. Matching itself is relative to the scan
+/// root, so a normalized pattern can never address anything outside the selected remote
+/// subdirectory.
 pub fn normalize_exclude_pattern(raw: &str) -> Option<String> {
     let replaced = raw.trim().replace('\\', "/");
     let parts: Vec<&str> = replaced
@@ -215,7 +216,7 @@ pub fn normalize_exclude_pattern(raw: &str) -> Option<String> {
         .collect();
     if parts
         .iter()
-        .any(|part| *part == ".." || part.contains('\0'))
+        .any(|part| *part == ".." || part.chars().any(|c| c.is_control()))
     {
         return None;
     }
@@ -1365,7 +1366,13 @@ where
     if cancel_flag.load(Ordering::SeqCst) {
         return Err("Operation canceled by user.".to_string());
     }
+    let cache_requested = use_cache && is_cache_enabled();
+    // A cached listing cannot be reconciled with patterns added or removed since it was
+    // saved, so only reuse the cache when no exclusions are active.
     let use_cache = use_cache && exclude_folders.is_empty();
+    if cache_requested && !use_cache {
+        log("Remote listing cache bypassed while folder exclusions are active.\n");
+    }
 
     if use_cache && is_cache_enabled() {
         if let Some(cached_items) = load_remote_cache(remote_url, auth_user) {
@@ -3558,6 +3565,8 @@ mod tests {
         );
         assert_eq!(normalize_exclude_pattern(".."), None);
         assert_eq!(normalize_exclude_pattern("a/../b"), None);
+        assert_eq!(normalize_exclude_pattern("bad\nname"), None);
+        assert_eq!(normalize_exclude_pattern("bad\tname"), None);
         assert_eq!(normalize_exclude_pattern("/"), None);
         assert_eq!(
             normalize_exclude_pattern(&"x".repeat(MAX_EXCLUDE_PATTERN_CHARS + 1)),
