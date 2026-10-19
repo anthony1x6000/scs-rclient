@@ -211,6 +211,8 @@ fn cancel_webdav_action(state: tauri::State<'_, WebdavState>) -> Result<(), Stri
 ///   operation off the working copy it is meant to leave alone.
 /// - `backup_dated`: When true (and `backup` is also true), the redirect is nested one level
 ///   deeper under today's date, giving each day its own `<mount>/backups/<YYYY-MM-DD>` folder.
+/// - `exclude_folders`: Relative folder patterns (e.g. `.git/`) that scanning and transfers
+///   must skip entirely — they are never traversed, uploaded, downloaded, or deleted by sync.
 #[tauri::command]
 async fn run_webdav_action(
     app: tauri::AppHandle,
@@ -223,11 +225,13 @@ async fn run_webdav_action(
     concurrency: Option<usize>,
     backup: Option<bool>,
     backup_dated: Option<bool>,
+    exclude_folders: Option<Vec<String>>,
 ) -> Result<(), String> {
     use tauri::Emitter;
 
     state.cancel_flag.store(false, Ordering::SeqCst);
     let cancel_flag = state.cancel_flag.clone();
+    let exclude_folders = webdav::normalize_exclude_folders(&exclude_folders.unwrap_or_default());
 
     let mount_dir_str = get_mount_dir(app.clone(), target_subdir)?;
     let base_mount = std::path::Path::new(&mount_dir_str);
@@ -272,7 +276,7 @@ async fn run_webdav_action(
         let emit_log = move |msg: &str| {
             let _ = app_handle.emit("webdav-log", msg);
         };
-        webdav::execute_webdav_action_with_options(
+        webdav::execute_webdav_action_with_exclusions(
             &client,
             &action,
             &remote_url,
@@ -280,6 +284,7 @@ async fn run_webdav_action(
             &cancel_flag,
             concurrency,
             auth_user.as_deref(),
+            &exclude_folders,
             emit_log,
         )
     })

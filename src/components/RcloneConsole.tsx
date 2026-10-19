@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useLayoutEffect } from "react";
+import ExcludeFolders from "./ExcludeFolders";
 
 interface RcloneConsoleProps {
   logs: string;
@@ -11,6 +12,7 @@ export function RcloneConsole({ logs, onClear, onOpenFolder }: RcloneConsoleProp
   const wrapRef = useRef<HTMLDivElement>(null);
   const [follow, setFollow] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [showExcludeFolders, setShowExcludeFolders] = useState(false);
   const [hasOverflow, setHasOverflow] = useState(false);
   const [atTop, setAtTop] = useState(true);
   const [atBottom, setAtBottom] = useState(true);
@@ -64,7 +66,7 @@ export function RcloneConsole({ logs, onClear, onOpenFolder }: RcloneConsoleProp
 
   return (
     <div className="flex flex-col flex-1 min-h-0 overflow-hidden logs-pane">
-      <div className="flex gap-2 px-2 pb-1 text-xs">
+      <div className="flex flex-wrap gap-2 px-2 pb-1 text-xs">
         <button
           type="button"
           onClick={() => setFollow((f) => !f)}
@@ -99,7 +101,17 @@ export function RcloneConsole({ logs, onClear, onOpenFolder }: RcloneConsoleProp
             Open folder
           </button>
         )}
+        <button
+          type="button"
+          onClick={() => setShowExcludeFolders((open) => !open)}
+          aria-expanded={showExcludeFolders}
+          aria-controls="scs-exclude-folders"
+          className={`px-2 py-1 border bg-transparent text-white cursor-pointer transition-all duration-150 ${showExcludeFolders ? "border-white/60" : "border-white/20 hover:border-white/50"}`}
+        >
+          Exclude folder
+        </button>
       </div>
+      {showExcludeFolders && <ExcludeFolders />}
       <label className="sr-only" htmlFor="scs-console">WebDAV console output</label>
       <div ref={wrapRef} className="relative flex-1 min-h-0 flex flex-col overflow-hidden px-2 pb-1">
         {/* top fade */}
