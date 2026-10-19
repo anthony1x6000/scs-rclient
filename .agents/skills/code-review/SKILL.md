@@ -72,7 +72,7 @@ every review must follow this exact order:
 write top-level summary in /caveman mode (1-3 sentences).
 drop articles (a/an/the), drop filler, keep technical facts exact. Plain text only, no bold asterisks, no emojis.
 pattern: `[thing] [action] [reason]. [status/verdict].`
-example: `tldr: diff update ai review action, switch model to nemotron, remove dead test code. security sound, logic clean.`
+example: `tldr: diff update ai review action, switch model to deepseek 4.1 flash, remove dead test code. security sound, logic clean.`
 
 ### 2. findings
 format findings: `<file>:L<line>: <sev>: <problem>. <fix>.`
