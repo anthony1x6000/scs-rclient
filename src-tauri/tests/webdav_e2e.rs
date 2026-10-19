@@ -1,13 +1,148 @@
 use scs_rclient_lib::webdav::{
     build_file_url, collect_local_files, collect_local_files_excluding, compute_sha256,
     execute_webdav_action, execute_webdav_action_with_exclusions, list_remote_recursive,
-    list_remote_recursive_with_exclusions_and_log, normalize_exclude_folders,
-    parse_propfind_xml, parse_webdav_date, relative_item_path, resolve_item_url,
-    should_download_file, should_upload_file, verify_webdav_auth,
+    list_remote_recursive_with_exclusions_and_log, list_remote_recursive_with_options_and_log,
+    normalize_exclude_folders, parse_propfind_xml, parse_webdav_date, relative_item_path,
+    resolve_item_url, should_download_file, should_upload_file, verify_webdav_auth,
 };
 use std::collections::HashSet;
 use std::fs;
 use std::sync::atomic::AtomicBool;
+
+/// Returns the live WebDAV base URL, or `None` when the e2e server is not configured.
+fn live_base_url() -> Option<String> {
+    match std::env::var("TEST_WEBDAV_URL") {
+        Ok(url) if !url.trim().is_empty() => Some(url),
+        _ => None,
+    }
+}
+
+fn live_client() -> rustydav::client::Client {
+    let username = std::env::var("TEST_WEBDAV_USER").unwrap_or_else(|_| "testuser".to_string());
+    let password = std::env::var("TEST_WEBDAV_PASS").unwrap_or_else(|_| "testpass".to_string());
+    rustydav::client::Client::init(&username, &password)
+}
+
+fn write_local_file(root: &std::path::Path, rel: &str, contents: &[u8]) {
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, contents).unwrap();
+}
+
+fn local_file_paths(root: &std::path::Path) -> Vec<String> {
+    let mut paths: Vec<String> = collect_local_files(root)
+        .into_iter()
+        .map(|(_, rel, _)| rel)
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Lists remote files relative to `url`, bypassing the listing cache so assertions see
+/// the server's current state rather than a listing cached by an earlier action.
+fn remote_file_paths(
+    client: &rustydav::client::Client,
+    url: &str,
+    cancel_flag: &AtomicBool,
+) -> HashSet<String> {
+    list_remote_recursive_with_options_and_log(
+        client,
+        url,
+        cancel_flag,
+        None,
+        None,
+        false,
+        |_| {},
+    )
+    .expect("remote listing failed")
+    .iter()
+    .filter(|item| !item.is_dir)
+    .map(|item| relative_item_path(url, &item.href))
+    .collect()
+}
+
+fn read_remote_text(client: &rustydav::client::Client, url: &str) -> String {
+    use std::io::Read;
+    let mut response = client.get(url).expect("remote GET failed");
+    assert!(
+        response.status().is_success(),
+        "remote GET {} returned HTTP {}",
+        url,
+        response.status()
+    );
+    let mut body = String::new();
+    response
+        .read_to_string(&mut body)
+        .expect("failed to read remote body");
+    body
+}
+
+/// Deletes every child of `url` (files first, deepest directories last) and then `url`.
+fn remove_remote_tree(client: &rustydav::client::Client, url: &str, cancel_flag: &AtomicBool) {
+    if let Ok(items) = list_remote_recursive_with_options_and_log(
+        client,
+        url,
+        cancel_flag,
+        None,
+        None,
+        false,
+        |_| {},
+    ) {
+        for item in items.iter().filter(|item| !item.is_dir) {
+            let _ = client.delete(&resolve_item_url(url, &item.href));
+        }
+        let mut directories: Vec<&String> = items
+            .iter()
+            .filter(|item| item.is_dir)
+            .map(|item| &item.href)
+            .collect();
+        directories.sort_by(|a, b| b.cmp(a));
+        for href in directories {
+            let _ = client.delete(&resolve_item_url(url, href));
+        }
+    }
+    let _ = client.delete(url);
+}
+
+/// Extracts relative directory paths from `[n] Scanning directory: <path>...` log lines.
+fn scanned_directories(log: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|line| line.split_once("Scanning directory: ").map(|(_, rest)| rest))
+        .map(|rest| {
+            rest.trim_end_matches("...")
+                .trim_end_matches('/')
+                .trim()
+                .to_string()
+        })
+        .filter(|dir| !dir.is_empty() && dir != "/ (root)")
+        .collect()
+}
+
+fn assert_scanned_directories(log: &str, expected: &[&str]) {
+    let scanned = scanned_directories(log);
+    for dir in expected {
+        assert!(
+            scanned.iter().any(|scanned_dir| scanned_dir == dir),
+            "included folder {} must be scanned; scanned: {:?}\nlog:\n{}",
+            dir,
+            scanned,
+            log
+        );
+    }
+}
+
+fn assert_not_scanned_directories(log: &str, excluded: &[&str]) {
+    let scanned = scanned_directories(log);
+    for dir in excluded {
+        assert!(
+            !scanned.iter().any(|scanned_dir| scanned_dir == dir),
+            "excluded folder {} must not be scanned; scanned: {:?}\nlog:\n{}",
+            dir,
+            scanned,
+            log
+        );
+    }
+}
 
 #[test]
 fn test_incremental_upload_decision_matrix() {
@@ -1524,6 +1659,556 @@ fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
     let _ = fs::remove_dir_all(&temp_root);
 }
 
+/// End-to-end coverage for nested `.git` folders, name-vs-path patterns, and near misses.
+///
+/// Seeds excluded folders on the server first, then runs PUT/GET/SYNC with exclusions and
+/// checks three things each time: the excluded content is not transferred, the scan log
+/// never visits it, and the seeded remote copies are left byte-for-byte intact.
+#[test]
+fn test_live_copyparty_excluded_folders_nested_and_path_patterns() {
+    let base_url = match live_base_url() {
+        Some(url) => url,
+        None => {
+            eprintln!(
+                "SKIPPED: TEST_WEBDAV_URL not set; skipping nested excluded-folder e2e test."
+            );
+            return;
+        }
+    };
+    let client = live_client();
+    let cancel_flag = AtomicBool::new(false);
+    let mut log_output = String::new();
+
+    let test_url = format!("{}/excluded_nested_test/", base_url.trim_end_matches('/'));
+    remove_remote_tree(&client, &test_url, &cancel_flag);
+    let _ = client.mkcol(&test_url);
+
+    let temp_root = std::env::temp_dir().join(format!(
+        "scs_exclude_nested_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let seed_dir = temp_root.join("seed");
+    let project_dir = temp_root.join("project");
+    let download_dir = temp_root.join("download");
+
+    // Seed every excluded folder on the server with sentinel content, plus the included
+    // files that surround them.
+    for (rel, contents) in [
+        (".git/config", "seed-root-git"),
+        (".gitlab/notes.txt", "seed-gitlab"),
+        ("node_modules/pkg/index.js", "seed-node-modules"),
+        ("assets/cache/data.bin", "seed-cache"),
+        ("assets/cache2/keep.txt", "seed-cache2"),
+        ("assets/keep.txt", "seed-assets-keep"),
+        ("module/.git/config", "seed-module-git"),
+        ("module/deep/.git/config", "seed-deep-git"),
+        ("module/deep/keep.txt", "seed-deep-keep"),
+        ("module/notes.txt", "seed-module-notes"),
+        ("root-keep.txt", "seed-root-keep"),
+        ("README.md", "seed-readme"),
+    ] {
+        write_local_file(&seed_dir, rel, contents.as_bytes());
+    }
+    let seed_res = execute_webdav_action(
+        &client,
+        "put",
+        &test_url,
+        &seed_dir,
+        &cancel_flag,
+        |_| {},
+    );
+    assert!(
+        seed_res.is_ok(),
+        "Seeding remote excluded folders failed: {:?}",
+        seed_res
+    );
+
+    let included_paths = [
+        ".gitlab/notes.txt",
+        "README.md",
+        "assets/cache2/keep.txt",
+        "assets/keep.txt",
+        "module/deep/keep.txt",
+        "module/new.txt",
+        "module/notes.txt",
+        "root-keep.txt",
+    ];
+    let excluded_paths = [
+        ".git/config",
+        "assets/cache/data.bin",
+        "module/.git/config",
+        "module/deep/.git/config",
+        "node_modules/pkg/index.js",
+    ];
+
+    // Local working copy: the same tree with different content, so a successful upload is
+    // observable, plus one brand-new included file.
+    for (rel, contents) in [
+        (".git/config", "project-root-git"),
+        (".gitlab/notes.txt", "project-gitlab"),
+        ("node_modules/pkg/index.js", "project-node-modules"),
+        ("assets/cache/data.bin", "project-cache"),
+        ("assets/cache2/keep.txt", "project-cache2"),
+        ("assets/keep.txt", "project-assets-keep"),
+        ("module/.git/config", "project-module-git"),
+        ("module/deep/.git/config", "project-deep-git"),
+        ("module/deep/keep.txt", "project-deep-keep"),
+        ("module/new.txt", "project-new"),
+        ("module/notes.txt", "project-module-notes"),
+        ("root-keep.txt", "project-root-keep"),
+        ("README.md", "project-readme"),
+    ] {
+        write_local_file(&project_dir, rel, contents.as_bytes());
+    }
+
+    let exclusions = normalize_exclude_folders(&[
+        ".git/".to_string(),
+        "node_modules".to_string(),
+        "assets/cache".to_string(),
+    ]);
+
+    // 1. PUT: included files upload; root, one-level, and two-level `.git` folders are skipped.
+    log_output.clear();
+    let put_res = execute_webdav_action_with_exclusions(
+        &client,
+        "put",
+        &test_url,
+        &project_dir,
+        &cancel_flag,
+        None,
+        None,
+        &exclusions,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(put_res.is_ok(), "PUT with exclusions failed: {:?}", put_res);
+    for included in included_paths {
+        assert!(
+            log_output.contains(&format!("Copied: {included}")),
+            "{} must upload: {}",
+            included,
+            log_output
+        );
+    }
+    for excluded in excluded_paths {
+        assert!(
+            !log_output.contains(&format!("Copied: {excluded}")),
+            "{} must not upload: {}",
+            excluded,
+            log_output
+        );
+    }
+    assert_not_scanned_directories(
+        &log_output,
+        &[
+            ".git",
+            "module/.git",
+            "module/deep/.git",
+            "node_modules",
+            "assets/cache",
+        ],
+    );
+    if !scanned_directories(&log_output).is_empty() {
+        assert_scanned_directories(
+            &log_output,
+            &[".gitlab", "assets", "assets/cache2", "module", "module/deep"],
+        );
+    }
+
+    // The seeded copies inside excluded folders must be untouched by the upload.
+    for (rel, expected) in [
+        (".git/config", "seed-root-git"),
+        ("module/.git/config", "seed-module-git"),
+        ("module/deep/.git/config", "seed-deep-git"),
+        ("node_modules/pkg/index.js", "seed-node-modules"),
+        ("assets/cache/data.bin", "seed-cache"),
+        (".gitlab/notes.txt", "project-gitlab"),
+        ("assets/cache2/keep.txt", "project-cache2"),
+    ] {
+        assert_eq!(
+            read_remote_text(&client, &build_file_url(&test_url, rel)),
+            expected,
+            "remote content mismatch for {}",
+            rel
+        );
+    }
+    let after_put = remote_file_paths(&client, &test_url, &cancel_flag);
+    for excluded in excluded_paths {
+        assert!(
+            after_put.contains(excluded),
+            "seeded excluded file {} must still exist remotely: {:?}",
+            excluded,
+            after_put
+        );
+    }
+    for near_miss in [".gitlab/notes.txt", "assets/cache2/keep.txt"] {
+        assert!(
+            after_put.contains(near_miss),
+            "{} must not be excluded: {:?}",
+            near_miss,
+            after_put
+        );
+    }
+
+    // 2. GET: excluded remote folders must not create anything locally, at any depth.
+    fs::create_dir_all(&download_dir).unwrap();
+    log_output.clear();
+    let get_res = execute_webdav_action_with_exclusions(
+        &client,
+        "get",
+        &test_url,
+        &download_dir,
+        &cancel_flag,
+        None,
+        None,
+        &exclusions,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(get_res.is_ok(), "GET with exclusions failed: {:?}", get_res);
+    for included in included_paths {
+        assert!(
+            log_output.contains(&format!("Downloaded: {included}")),
+            "{} must download: {}",
+            included,
+            log_output
+        );
+    }
+    for excluded in excluded_paths {
+        assert!(
+            !log_output.contains(&format!("Downloaded: {excluded}")),
+            "{} must not download: {}",
+            excluded,
+            log_output
+        );
+    }
+    assert_eq!(
+        local_file_paths(&download_dir),
+        included_paths
+            .iter()
+            .map(|path| path.to_string())
+            .collect::<Vec<String>>(),
+        "GET must create exactly the included files"
+    );
+    for excluded_dir in [
+        ".git",
+        "node_modules",
+        "assets/cache",
+        "module/.git",
+        "module/deep/.git",
+    ] {
+        assert!(
+            !download_dir.join(excluded_dir).exists(),
+            "excluded folder {} must not be created locally",
+            excluded_dir
+        );
+    }
+
+    // 3. SYNC: a missing included file is deleted remotely, excluded folders are not.
+    fs::remove_file(download_dir.join("README.md")).unwrap();
+    log_output.clear();
+    let sync_res = execute_webdav_action_with_exclusions(
+        &client,
+        "sync",
+        &test_url,
+        &download_dir,
+        &cancel_flag,
+        None,
+        None,
+        &exclusions,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(sync_res.is_ok(), "SYNC with exclusions failed: {:?}", sync_res);
+    assert!(
+        log_output.contains("Deleted remote file not in local: README.md"),
+        "sync should delete README.md: {}",
+        log_output
+    );
+    for excluded in excluded_paths {
+        assert!(
+            !log_output.contains(&format!("Deleted remote file not in local: {excluded}")),
+            "sync must not delete excluded {}: {}",
+            excluded,
+            log_output
+        );
+    }
+    let after_sync = remote_file_paths(&client, &test_url, &cancel_flag);
+    assert!(
+        !after_sync.contains("README.md"),
+        "README.md should be deleted: {:?}",
+        after_sync
+    );
+    for kept in excluded_paths {
+        assert!(
+            after_sync.contains(kept),
+            "excluded {} must survive sync: {:?}",
+            kept,
+            after_sync
+        );
+    }
+    for near_miss in [".gitlab/notes.txt", "assets/cache2/keep.txt"] {
+        assert!(
+            after_sync.contains(near_miss),
+            "{} must survive sync: {:?}",
+            near_miss,
+            after_sync
+        );
+    }
+
+    remove_remote_tree(&client, &test_url, &cancel_flag);
+    let _ = fs::remove_dir_all(&temp_root);
+}
+
+/// End-to-end coverage for a `.git` folder one level above the scan root ("current dir").
+///
+/// The parent collection also holds ordinary files and a `.git` folder. Actions are scoped
+/// to `current/`, so the parent `.git` must never be scanned, downloaded, overwritten, or
+/// deleted — and the scan must still exclude `.git` inside `current/` itself.
+#[test]
+fn test_live_copyparty_excluded_folder_above_scan_root_is_untouched() {
+    let base_url = match live_base_url() {
+        Some(url) => url,
+        None => {
+            eprintln!(
+                "SKIPPED: TEST_WEBDAV_URL not set; skipping above-root excluded-folder e2e test."
+            );
+            return;
+        }
+    };
+    let client = live_client();
+    let cancel_flag = AtomicBool::new(false);
+    let mut log_output = String::new();
+
+    let test_url = format!("{}/excluded_above_test/", base_url.trim_end_matches('/'));
+    let current_url = format!("{}current/", test_url);
+    remove_remote_tree(&client, &test_url, &cancel_flag);
+    let _ = client.mkcol(&test_url);
+
+    let temp_root = std::env::temp_dir().join(format!(
+        "scs_exclude_above_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let seed_dir = temp_root.join("seed");
+    let local_parent = temp_root.join("local");
+    let download_parent = temp_root.join("download");
+
+    // Seed the parent AND the current directory on the server.
+    for (rel, contents) in [
+        (".git/config", "seed-parent-git"),
+        ("parent-keep.txt", "seed-parent-keep"),
+        ("current/.git/config", "seed-current-git"),
+        ("current/nested/.git/config", "seed-nested-git"),
+        ("current/keep.txt", "seed-current-keep"),
+        ("current/nested/keep.txt", "seed-nested-keep"),
+    ] {
+        write_local_file(&seed_dir, rel, contents.as_bytes());
+    }
+    let seed_res = execute_webdav_action(
+        &client,
+        "put",
+        &test_url,
+        &seed_dir,
+        &cancel_flag,
+        |_| {},
+    );
+    assert!(
+        seed_res.is_ok(),
+        "Seeding remote above-root tree failed: {:?}",
+        seed_res
+    );
+
+    // The local working copy for the scoped action lives at local/current/. Its parent
+    // contains sentinel `.git` content that must remain untouched.
+    write_local_file(&local_parent, ".git/config", b"local-parent-git");
+    write_local_file(&local_parent, "parent-keep.txt", b"local-parent-keep");
+    write_local_file(&local_parent, "current/keep.txt", b"local-current-keep");
+    write_local_file(&local_parent, "current/extra.txt", b"local-current-extra");
+    write_local_file(&local_parent, "current/.git/config", b"local-current-git");
+    write_local_file(&local_parent, "current/nested/keep.txt", b"local-nested-keep");
+    write_local_file(
+        &local_parent,
+        "current/nested/.git/config",
+        b"local-nested-git",
+    );
+
+    let exclusions = normalize_exclude_folders(&[".git/".to_string()]);
+
+    // 1. PUT scoped to current/: only current/'s included files upload.
+    log_output.clear();
+    let put_res = execute_webdav_action_with_exclusions(
+        &client,
+        "put",
+        &current_url,
+        &local_parent.join("current"),
+        &cancel_flag,
+        None,
+        None,
+        &exclusions,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(put_res.is_ok(), "PUT above-root test failed: {:?}", put_res);
+    for included in ["extra.txt", "keep.txt", "nested/keep.txt"] {
+        assert!(
+            log_output.contains(&format!("Copied: {included}")),
+            "{} must upload: {}",
+            included,
+            log_output
+        );
+    }
+    for excluded in [".git/config", "nested/.git/config"] {
+        assert!(
+            !log_output.contains(&format!("Copied: {excluded}")),
+            "{} must not upload: {}",
+            excluded,
+            log_output
+        );
+    }
+    assert_not_scanned_directories(&log_output, &[".git", "nested/.git"]);
+    if !scanned_directories(&log_output).is_empty() {
+        assert_scanned_directories(&log_output, &["nested"]);
+    }
+
+    // Parent-level content and excluded current-level content are untouched.
+    for (rel, expected) in [
+        (".git/config", "seed-parent-git"),
+        ("parent-keep.txt", "seed-parent-keep"),
+        ("current/.git/config", "seed-current-git"),
+        ("current/nested/.git/config", "seed-nested-git"),
+        ("current/keep.txt", "local-current-keep"),
+    ] {
+        assert_eq!(
+            read_remote_text(&client, &build_file_url(&test_url, rel)),
+            expected,
+            "remote content mismatch for {}",
+            rel
+        );
+    }
+
+    // 2. GET scoped to current/: the parent's local `.git` and keep file are not touched.
+    write_local_file(
+        &download_parent,
+        ".git/config",
+        b"download-parent-git",
+    );
+    write_local_file(
+        &download_parent,
+        "parent-keep.txt",
+        b"download-parent-keep",
+    );
+    fs::create_dir_all(download_parent.join("current")).unwrap();
+    log_output.clear();
+    let get_res = execute_webdav_action_with_exclusions(
+        &client,
+        "get",
+        &current_url,
+        &download_parent.join("current"),
+        &cancel_flag,
+        None,
+        None,
+        &exclusions,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(get_res.is_ok(), "GET above-root test failed: {:?}", get_res);
+    assert_eq!(
+        local_file_paths(&download_parent.join("current")),
+        vec![
+            "extra.txt".to_string(),
+            "keep.txt".to_string(),
+            "nested/keep.txt".to_string(),
+        ],
+        "GET must download only current/ included files"
+    );
+    assert!(
+        !download_parent.join("current/.git").exists(),
+        "current/.git must not be created locally"
+    );
+    assert!(
+        !download_parent.join("current/nested/.git").exists(),
+        "current/nested/.git must not be created locally"
+    );
+    assert_eq!(
+        fs::read_to_string(download_parent.join(".git/config")).unwrap(),
+        "download-parent-git",
+        "parent .git must not be overwritten by a scoped GET"
+    );
+    assert_eq!(
+        fs::read_to_string(download_parent.join("parent-keep.txt")).unwrap(),
+        "download-parent-keep",
+        "parent keep file must not be touched by a scoped GET"
+    );
+
+    // 3. SYNC scoped to current/: deletes only current/keep.txt, never parent content.
+    fs::remove_file(download_parent.join("current/keep.txt")).unwrap();
+    log_output.clear();
+    let sync_res = execute_webdav_action_with_exclusions(
+        &client,
+        "sync",
+        &current_url,
+        &download_parent.join("current"),
+        &cancel_flag,
+        None,
+        None,
+        &exclusions,
+        |msg| log_output.push_str(msg),
+    );
+    assert!(sync_res.is_ok(), "SYNC above-root test failed: {:?}", sync_res);
+    assert!(
+        log_output.contains("Deleted remote file not in local: keep.txt"),
+        "sync should delete current/keep.txt: {}",
+        log_output
+    );
+    for excluded in [".git/config", "nested/.git/config"] {
+        assert!(
+            !log_output.contains(&format!("Deleted remote file not in local: {excluded}")),
+            "sync must not delete excluded {}: {}",
+            excluded,
+            log_output
+        );
+    }
+
+    let after_current = remote_file_paths(&client, &current_url, &cancel_flag);
+    assert!(
+        !after_current.contains("keep.txt"),
+        "current/keep.txt should be deleted: {:?}",
+        after_current
+    );
+    assert!(
+        after_current.contains(".git/config"),
+        "current/.git/config must survive sync: {:?}",
+        after_current
+    );
+    assert!(
+        after_current.contains("nested/.git/config"),
+        "current/nested/.git/config must survive sync: {:?}",
+        after_current
+    );
+    for (rel, expected) in [
+        (".git/config", "seed-parent-git"),
+        ("parent-keep.txt", "seed-parent-keep"),
+    ] {
+        assert_eq!(
+            read_remote_text(&client, &build_file_url(&test_url, rel)),
+            expected,
+            "parent {} must be untouched by a scoped sync",
+            rel
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(download_parent.join(".git/config")).unwrap(),
+        "download-parent-git",
+        "local parent .git must be untouched by a scoped sync"
+    );
+
+    remove_remote_tree(&client, &test_url, &cancel_flag);
+    let _ = fs::remove_dir_all(&temp_root);
+}
+
 #[test]
 fn test_scan_prunes_excluded_folders_without_requesting_them() {
     use std::collections::HashMap;
@@ -1537,20 +2222,53 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
 
     // Remote tree:
     //   keep.txt
-    //   .git/config                  <- excluded by name
-    //   build/keep.txt               <- included: only build/cache is excluded
-    //   build/cache/artifact.bin     <- excluded by relative path
-    //   src/main.rs                  <- included
+    //   .git/config                        <- excluded by name at the scan root
+    //   .gitlab/notes.txt                  <- near miss: must stay included
+    //   assets/keep.txt                    <- included
+    //   assets/cache/data.bin              <- excluded by path pattern
+    //   assets/cache2/keep.txt             <- near miss: must stay included
+    //   build/keep.txt                     <- included: only build/cache is excluded
+    //   build/cache/artifact.bin           <- excluded by relative path
+    //   module/notes.txt                   <- included
+    //   module/.git/config                 <- excluded by name, one level deep
+    //   module/deep/keep.txt               <- included
+    //   module/deep/.git/config            <- excluded by name, two levels deep
+    //   node_modules/pkg/index.js          <- excluded by name
+    //   src/main.rs                        <- included
     type Entry = (Vec<&'static str>, Vec<(&'static str, u64)>);
     let mut dirs: HashMap<&'static str, Entry> = HashMap::new();
     dirs.insert(
         "/exclude-course/",
         (
-            vec![".git/", "build/", "src/"],
+            vec![
+                ".git/",
+                ".gitlab/",
+                "assets/",
+                "build/",
+                "module/",
+                "node_modules/",
+                "src/",
+            ],
             vec![("keep.txt", 10)],
         ),
     );
     dirs.insert("/exclude-course/.git/", (vec![], vec![("config", 20)]));
+    dirs.insert(
+        "/exclude-course/.gitlab/",
+        (vec![], vec![("notes.txt", 15)]),
+    );
+    dirs.insert(
+        "/exclude-course/assets/",
+        (vec!["cache/", "cache2/"], vec![("keep.txt", 35)]),
+    );
+    dirs.insert(
+        "/exclude-course/assets/cache/",
+        (vec![], vec![("data.bin", 45)]),
+    );
+    dirs.insert(
+        "/exclude-course/assets/cache2/",
+        (vec![], vec![("keep.txt", 55)]),
+    );
     dirs.insert(
         "/exclude-course/build/",
         (vec!["cache/"], vec![("keep.txt", 30)]),
@@ -1558,6 +2276,30 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
     dirs.insert(
         "/exclude-course/build/cache/",
         (vec![], vec![("artifact.bin", 40)]),
+    );
+    dirs.insert(
+        "/exclude-course/module/",
+        (vec![".git/", "deep/"], vec![("notes.txt", 60)]),
+    );
+    dirs.insert(
+        "/exclude-course/module/.git/",
+        (vec![], vec![("config", 65)]),
+    );
+    dirs.insert(
+        "/exclude-course/module/deep/",
+        (vec![".git/"], vec![("keep.txt", 70)]),
+    );
+    dirs.insert(
+        "/exclude-course/module/deep/.git/",
+        (vec![], vec![("config", 75)]),
+    );
+    dirs.insert(
+        "/exclude-course/node_modules/",
+        (vec!["pkg/"], vec![]),
+    );
+    dirs.insert(
+        "/exclude-course/node_modules/pkg/",
+        (vec![], vec![("index.js", 80)]),
     );
     dirs.insert("/exclude-course/src/", (vec![], vec![("main.rs", 50)]));
 
@@ -1654,7 +2396,12 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
     let base_url = format!("http://127.0.0.1:{}/exclude-course/", port);
     let client = rustydav::client::Client::init("testuser", "testpass");
     let cancel_flag = AtomicBool::new(false);
-    let exclusions = normalize_exclude_folders(&[".git/".to_string(), "build/cache".to_string()]);
+    let exclusions = normalize_exclude_folders(&[
+        ".git/".to_string(),
+        "node_modules".to_string(),
+        "assets/cache".to_string(),
+        "build/cache".to_string(),
+    ]);
     let mut log_output = String::new();
 
     let items = list_remote_recursive_with_exclusions_and_log(
@@ -1678,16 +2425,29 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
     assert_eq!(
         found,
         vec![
+            ".gitlab/notes.txt".to_string(),
+            "assets/cache2/keep.txt".to_string(),
+            "assets/keep.txt".to_string(),
             "build/keep.txt".to_string(),
             "keep.txt".to_string(),
+            "module/deep/keep.txt".to_string(),
+            "module/notes.txt".to_string(),
             "src/main.rs".to_string(),
         ],
         "excluded folders and their contents must not appear in the listing"
     );
 
-    // The strongest guarantee: the excluded collections were never requested at all.
+    // The strongest guarantee: excluded collections were never requested at all, including
+    // `.git` nested one and two levels deep.
     let requested = requested.lock().unwrap().clone();
-    for skipped in ["/exclude-course/.git", "/exclude-course/build/cache"] {
+    for skipped in [
+        "/exclude-course/.git",
+        "/exclude-course/module/.git",
+        "/exclude-course/module/deep/.git",
+        "/exclude-course/node_modules",
+        "/exclude-course/assets/cache",
+        "/exclude-course/build/cache",
+    ] {
         assert!(
             !requested.contains(skipped),
             "excluded folder {} must not be requested; requested: {:?}",
@@ -1697,7 +2457,12 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
     }
     for scanned in [
         "/exclude-course",
+        "/exclude-course/.gitlab",
+        "/exclude-course/assets",
+        "/exclude-course/assets/cache2",
         "/exclude-course/build",
+        "/exclude-course/module",
+        "/exclude-course/module/deep",
         "/exclude-course/src",
     ] {
         assert!(
@@ -1707,15 +2472,28 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
             requested
         );
     }
-    assert!(
-        !log_output.contains("Scanning directory: .git"),
-        "excluded .git must not be scanned: {}",
-        log_output
+    assert_not_scanned_directories(
+        &log_output,
+        &[
+            ".git",
+            "module/.git",
+            "module/deep/.git",
+            "node_modules",
+            "assets/cache",
+            "build/cache",
+        ],
     );
-    assert!(
-        !log_output.contains("Scanning directory: build/cache"),
-        "excluded build/cache must not be scanned: {}",
-        log_output
+    assert_scanned_directories(
+        &log_output,
+        &[
+            ".gitlab",
+            "assets",
+            "assets/cache2",
+            "build",
+            "module",
+            "module/deep",
+            "src",
+        ],
     );
 
     is_running.store(false, Ordering::SeqCst);
