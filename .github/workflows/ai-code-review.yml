@@ -309,10 +309,14 @@ jobs:
       # endpoint's own ceiling, so a reviewer reasons harder than its default
       # without spending its whole completion budget on the trace. A model that
       # returns no review text abstains, so an unavailable endpoint cannot block
-      # a merge on its own.
+      # a merge on its own. Each review is posted the moment that reviewer
+      # answers, so the one that stalls on its endpoint no longer keeps the
+      # other's review off the pull request for the rest of its timeout.
       - name: Call AI Code Review Models
         if: success() && steps.diff.outputs.has_diff == 'true'
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           OCG_KEY: ${{ secrets.OCG_KEY }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
         run: node scripts/ai-code-review.mjs call
@@ -322,7 +326,7 @@ jobs:
       # exit code is job success, which is what the merge job waits on. PRs
       # whose filtered diff was empty never reach it either: the reviewers never
       # saw those files, and unreviewed is not approved.
-      - name: Post PR Review Comment and Verdict
+      - name: Aggregate PR Review Verdict
         if: success() && steps.diff.outputs.has_diff == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -582,24 +586,27 @@ jobs:
       - name: Call Security Review Models
         if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           OCG_KEY: ${{ secrets.OCG_KEY }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           AI_MODEL_IDS: opencode-go-deepseek
         run: node scripts/ai-code-review.mjs call
 
-      - name: Post Security Review Comment and Verdict
+      - name: Aggregate Security Review Verdict
         if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           AI_MODEL_IDS: opencode-go-deepseek
         run: |
-          # The shared engine posts one comment per model, strips bold and emoji,
-          # parses each verdict, and exits non-zero if a reviewer that answered
-          # objected or if none approved. A model that returned no review text
-          # abstains instead of blocking. This job's exit code is what the merge
-          # job's `needs` waits on, so a security objection blocks the merge
-          # without any check-name coordination.
+          # The call step posts one comment per model as it answers, strips bold
+          # and emoji, and records each verdict. This step aggregates them and
+          # exits non-zero if a reviewer that answered objected or if none
+          # approved. A model that returned no review text abstains instead of
+          # blocking. This job's exit code is what the merge job's `needs` waits
+          # on, so a security objection blocks the merge without any check-name
+          # coordination.
           if node scripts/ai-code-review.mjs post-comment; then
             exit 0
           fi

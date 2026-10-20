@@ -517,7 +517,10 @@ function preparePayload() {
 
 // Every reviewer is called concurrently, so the whole fleet costs roughly the
 // wall clock of the slowest one and the job stays inside the timeout budget the
-// code review grants its sibling checks.
+// code review grants its sibling checks. Each review is posted on resolution
+// rather than at the end: one reviewer's endpoint stalls for its whole timeout
+// often enough that waiting for it left the pull request with no review at all
+// for ten minutes while its own checks were already green.
 async function callModels() {
   const payloadFile = process.env.PAYLOAD_FILE || "/tmp/ai_review_payload.json";
   if (!fs.existsSync(payloadFile)) {
@@ -534,12 +537,23 @@ async function callModels() {
   }
 
   const providers = loadProviders();
-  const results = await Promise.all(providers.map((provider) => callProvider(payload, provider)));
-  const failed = results.filter((result) => !result.ok);
-  console.log(`called ${results.length} reviewer(s), ${failed.length} failed.`);
-  // A failed call is not fatal here: it is written as an error response so
-  // post-comment posts the reason on the PR and fails the check, keeping the
-  // merge gate in one place.
+  const context = reviewContext();
+  const results = await Promise.all(
+    providers.map(async (provider) => {
+      const result = await callProvider(payload, provider);
+      // Post the review as soon as this reviewer answers, then record its
+      // verdict so the post-comment step aggregates the same outcome instead of
+      // posting the comment a second time.
+      const outcome = postProviderComment(provider, context);
+      recordOutcome(context, provider, outcome);
+      return { result, outcome };
+    })
+  );
+  const failed = results.filter(({ result }) => !result.ok);
+  console.log(`called ${results.length} reviewer(s), ${failed.length} failed; each review posted as it landed.`);
+  // A failed call is not fatal here: it is written as an error response and
+  // posted as an abstention. post-comment reads the recorded outcomes and fails
+  // the check on an objection, keeping the merge gate in one place.
 }
 
 async function callProvider(payload, provider) {
@@ -643,8 +657,8 @@ async function callProvider(payload, provider) {
         // with finish_reason=length and no content. Ask it again with a doubled
         // budget, but only while the deadline can still pay for the longer
         // answer and the retry gets at least as long as the attempt that just
-        // truncated; otherwise record the truncated body and let post-comment
-        // report the abstention.
+        // truncated; otherwise record the truncated body and let the caller
+        // post the abstention.
         if (body?.choices?.[0]?.finish_reason === "length" && !extractContent(message)) {
           const spentMs = Date.now() - attemptStartedAt;
           const leftMs = deadline - Date.now();
@@ -695,9 +709,10 @@ async function callProvider(payload, provider) {
   return writeError(message);
 }
 
-function postComment() {
-  const providers = loadProviders();
-  const context = {
+// The shared inputs of a review, read in two steps: `call` posts each comment
+// and records its outcome, `post-comment` reports the verdict from the record.
+function reviewContext() {
+  return {
     responseTemplate: process.env.RESPONSE_FILE || "/tmp/ai_review_response.json",
     commentTemplate: process.env.COMMENT_FILE || "/tmp/ai_review_comment.md",
     commentHeader: process.env.COMMENT_HEADER || "## ai code review",
@@ -705,8 +720,47 @@ function postComment() {
     prNumber: process.env.PR_NUMBER,
     reviewName: process.env.REVIEW_NAME || "ai code review"
   };
+}
 
-  const outcomes = providers.map((provider) => postProviderComment(provider, context));
+// A posted review's verdict, keyed like its response:
+// /tmp/ai_review_response.<id>.json.outcome.
+function outcomePath(context, provider) {
+  return `${perProviderPath(context.responseTemplate, provider.id)}.outcome`;
+}
+
+function recordOutcome(context, provider, outcome) {
+  const body = { status: outcome.status, detail: outcome.detail ?? "" };
+  fs.writeFileSync(outcomePath(context, provider), JSON.stringify(body, null, 2), "utf8");
+}
+
+function readOutcome(context, provider) {
+  const file = outcomePath(context, provider);
+  if (!fs.existsSync(file)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!["approved", "objected", "abstained"].includes(parsed.status)) {
+      return null;
+    }
+    return { provider, status: parsed.status, detail: parsed.detail || "" };
+  } catch (err) {
+    console.warn(`${provider.id}: unreadable outcome at ${file} (${err.message}); posting the review instead.`);
+    return null;
+  }
+}
+
+function postComment() {
+  const providers = loadProviders();
+  const context = reviewContext();
+
+  // The call step already posted each reviewer's comment as it landed and
+  // recorded its verdict. Aggregate that record here so nothing is posted
+  // twice; a run that invoked post-comment on its own, or one that died before
+  // recording, falls back to posting exactly as it used to.
+  const outcomes = providers.map(
+    (provider) => readOutcome(context, provider) ?? postProviderComment(provider, context)
+  );
   const approved = outcomes.filter((outcome) => outcome.status === "approved");
   const objected = outcomes.filter((outcome) => outcome.status === "objected");
   const abstained = outcomes.filter((outcome) => outcome.status === "abstained");
