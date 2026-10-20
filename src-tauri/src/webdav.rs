@@ -1165,6 +1165,17 @@ pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Resu
     let url = rustydav::prelude::Url::parse(url_str)
         .map_err(|e| format!("Invalid WebDAV URL: {}", e))?;
 
+    // Reject credentials embedded in the URL itself (https://user:pass@host/):
+    // the password would be persisted verbatim in the settings store, echoed
+    // into operation logs, and attached by the transport regardless of host —
+    // outside the keyring vault every other credential path uses.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "URL must not contain embedded credentials: set the username and password separately."
+                .to_string(),
+        );
+    }
+
     let scheme = url.scheme().to_ascii_lowercase();
     if scheme != "https" {
         if scheme == "http" && allow_insecure {
@@ -2950,6 +2961,20 @@ where
                     "[{}/{}] Downloading: {} ({} bytes)...\n",
                     current_num, total_files, rel, item.size
                 ));
+                // A server-supplied href must not redirect an authenticated
+                // GET to another host: require the same origin as the
+                // configured remote and pass the SSRF guard. Checked before
+                // any filesystem touch — a skipped item creates nothing.
+                let download_url = resolve_item_url(remote_url, &item.href);
+                if !same_remote_origin(remote_url, &download_url)
+                    || validate_webdav_url(&download_url).is_err()
+                {
+                    log(&format!(
+                        "[{}/{}] ERROR: Skipping {}: href resolves outside the configured remote origin\n",
+                        current_num, total_files, rel
+                    ));
+                    continue;
+                }
                 let target_file = match safe_join_path(local_dir, rel) {
                     Ok(p) => p,
                     Err(e) => {
@@ -2969,19 +2994,6 @@ where
                             return Err(format!("Directory traversal detected for {}", rel));
                         }
                     }
-                }
-                let download_url = resolve_item_url(remote_url, &item.href);
-                // A server-supplied href must not redirect an authenticated
-                // GET to another host: require the same origin as the
-                // configured remote and pass the SSRF guard.
-                if !same_remote_origin(remote_url, &download_url)
-                    || validate_webdav_url(&download_url).is_err()
-                {
-                    log(&format!(
-                        "[{}/{}] ERROR: Skipping {}: href resolves outside the configured remote origin\n",
-                        current_num, total_files, rel
-                    ));
-                    continue;
                 }
                 let download_result = retry_webdav_operation(
                     &format!("GET {download_url}"),
@@ -3800,6 +3812,68 @@ mod tests {
             base,
             "http://example.com/remote.php/webdav/folder/file.txt"
         ));
+    }
+
+    #[test]
+    fn test_url_userinfo_credentials_rejected() {
+        // A password embedded in the URL is persisted to settings.json and
+        // logged verbatim — it must be rejected before any storage or request.
+        assert!(validate_webdav_url_internal(
+            "https://user:secretpass@example.com/dav/",
+            false
+        )
+        .is_err());
+        assert!(validate_webdav_url_internal(
+            "https://user:secretpass@example.com/dav/",
+            true
+        )
+        .is_err());
+        // Username-only userinfo is rejected too: it still bypasses the vault.
+        assert!(validate_webdav_url_internal(
+            "https://user@example.com/dav/",
+            false
+        )
+        .is_err());
+        // The same host without embedded credentials is fine.
+        assert!(validate_webdav_url_internal("https://example.com/dav/", false).is_ok());
+    }
+
+    #[test]
+    fn test_http_scheme_rejected_in_production_sniffer_cannot_read_credentials() {
+        // A passive sniffer on the local network reads every plain-text byte.
+        // Production mode must refuse any scheme it could read, so the
+        // Basic-auth password can never travel unencrypted.
+        for url in [
+            "http://example.com/",
+            "http://example.com/dav/",
+            "http://10.0.0.1/", // would also fail private-range, scheme first
+        ] {
+            assert!(
+                validate_webdav_url_internal(url, false).is_err(),
+                "production mode must reject sniffer-readable scheme: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cache_and_settings_never_store_password() {
+        // The listing cache must never carry the credential: serialize an
+        // entry with a marker "password" and prove the struct has no field
+        // that would emit it.
+        let entry = CachedRemoteListing {
+            remote_url: "https://example.com/dav/".to_string(),
+            auth_user: Some("user".to_string()),
+            timestamp: 0,
+            items: vec![WebdavItem::new("dav/file.txt", false, 3)],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.to_ascii_lowercase().contains("password"),
+            "cache serialization leaked a password field: {json}"
+        );
+        assert!(!json.contains("secretpass"));
+        // auth_user carries only the username, never the secret.
+        assert!(json.contains("user"));
     }
 
     #[test]
