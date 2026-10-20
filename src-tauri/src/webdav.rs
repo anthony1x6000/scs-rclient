@@ -1309,6 +1309,11 @@ fn blocked_ip_reason(ip: std::net::IpAddr) -> Option<&'static str> {
             if (segments[0] & 0xfe00) == 0xfc00 {
                 return Some("Access to unique local IPv6 is blocked for security.");
             }
+            // 64:ff9b:1::/48 is local-use NAT64 (RFC 8215): a private
+            // translation prefix, never a public WebDAV destination.
+            if segments[0] == 0x64 && segments[1] == 0xff9b && segments[2] == 1 {
+                return Some("Access to local-use NAT64 IPv6 is blocked for security.");
+            }
             // IPv4 addresses carried inside an IPv6 spelling by a transition
             // mechanism must not smuggle a blocked range past this check.
             if let Some(reason) = embedded_ipv4_reason(ipv6) {
@@ -3873,6 +3878,14 @@ mod tests {
         assert!(validate_webdav_url_internal("https://[2002:808:808::]/dav", false).is_ok());
         // Teredo carries a server IPv4 and a bit-inverted client IPv4.
         assert!(validate_webdav_url_internal("https://[2001:0:a00:1::]/dav", false).is_err());
+        // Public Teredo server, client 10.0.0.1 inverted into the last 32 bits.
+        assert!(validate_webdav_url_internal(
+            "https://[2001:0:808:808:0:0:f5ff:fffe]/dav",
+            false
+        )
+        .is_err());
+        // Local-use NAT64 (RFC 8215) is not a public destination.
+        assert!(validate_webdav_url_internal("https://[64:ff9b:1::808:808]/dav", false).is_err());
         // IPv4-compatible ::a.b.c.d spellings stay covered alongside mapped ones.
         assert!(validate_webdav_url_internal("https://[::a00:1]/dav", false).is_err());
     }
