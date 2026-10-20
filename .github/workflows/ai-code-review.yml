@@ -318,7 +318,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           OCG_KEY: ${{ secrets.OCG_KEY }}
-          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
         run: node scripts/ai-code-review.mjs call
 
       # Exits non-zero unless at least one model returned an explicit
@@ -589,7 +588,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           OCG_KEY: ${{ secrets.OCG_KEY }}
-          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           AI_MODEL_IDS: opencode-go-deepseek
         run: node scripts/ai-code-review.mjs call
 
