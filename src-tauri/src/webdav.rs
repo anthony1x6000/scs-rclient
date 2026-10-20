@@ -1128,6 +1128,22 @@ fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
     )
 }
 
+/// Gate for any URL taken from a server response before it becomes a request:
+/// it must stay on the configured remote's origin and still pass the SSRF
+/// guard. Returns the user-facing reason when the URL must not be used.
+///
+/// Residual: `rustydav` 0.1.3 builds its own `reqwest::blocking::Client` with
+/// the default redirect policy, so a 3xx sent by the remote is still followed
+/// by the transport. This gate validates the URL handed to the client, not a
+/// redirect target; closing that gap needs an upstream rustydav constructor
+/// that accepts a client with a validating redirect policy.
+fn guard_server_derived_url(remote_url: &str, target_url: &str) -> Result<(), String> {
+    if !same_remote_origin(remote_url, target_url) {
+        return Err("href resolves outside the configured remote origin".to_string());
+    }
+    validate_webdav_url(target_url)
+}
+
 /// Builds the URL for a specific file under a collection, ensuring proper percent-encoding.
 pub fn build_file_url(collection_url: &str, rel_path: &str) -> String {
     if let Ok(mut base) = rustydav::prelude::Url::parse(collection_url) {
@@ -1214,23 +1230,47 @@ pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Resu
         // Resolve DNS names and reject any address in a blocked private range.
         // Closes the hostname-resolving-to-private-IP gap; the residual DNS
         // rebinding TOCTOU needs a reqwest custom resolver for a full fix.
-        use std::net::ToSocketAddrs;
-        let resolution_target = format!("{unbracketed}:0");
-        if let Ok(addrs) = resolution_target.to_socket_addrs() {
-            for addr in addrs {
-                if let Some(reason) = blocked_ip_reason(addr.ip()) {
-                    return Err(reason.to_string());
-                }
-            }
-        }
+        check_resolved_host(unbracketed)?;
     }
 
     Ok(())
 }
 
+/// Resolves a hostname and rejects it when any address it maps to is blocked.
+///
+/// Fails closed: a lookup that cannot complete says nothing about where the
+/// request would land, so an unanswered resolution is an error, not a pass.
+///
+/// Deliberately not memoized, even though the download and delete loops call
+/// the guard once per item: a host that validates as public can rebind to a
+/// private address moments later, and a cached verdict would leave the guard
+/// switched off for that host for the rest of the process. Paying one blocking
+/// lookup per item keeps every request checked against current DNS.
+fn check_resolved_host(host: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+
+    let resolution_target = format!("{host}:0");
+    let addrs = resolution_target.to_socket_addrs().map_err(|e| {
+        format!("Could not resolve WebDAV host {host} ({e}); refusing to connect.")
+    })?;
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        if let Some(reason) = blocked_ip_reason(addr.ip()) {
+            return Err(reason.to_string());
+        }
+    }
+    if !resolved_any {
+        return Err(format!(
+            "Could not resolve WebDAV host {host}; refusing to connect."
+        ));
+    }
+    Ok(())
+}
+
 /// Returns the block reason when the IP falls in a range the client must not
-/// reach, including via IPv4-mapped IPv6 (::ffff:a.b.c.d) and NAT64
-/// (64:ff9b::a.b.c.d) spellings of those ranges.
+/// reach, including when a blocked IPv4 range is spelled as an IPv6 address by
+/// a transition mechanism (IPv4-mapped, NAT64, 6to4, Teredo).
 fn blocked_ip_reason(ip: std::net::IpAddr) -> Option<&'static str> {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
@@ -1269,27 +1309,61 @@ fn blocked_ip_reason(ip: std::net::IpAddr) -> Option<&'static str> {
             if (segments[0] & 0xfe00) == 0xfc00 {
                 return Some("Access to unique local IPv6 is blocked for security.");
             }
-            // IPv4-mapped (::ffff:a.b.c.d)
-            if let Some(v4) = ipv6.to_ipv4() {
-                if let Some(reason) = blocked_ip_reason(std::net::IpAddr::V4(v4)) {
-                    return Some(reason);
-                }
-            }
-            // NAT64 well-known prefix 64:ff9b::/96 embedding a blocked IPv4
-            if segments[0] == 0x64 && segments[1] == 0xff9b && (segments[2] | segments[3]) == 0 {
-                let v4 = std::net::Ipv4Addr::new(
-                    (segments[4] >> 8) as u8,
-                    segments[4] as u8,
-                    (segments[5] >> 8) as u8,
-                    segments[5] as u8,
-                );
-                if let Some(reason) = blocked_ip_reason(std::net::IpAddr::V4(v4)) {
-                    return Some(reason);
-                }
+            // IPv4 addresses carried inside an IPv6 spelling by a transition
+            // mechanism must not smuggle a blocked range past this check.
+            if let Some(reason) = embedded_ipv4_reason(ipv6) {
+                return Some(reason);
             }
             None
         }
     }
+}
+
+/// Returns some reason when a blocked IPv4 range is embedded in an IPv6
+/// address by a transition mechanism: IPv4-mapped (`::ffff:a.b.c.d`) and
+/// IPv4-compatible (`::a.b.c.d`), NAT64 well-known (`64:ff9b::/96`), 6to4
+/// (`2002:aabb:ccdd::/48`), and Teredo's server and bit-inverted client
+/// addresses (`2001:0::/32`).
+fn embedded_ipv4_reason(ipv6: std::net::Ipv6Addr) -> Option<&'static str> {
+    let octets = |hi: u16, lo: u16| {
+        std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+    };
+    let check = |v4: std::net::Ipv4Addr| blocked_ip_reason(std::net::IpAddr::V4(v4));
+
+    if let Some(compatible_or_mapped) = ipv6.to_ipv4() {
+        if let Some(reason) = check(compatible_or_mapped) {
+            return Some(reason);
+        }
+    }
+    let segments = ipv6.segments();
+    // RFC 6052 NAT64: 64:ff9b::/96 with segments 2..=5 zero. The embedded IPv4
+    // is the final 32 bits — reading segments 4 and 5 instead decoded every
+    // standard NAT64 address as 0.0.0.0.
+    if segments[0] == 0x64
+        && segments[1] == 0xff9b
+        && (segments[2] | segments[3] | segments[4] | segments[5]) == 0
+    {
+        if let Some(reason) = check(octets(segments[6], segments[7])) {
+            return Some(reason);
+        }
+    }
+    // 6to4: 2002:<IPv4 as two segments>::/48.
+    if segments[0] == 0x2002 {
+        if let Some(reason) = check(octets(segments[1], segments[2])) {
+            return Some(reason);
+        }
+    }
+    // Teredo: 2001:0:<server IPv4>:<flags|port>:<client IPv4, inverted>.
+    if segments[0] == 0x2001 && segments[1] == 0 {
+        if let Some(reason) = check(octets(segments[2], segments[3])) {
+            return Some(reason);
+        }
+        let client = !((u32::from(segments[6]) << 16) | u32::from(segments[7]));
+        if let Some(reason) = check(std::net::Ipv4Addr::from(client)) {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 /// Ensures all parent collections exist for a relative file path prior to PUT.
@@ -2966,12 +3040,10 @@ where
                 // configured remote and pass the SSRF guard. Checked before
                 // any filesystem touch — a skipped item creates nothing.
                 let download_url = resolve_item_url(remote_url, &item.href);
-                if !same_remote_origin(remote_url, &download_url)
-                    || validate_webdav_url(&download_url).is_err()
-                {
+                if let Err(reason) = guard_server_derived_url(remote_url, &download_url) {
                     log(&format!(
-                        "[{}/{}] ERROR: Skipping {}: href resolves outside the configured remote origin\n",
-                        current_num, total_files, rel
+                        "[{}/{}] ERROR: Skipping {}: {}\n",
+                        current_num, total_files, rel, reason
                     ));
                     continue;
                 }
@@ -3244,12 +3316,10 @@ where
                     let file_url = resolve_item_url(remote_url, &item.href);
                     // A server-supplied href must not redirect the
                     // authenticated DELETE to another host.
-                    if !same_remote_origin(remote_url, &file_url)
-                        || validate_webdav_url(&file_url).is_err()
-                    {
+                    if let Err(reason) = guard_server_derived_url(remote_url, &file_url) {
                         log(&format!(
-                            "ERROR: Skipping delete of {}: href resolves outside the configured remote origin\n",
-                            rel
+                            "ERROR: Skipping delete of {}: {}\n",
+                            rel, reason
                         ));
                         continue;
                     }
@@ -3789,6 +3859,32 @@ mod tests {
         assert!(validate_webdav_url_internal("https://[64:ff9b::a00:1]/dav", false).is_err());
         // A public IPv6 literal is still accepted.
         assert!(validate_webdav_url_internal("https://[2606:4700::6810:85e5]/dav", false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_embedded_ipv4_spellings() {
+        // NAT64 64:ff9b::/96 embeds the IPv4 in the last 32 bits, so the public
+        // form must be accepted and only genuinely blocked targets rejected.
+        assert!(validate_webdav_url_internal("https://[64:ff9b::808:808]/dav", false).is_ok());
+        assert!(validate_webdav_url_internal("https://[64:ff9b::a00:1]/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://[64:ff9b::7f00:1]/dav", false).is_err());
+        // 6to4 carries the IPv4 in segments 1-2 of the 2002::/16 prefix.
+        assert!(validate_webdav_url_internal("https://[2002:a00:1::]/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://[2002:808:808::]/dav", false).is_ok());
+        // Teredo carries a server IPv4 and a bit-inverted client IPv4.
+        assert!(validate_webdav_url_internal("https://[2001:0:a00:1::]/dav", false).is_err());
+        // IPv4-compatible ::a.b.c.d spellings stay covered alongside mapped ones.
+        assert!(validate_webdav_url_internal("https://[::a00:1]/dav", false).is_err());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_fails_closed_when_host_does_not_resolve() {
+        // An unanswered lookup must not be read as "no blocked address found":
+        // a host that fails validation-time resolution can resolve to a private
+        // address when the request is actually issued.
+        let result = validate_webdav_url_internal("https://does-not-resolve.invalid/dav", false);
+        assert!(result.is_err(), "unresolvable host must be rejected");
+        assert!(result.unwrap_err().contains("Could not resolve"));
     }
 
     #[test]
