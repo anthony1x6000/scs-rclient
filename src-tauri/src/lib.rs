@@ -170,6 +170,7 @@ fn delete_credentials(username: String) -> Result<(), String> {
     }
 }
 
+pub mod dav_client;
 pub mod webdav;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -279,7 +280,7 @@ async fn run_webdav_action(
         Some(user.clone())
     };
 
-    let client = rustydav::client::Client::init(&user, &pass);
+    let client = dav_client::Client::init(&user, &pass, &remote_url)?;
     let app_handle = app.clone();
 
     tauri::async_runtime::spawn_blocking(move || {

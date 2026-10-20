@@ -1,3 +1,4 @@
+use crate::dav_client::{self, Client};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::io::Read;
@@ -30,13 +31,13 @@ pub const RETRY_MAX_DELAY_MS: u64 = 10_000;
 /// Retry delay used by production call sites; unit tests pass [`Duration::ZERO`] instead.
 const RETRY_DELAY: Duration = Duration::from_millis(RETRY_BASE_DELAY_MS);
 
-// Static compile-time assertion verifying that rustydav::client::Client implements Send + Sync
+// Static compile-time assertion verifying that dav_client::Client implements Send + Sync
 // and can safely be shared across concurrent scanning worker threads.
-// Note: rustydav::client::Client internally wraps reqwest::blocking::Client, which maintains
+// Note: dav_client::Client internally wraps reqwest::blocking::Client, which maintains
 // an Arc-backed connection pool designed for concurrent multi-threaded usage.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<rustydav::client::Client>();
+    assert_send_sync::<Client>();
 };
 
 /// Classification of a single WebDAV request attempt, used to decide whether a retry is worth it.
@@ -47,9 +48,21 @@ enum AttemptError {
     Fatal(String),
 }
 
+/// Formats a WebDAV transport error with its full source chain and a retry
+/// classification, then labels it transient or fatal. An unparseable request
+/// URL is deterministic, so it is fatal.
+fn classify_dav_error(context: &str, error: &dav_client::Error) -> AttemptError {
+    match error {
+        dav_client::Error::InvalidUrl(msg) => {
+            AttemptError::Fatal(format!("{context}: invalid request URL: {msg}"))
+        }
+        dav_client::Error::Transport(e) => classify_transport_error(context, e),
+    }
+}
+
 /// Formats a reqwest transport error with its full source chain and a retry classification,
 /// then labels it transient or fatal.
-fn classify_reqwest_error(context: &str, error: &rustydav::prelude::Error) -> AttemptError {
+fn classify_transport_error(context: &str, error: &reqwest::Error) -> AttemptError {
     let mut detail = format!("{context}: {error}");
     if let Some(url) = error.url() {
         detail.push_str(&format!("\n    url: {url}"));
@@ -86,8 +99,8 @@ fn classify_reqwest_error(context: &str, error: &rustydav::prelude::Error) -> At
 /// mid-download timeout is retried instead of being mistaken for a local disk failure.
 fn classify_io_error(context: &str, error: &std::io::Error) -> AttemptError {
     if let Some(inner) = error.get_ref() {
-        if let Some(reqwest_error) = inner.downcast_ref::<rustydav::prelude::Error>() {
-            return classify_reqwest_error(context, reqwest_error);
+        if let Some(reqwest_error) = inner.downcast_ref::<reqwest::Error>() {
+            return classify_transport_error(context, reqwest_error);
         }
     }
     let detail = format!("{context}: {error}");
@@ -971,7 +984,7 @@ pub fn resolve_item_url(base_url: &str, item_href: &str) -> String {
     } else {
         item_href.to_string()
     };
-    if let Ok(base) = rustydav::prelude::Url::parse(base_url) {
+    if let Ok(base) = reqwest::Url::parse(base_url) {
         if let Ok(joined) = base.join(&safe_href) {
             let mut s = joined.to_string();
             if item_href.ends_with('/') && !s.ends_with('/') {
@@ -1043,11 +1056,11 @@ fn sanitize_relative_path(rel: &str) -> String {
 /// Computes the item path relative to the collection URL.
 pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
     let resolved_url_str = resolve_item_url(base_url, item_href);
-    let resolved_url = match rustydav::prelude::Url::parse(&resolved_url_str) {
+    let resolved_url = match reqwest::Url::parse(&resolved_url_str) {
         Ok(u) => u,
         Err(_) => return sanitize_relative_path(&decode_percent(item_href)),
     };
-    let base_url_parsed = match rustydav::prelude::Url::parse(base_url) {
+    let base_url_parsed = match reqwest::Url::parse(base_url) {
         Ok(u) => u,
         Err(_) => return sanitize_relative_path(&decode_percent(item_href)),
     };
@@ -1121,8 +1134,8 @@ pub fn build_remote_url(base_url: &str, subdir: &str) -> String {
 fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
     matches!(
         (
-            rustydav::prelude::Url::parse(remote_url),
-            rustydav::prelude::Url::parse(target_url),
+            reqwest::Url::parse(remote_url),
+            reqwest::Url::parse(target_url),
         ),
         (Ok(a), Ok(b)) if a.origin() == b.origin()
     )
@@ -1132,11 +1145,10 @@ fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
 /// it must stay on the configured remote's origin and still pass the SSRF
 /// guard. Returns the user-facing reason when the URL must not be used.
 ///
-/// Residual: `rustydav` 0.1.3 builds its own `reqwest::blocking::Client` with
-/// the default redirect policy, so a 3xx sent by the remote is still followed
-/// by the transport. This gate validates the URL handed to the client, not a
-/// redirect target; closing that gap needs an upstream rustydav constructor
-/// that accepts a client with a validating redirect policy.
+/// Redirect targets never reach the transport: the in-repo `dav_client`
+/// builds its reqwest client with `redirect::Policy::none()`, so a 3xx sent
+/// by the remote is returned as a plain non-success response instead of
+/// being followed with the Basic-auth header attached.
 fn guard_server_derived_url(remote_url: &str, target_url: &str) -> Result<(), String> {
     if !same_remote_origin(remote_url, target_url) {
         return Err("href resolves outside the configured remote origin".to_string());
@@ -1146,7 +1158,7 @@ fn guard_server_derived_url(remote_url: &str, target_url: &str) -> Result<(), St
 
 /// Builds the URL for a specific file under a collection, ensuring proper percent-encoding.
 pub fn build_file_url(collection_url: &str, rel_path: &str) -> String {
-    if let Ok(mut base) = rustydav::prelude::Url::parse(collection_url) {
+    if let Ok(mut base) = reqwest::Url::parse(collection_url) {
         let ok = if let Ok(mut segments) = base.path_segments_mut() {
             segments.pop_if_empty();
             for part in rel_path.split('/') {
@@ -1171,14 +1183,20 @@ pub fn build_file_url(collection_url: &str, rel_path: &str) -> String {
 /// Validates a WebDAV URL against SSRF, internal networks, and insecure protocols.
 /// In production, requires HTTPS and blocks local/private/link-local addresses.
 pub fn validate_webdav_url(url_str: &str) -> Result<(), String> {
-    let allow_insecure = cfg!(test)
+    validate_webdav_url_internal(url_str, insecure_webdav_allowed())
+}
+
+/// Whether insecure WebDAV origins (plain HTTP, private addresses) are
+/// permitted in this process: unit tests, an explicit development override,
+/// or a configured live test server.
+pub(crate) fn insecure_webdav_allowed() -> bool {
+    cfg!(test)
         || std::env::var("ALLOW_INSECURE_WEBDAV").as_deref() == Ok("1")
-        || std::env::var("TEST_WEBDAV_URL").is_ok();
-    validate_webdav_url_internal(url_str, allow_insecure)
+        || std::env::var("TEST_WEBDAV_URL").is_ok()
 }
 
 pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Result<(), String> {
-    let url = rustydav::prelude::Url::parse(url_str)
+    let url = reqwest::Url::parse(url_str)
         .map_err(|e| format!("Invalid WebDAV URL: {}", e))?;
 
     // Reject credentials embedded in the URL itself (https://user:pass@host/):
@@ -1228,8 +1246,10 @@ pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Resu
         }
     } else {
         // Resolve DNS names and reject any address in a blocked private range.
-        // Closes the hostname-resolving-to-private-IP gap; the residual DNS
-        // rebinding TOCTOU needs a reqwest custom resolver for a full fix.
+        // The residual DNS rebinding TOCTOU (guard resolves, transport
+        // re-resolves) is closed at the transport: `dav_client` pins the
+        // validated addresses with `resolve_to_addrs`, so connect-time DNS is
+        // bypassed entirely.
         check_resolved_host(unbracketed)?;
     }
 
@@ -1271,7 +1291,7 @@ fn check_resolved_host(host: &str) -> Result<(), String> {
 /// Returns the block reason when the IP falls in a range the client must not
 /// reach, including when a blocked IPv4 range is spelled as an IPv6 address by
 /// a transition mechanism (IPv4-mapped, NAT64, 6to4, Teredo).
-fn blocked_ip_reason(ip: std::net::IpAddr) -> Option<&'static str> {
+pub(crate) fn blocked_ip_reason(ip: std::net::IpAddr) -> Option<&'static str> {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
             if ipv4.is_loopback() {
@@ -1377,7 +1397,7 @@ fn embedded_ipv4_reason(ipv6: std::net::Ipv6Addr) -> Option<&'static str> {
 /// attempt. A failure that survives all retries is returned to the caller, which logs it and
 /// skips only the affected file.
 pub fn ensure_remote_parent_dirs<L: FnMut(&str)>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     rel_path: &str,
     cancel_flag: &AtomicBool,
@@ -1398,7 +1418,7 @@ pub fn ensure_remote_parent_dirs<L: FnMut(&str)>(
         || {
             client
                 .mkcol(remote_url)
-                .map_err(|e| classify_reqwest_error(&format!("MKCOL {remote_url}"), &e))
+                .map_err(|e| classify_dav_error(&format!("MKCOL {remote_url}"), &e))
         },
     );
     match res {
@@ -1435,7 +1455,7 @@ pub fn ensure_remote_parent_dirs<L: FnMut(&str)>(
             || {
                 client
                     .mkcol(&dir_url)
-                    .map_err(|e| classify_reqwest_error(&format!("MKCOL {dir_url}"), &e))
+                    .map_err(|e| classify_dav_error(&format!("MKCOL {dir_url}"), &e))
             },
         )
         .map_err(|e| format!("Failed to create folder {}: {}", dir_url, e))?;
@@ -1454,7 +1474,7 @@ pub fn ensure_remote_parent_dirs<L: FnMut(&str)>(
 /// or returns 0 child items (e.g. server restricts Depth: infinity to Depth: 0),
 /// it falls back to breadth-first traversal using Depth: 1.
 pub fn list_remote_recursive(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
 ) -> Result<Vec<WebdavItem>, String> {
@@ -1463,7 +1483,7 @@ pub fn list_remote_recursive(
 
 /// Recursively lists remote WebDAV items under remote_url with streamed diagnostic logs.
 pub fn list_remote_recursive_with_log<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
     log: F,
@@ -1477,7 +1497,7 @@ where
 /// Recursively lists remote WebDAV items under remote_url with configurable worker concurrency and streamed diagnostic logs.
 ///
 /// Thread Safety:
-/// `rustydav::client::Client` implements `Send + Sync` (internally backed by `reqwest::blocking::Client` connection pool)
+/// `Client` implements `Send + Sync` (internally backed by `reqwest::blocking::Client` connection pool)
 /// allowing concurrent Depth: 1 requests across worker threads.
 ///
 /// Parameters:
@@ -1485,7 +1505,7 @@ where
 ///   `None` keeps the live limit (the environment default until the user changes it).
 /// - `auth_user`: Optional username for credential-scoped cache partitioning (CWE-287 / CWE-384).
 pub fn list_remote_recursive_with_concurrency_and_log<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
     concurrency: Option<usize>,
@@ -1517,7 +1537,7 @@ where
 /// This is the exclusion-free variant; [`list_remote_recursive_with_exclusions_and_log`]
 /// additionally prunes excluded folders from the traversal.
 pub fn list_remote_recursive_with_options_and_log<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
     concurrency: Option<usize>,
@@ -1551,7 +1571,7 @@ where
 /// - `use_cache`: Listing cache is bypassed while exclusions are active, because a cached
 ///   listing cannot be reconciled with patterns added or removed since it was saved.
 pub fn list_remote_recursive_with_exclusions_and_log<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
     concurrency: Option<usize>,
@@ -1599,7 +1619,7 @@ where
         &mut log,
         || {
             client.list(remote_url, "infinity").map_err(|e| {
-                classify_reqwest_error(&format!("PROPFIND Depth: infinity {remote_url}"), &e)
+                classify_dav_error(&format!("PROPFIND Depth: infinity {remote_url}"), &e)
             })
         },
     );
@@ -1661,7 +1681,7 @@ where
     if let Some(requested) = concurrency {
         set_scan_concurrency(requested);
     }
-    let remote_parsed = rustydav::prelude::Url::parse(remote_url)
+    let remote_parsed = reqwest::Url::parse(remote_url)
         .map_err(|e| format!("Invalid remote URL: {}", e))?;
 
     let root_visited_key = remote_url.trim_end_matches('/').to_ascii_lowercase();
@@ -1793,9 +1813,9 @@ where
     #[allow(clippy::too_many_arguments)]
     fn spawn_scan_worker<'scope, 'env: 'scope>(
         scope: &'scope std::thread::Scope<'scope, 'env>,
-        client: &'env rustydav::client::Client,
+        client: &'env Client,
         remote_url: &'env str,
-        remote_origin: rustydav::prelude::Url,
+        remote_origin: reqwest::Url,
         cancel_flag: &'env AtomicBool,
         state_ref: &'env Mutex<ScanState>,
         cvar_ref: &'env Condvar,
@@ -1845,7 +1865,7 @@ where
                         },
                         || {
                             client.list(&current_url, "1").map_err(|e| {
-                                classify_reqwest_error(
+                                classify_dav_error(
                                     &format!("PROPFIND Depth: 1 {current_url}"),
                                     &e,
                                 )
@@ -1939,7 +1959,7 @@ where
                         children_in_dir += 1;
                         if item.is_dir {
                             new_dirs += 1;
-                            if let Ok(parsed_sub) = rustydav::prelude::Url::parse(&item_url) {
+                            if let Ok(parsed_sub) = reqwest::Url::parse(&item_url) {
                                 if parsed_sub.origin() == worker_remote_origin
                                     && !rel_from_root.is_empty()
                                     && is_safe_relative_path(&rel_from_root)
@@ -2252,7 +2272,7 @@ pub fn compute_sha256(bytes: &[u8]) -> String {
 /// Verifies authentication by sending PROPFIND depth 0 to the URL.
 pub fn verify_webdav_auth(url: &str, username: &str, password: &str) -> Result<(), String> {
     validate_webdav_url(url)?;
-    let client = rustydav::client::Client::init(username, password);
+    let client = Client::init(username, password, url)?;
     match client.list(url, "0") {
         Ok(res) => {
             let status = res.status();
@@ -2354,7 +2374,7 @@ impl Drop for WorkerSlot<'_> {
 /// - Work is distributed via a shared atomic cursor over `files`.
 /// - Per-file log lines are funneled through an mpsc channel because the `log`
 ///   callback is `FnMut` (not `Sync`).
-/// - `rustydav::client::Client` is `Send + Sync` (asserted at compile time above),
+/// - `Client` is `Send + Sync` (asserted at compile time above),
 ///   so workers share one connection pool.
 /// - Remote-cache updates are serialized behind a mutex because
 ///   `update_remote_cache_item` performs a read-modify-write of the cache file.
@@ -2363,7 +2383,7 @@ impl Drop for WorkerSlot<'_> {
 /// MKCOL, open, non-2xx status, and transport failures that survive every retry)
 /// are logged and skipped, while a worker panic still aborts the batch with `Err`.
 fn upload_files_concurrently<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     files: Vec<(PathBuf, String, u64)>,
     cancel_flag: &AtomicBool,
@@ -2430,7 +2450,7 @@ where
     /// Per-batch state shared by every upload worker.
     #[derive(Clone, Copy)]
     struct UploadCtx<'a> {
-        client: &'a rustydav::client::Client,
+        client: &'a Client,
         remote_url: &'a str,
         files: &'a [(PathBuf, String, u64)],
         next_idx: &'a AtomicUsize,
@@ -2562,7 +2582,7 @@ where
                                 ))
                             })?;
                             client.put(file, &file_url).map_err(|e| {
-                                classify_reqwest_error(&format!("PUT {file_url}"), &e)
+                                classify_dav_error(&format!("PUT {file_url}"), &e)
                             })
                         },
                     );
@@ -2670,7 +2690,7 @@ where
 
 /// Executes a native WebDAV action and streams logs through the callback.
 pub fn execute_webdav_action<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     action: &str,
     remote_url: &str,
     local_dir: &Path,
@@ -2689,7 +2709,7 @@ where
 /// pools (put/sync). The limit is re-read while they run, so a Settings "Threads"
 /// change applies to the phase that is already in progress.
 pub fn execute_webdav_action_with_options<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     action: &str,
     remote_url: &str,
     local_dir: &Path,
@@ -2720,7 +2740,7 @@ where
 /// descends into them and the remote traversal never requests them. As a result they
 /// are never uploaded, downloaded, compared, or deleted by a mirror (`sync`).
 pub fn execute_webdav_action_with_exclusions<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     action: &str,
     remote_url: &str,
     local_dir: &Path,
@@ -2794,7 +2814,7 @@ where
                 &mut log,
                 || {
                     client.list(remote_url, "1").map_err(|e| {
-                        classify_reqwest_error(&format!("PROPFIND Depth: 1 {remote_url}"), &e)
+                        classify_dav_error(&format!("PROPFIND Depth: 1 {remote_url}"), &e)
                     })
                 },
             )?;
@@ -3080,7 +3100,7 @@ where
                     &mut log,
                     || {
                         let get_res = client.get(&download_url).map_err(|e| {
-                            classify_reqwest_error(&format!("GET {download_url}"), &e)
+                            classify_dav_error(&format!("GET {download_url}"), &e)
                         })?;
                         let status = get_res.status();
                         if !status.is_success() {
@@ -3336,7 +3356,7 @@ where
                         &mut log,
                         || {
                             client.delete(&file_url).map_err(|e| {
-                                classify_reqwest_error(&format!("DELETE {file_url}"), &e)
+                                classify_dav_error(&format!("DELETE {file_url}"), &e)
                             })
                         },
                     );
@@ -3564,7 +3584,7 @@ mod tests {
         let base = "http://localhost:3923/docs/";
         let url = build_file_url(base, "my folder/my file.txt");
         assert_eq!(url, "http://localhost:3923/docs/my%20folder/my%20file.txt");
-        assert!(rustydav::prelude::Url::parse(&url).is_ok());
+        assert!(reqwest::Url::parse(&url).is_ok());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use scs_rclient_lib::dav_client::Client;
 use scs_rclient_lib::webdav::{
     build_file_url, collect_local_files, collect_local_files_excluding, compute_sha256,
     execute_webdav_action, execute_webdav_action_with_exclusions, list_remote_recursive,
@@ -17,10 +18,11 @@ fn live_base_url() -> Option<String> {
     }
 }
 
-fn live_client() -> rustydav::client::Client {
+fn live_client() -> Client {
     let username = std::env::var("TEST_WEBDAV_USER").unwrap_or_else(|_| "testuser".to_string());
     let password = std::env::var("TEST_WEBDAV_PASS").unwrap_or_else(|_| "testpass".to_string());
-    rustydav::client::Client::init(&username, &password)
+    let base_url = live_base_url().expect("TEST_WEBDAV_URL configured");
+    Client::init(&username, &password, &base_url).expect("client init")
 }
 
 fn write_local_file(root: &std::path::Path, rel: &str, contents: &[u8]) {
@@ -41,7 +43,7 @@ fn local_file_paths(root: &std::path::Path) -> Vec<String> {
 /// Lists remote files relative to `url`, bypassing the listing cache so assertions see
 /// the server's current state rather than a listing cached by an earlier action.
 fn remote_file_paths(
-    client: &rustydav::client::Client,
+    client: &Client,
     url: &str,
     cancel_flag: &AtomicBool,
 ) -> HashSet<String> {
@@ -61,7 +63,7 @@ fn remote_file_paths(
     .collect()
 }
 
-fn read_remote_text(client: &rustydav::client::Client, url: &str) -> String {
+fn read_remote_text(client: &Client, url: &str) -> String {
     use std::io::Read;
     let mut response = client.get(url).expect("remote GET failed");
     assert!(
@@ -78,7 +80,7 @@ fn read_remote_text(client: &rustydav::client::Client, url: &str) -> String {
 }
 
 /// Deletes every child of `url` (files first, deepest directories last) and then `url`.
-fn remove_remote_tree(client: &rustydav::client::Client, url: &str, cancel_flag: &AtomicBool) {
+fn remove_remote_tree(client: &Client, url: &str, cancel_flag: &AtomicBool) {
     if let Ok(items) = list_remote_recursive_with_options_and_log(
         client,
         url,
@@ -289,7 +291,7 @@ fn test_url_encoding_for_spaces() {
         built,
         "http://127.0.0.1:3923/docs/folder%20name/file%20with%20spaces.txt"
     );
-    assert!(rustydav::prelude::Url::parse(&built).is_ok());
+    assert!(reqwest::Url::parse(&built).is_ok());
 }
 
 #[test]
@@ -339,7 +341,8 @@ fn test_live_copyparty_e2e_full_roundtrip() {
 
     let cancel_flag = AtomicBool::new(false);
     let mut log_output = String::new();
-    let client = rustydav::client::Client::init(&username, &password);
+    let client = Client::init(&username, &password, &base_url)
+        .expect("client init");
 
     // 1. Verify Authentication
     assert!(
@@ -741,7 +744,7 @@ fn test_live_copyparty_incremental_put_timestamp_differentiation() {
     let user = std::env::var("TEST_WEBDAV_USER").unwrap_or_else(|_| "testuser".into());
     let pass = std::env::var("TEST_WEBDAV_PASS").unwrap_or_else(|_| "testpass".into());
 
-    let client = rustydav::client::Client::init(&user, &pass);
+    let client = Client::init(&user, &pass, &base_url).expect("client init");
     let cancel_flag = AtomicBool::new(false);
     let mut log_output = String::new();
 
@@ -894,7 +897,7 @@ fn test_live_copyparty_incremental_get_timestamp_differentiation() {
     let user = std::env::var("TEST_WEBDAV_USER").unwrap_or_else(|_| "testuser".into());
     let pass = std::env::var("TEST_WEBDAV_PASS").unwrap_or_else(|_| "testpass".into());
 
-    let client = rustydav::client::Client::init(&user, &pass);
+    let client = Client::init(&user, &pass, &base_url).expect("client init");
     let cancel_flag = AtomicBool::new(false);
     let mut log_output = String::new();
 
@@ -911,7 +914,7 @@ fn test_live_copyparty_incremental_get_timestamp_differentiation() {
             .as_nanos()
     ));
 
-    struct CleanupGuard<'a>(&'a rustydav::client::Client, String, std::path::PathBuf);
+    struct CleanupGuard<'a>(&'a Client, String, std::path::PathBuf);
     impl<'a> Drop for CleanupGuard<'a> {
         fn drop(&mut self) {
             let _ = self.0.delete(&self.1);
@@ -1363,7 +1366,7 @@ fn test_concurrent_scanning_stress_1_to_64_threads() {
 
     let cancel_flag = AtomicBool::new(false);
     let base_url = format!("http://127.0.0.1:{}/stress-course/", port);
-    let client = rustydav::client::Client::init("testuser", "testpass");
+    let client = Client::init("testuser", "testpass", &base_url).expect("client init");
 
     let total_expected_items = total_expected_files + total_expected_dirs;
     assert_eq!(total_expected_dirs, 69);
@@ -1424,7 +1427,8 @@ fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
     };
     let username = std::env::var("TEST_WEBDAV_USER").unwrap_or_else(|_| "testuser".to_string());
     let password = std::env::var("TEST_WEBDAV_PASS").unwrap_or_else(|_| "testpass".to_string());
-    let client = rustydav::client::Client::init(&username, &password);
+    let client = Client::init(&username, &password, &base_url)
+        .expect("client init");
     let cancel_flag = AtomicBool::new(false);
     let mut log_output = String::new();
 
@@ -2394,7 +2398,7 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
     });
 
     let base_url = format!("http://127.0.0.1:{}/exclude-course/", port);
-    let client = rustydav::client::Client::init("testuser", "testpass");
+    let client = Client::init("testuser", "testpass", &base_url).expect("client init");
     let cancel_flag = AtomicBool::new(false);
     let exclusions = normalize_exclude_folders(&[
         ".git/".to_string(),

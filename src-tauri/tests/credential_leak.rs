@@ -13,6 +13,7 @@
 //! 2. Server B receives ZERO requests (origin check blocks the leak).
 //! 3. No emitted log line contains the raw password or its base64 form.
 
+use scs_rclient_lib::dav_client::Client;
 use scs_rclient_lib::webdav::execute_webdav_action_with_exclusions;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -140,7 +141,7 @@ fn test_credentials_reach_only_validated_origin_never_attacker() {
     // local_dir does not exist: the local scan returns nothing, and the
     // malicious item is skipped before any file is created.
     let local_dir = std::path::Path::new("/nonexistent-leak-test-dir");
-    let client = rustydav::client::Client::init(TEST_USER, TEST_PASS);
+    let client = Client::init(TEST_USER, TEST_PASS, &base_url).expect("client init");
     let cancel_flag = AtomicBool::new(false);
 
     let mut log_lines: Vec<String> = Vec::new();

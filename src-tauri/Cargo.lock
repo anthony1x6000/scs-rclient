@@ -2710,15 +2710,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
-name = "rustydav"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc4c86c47126ac8bfc573084610e93f4ca8726f3ae7bf6c64bd60476731b6e42"
-dependencies = [
- "reqwest 0.11.27",
-]
-
-[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2806,7 +2797,7 @@ dependencies = [
  "chrono",
  "keyring",
  "quick-xml 0.37.5",
- "rustydav",
+ "reqwest 0.11.27",
  "serde",
  "serde_json",
  "sha2",
