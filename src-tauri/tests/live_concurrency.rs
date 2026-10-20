@@ -1,6 +1,7 @@
 //! Verifies that the Settings "Threads" value resizes a worker pool while the
 //! operation is already running, without cancelling and restarting it.
 
+use scs_rclient_lib::dav_client::Client;
 use scs_rclient_lib::webdav::{
     execute_webdav_action_with_options, list_remote_recursive, set_scan_concurrency,
     DEFAULT_SCAN_CONCURRENCY,
@@ -152,7 +153,7 @@ fn test_scan_concurrency_changes_mid_operation() {
     set_scan_concurrency(1);
     let base_url = format!("http://127.0.0.1:{}/adapt-course/", port);
     let cancel_flag = AtomicBool::new(false);
-    let client = rustydav::client::Client::init("testuser", "testpass");
+    let client = Client::init("testuser", "testpass", &base_url).expect("client init");
 
     let items = std::thread::scope(|scope| {
         let scan = scope.spawn(|| list_remote_recursive(&client, &base_url, &cancel_flag));
@@ -273,7 +274,7 @@ fn test_upload_concurrency_changes_mid_operation() {
     set_scan_concurrency(1);
     let base_url = format!("http://127.0.0.1:{}/put-course/", port);
     let cancel_flag = AtomicBool::new(false);
-    let client = rustydav::client::Client::init("testuser", "testpass");
+    let client = Client::init("testuser", "testpass", &base_url).expect("client init");
 
     let result = std::thread::scope(|scope| {
         let action = scope.spawn(|| {

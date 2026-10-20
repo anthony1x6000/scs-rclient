@@ -1,3 +1,4 @@
+use crate::dav_client::{self, Client};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::io::Read;
@@ -30,13 +31,13 @@ pub const RETRY_MAX_DELAY_MS: u64 = 10_000;
 /// Retry delay used by production call sites; unit tests pass [`Duration::ZERO`] instead.
 const RETRY_DELAY: Duration = Duration::from_millis(RETRY_BASE_DELAY_MS);
 
-// Static compile-time assertion verifying that rustydav::client::Client implements Send + Sync
+// Static compile-time assertion verifying that dav_client::Client implements Send + Sync
 // and can safely be shared across concurrent scanning worker threads.
-// Note: rustydav::client::Client internally wraps reqwest::blocking::Client, which maintains
+// Note: dav_client::Client internally wraps reqwest::blocking::Client, which maintains
 // an Arc-backed connection pool designed for concurrent multi-threaded usage.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<rustydav::client::Client>();
+    assert_send_sync::<Client>();
 };
 
 /// Classification of a single WebDAV request attempt, used to decide whether a retry is worth it.
@@ -47,9 +48,21 @@ enum AttemptError {
     Fatal(String),
 }
 
+/// Formats a WebDAV transport error with its full source chain and a retry
+/// classification, then labels it transient or fatal. An unparseable request
+/// URL is deterministic, so it is fatal.
+fn classify_dav_error(context: &str, error: &dav_client::Error) -> AttemptError {
+    match error {
+        dav_client::Error::InvalidUrl(msg) => {
+            AttemptError::Fatal(format!("{context}: invalid request URL: {msg}"))
+        }
+        dav_client::Error::Transport(e) => classify_transport_error(context, e),
+    }
+}
+
 /// Formats a reqwest transport error with its full source chain and a retry classification,
 /// then labels it transient or fatal.
-fn classify_reqwest_error(context: &str, error: &rustydav::prelude::Error) -> AttemptError {
+fn classify_transport_error(context: &str, error: &reqwest::Error) -> AttemptError {
     let mut detail = format!("{context}: {error}");
     if let Some(url) = error.url() {
         detail.push_str(&format!("\n    url: {url}"));
@@ -86,8 +99,8 @@ fn classify_reqwest_error(context: &str, error: &rustydav::prelude::Error) -> At
 /// mid-download timeout is retried instead of being mistaken for a local disk failure.
 fn classify_io_error(context: &str, error: &std::io::Error) -> AttemptError {
     if let Some(inner) = error.get_ref() {
-        if let Some(reqwest_error) = inner.downcast_ref::<rustydav::prelude::Error>() {
-            return classify_reqwest_error(context, reqwest_error);
+        if let Some(reqwest_error) = inner.downcast_ref::<reqwest::Error>() {
+            return classify_transport_error(context, reqwest_error);
         }
     }
     let detail = format!("{context}: {error}");
@@ -971,7 +984,7 @@ pub fn resolve_item_url(base_url: &str, item_href: &str) -> String {
     } else {
         item_href.to_string()
     };
-    if let Ok(base) = rustydav::prelude::Url::parse(base_url) {
+    if let Ok(base) = reqwest::Url::parse(base_url) {
         if let Ok(joined) = base.join(&safe_href) {
             let mut s = joined.to_string();
             if item_href.ends_with('/') && !s.ends_with('/') {
@@ -1043,11 +1056,11 @@ fn sanitize_relative_path(rel: &str) -> String {
 /// Computes the item path relative to the collection URL.
 pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
     let resolved_url_str = resolve_item_url(base_url, item_href);
-    let resolved_url = match rustydav::prelude::Url::parse(&resolved_url_str) {
+    let resolved_url = match reqwest::Url::parse(&resolved_url_str) {
         Ok(u) => u,
         Err(_) => return sanitize_relative_path(&decode_percent(item_href)),
     };
-    let base_url_parsed = match rustydav::prelude::Url::parse(base_url) {
+    let base_url_parsed = match reqwest::Url::parse(base_url) {
         Ok(u) => u,
         Err(_) => return sanitize_relative_path(&decode_percent(item_href)),
     };
@@ -1115,9 +1128,37 @@ pub fn build_remote_url(base_url: &str, subdir: &str) -> String {
     }
 }
 
+/// True only when `target_url` shares the scheme/host/port origin of the
+/// configured `remote_url`, so a server-supplied href cannot redirect an
+/// authenticated request to another host.
+fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
+    matches!(
+        (
+            reqwest::Url::parse(remote_url),
+            reqwest::Url::parse(target_url),
+        ),
+        (Ok(a), Ok(b)) if a.origin() == b.origin()
+    )
+}
+
+/// Gate for any URL taken from a server response before it becomes a request:
+/// it must stay on the configured remote's origin and still pass the SSRF
+/// guard. Returns the user-facing reason when the URL must not be used.
+///
+/// Redirect targets never reach the transport: the in-repo `dav_client`
+/// builds its reqwest client with `redirect::Policy::none()`, so a 3xx sent
+/// by the remote is returned as a plain non-success response instead of
+/// being followed with the Basic-auth header attached.
+fn guard_server_derived_url(remote_url: &str, target_url: &str) -> Result<(), String> {
+    if !same_remote_origin(remote_url, target_url) {
+        return Err("href resolves outside the configured remote origin".to_string());
+    }
+    validate_webdav_url(target_url)
+}
+
 /// Builds the URL for a specific file under a collection, ensuring proper percent-encoding.
 pub fn build_file_url(collection_url: &str, rel_path: &str) -> String {
-    if let Ok(mut base) = rustydav::prelude::Url::parse(collection_url) {
+    if let Ok(mut base) = reqwest::Url::parse(collection_url) {
         let ok = if let Ok(mut segments) = base.path_segments_mut() {
             segments.pop_if_empty();
             for part in rel_path.split('/') {
@@ -1142,15 +1183,32 @@ pub fn build_file_url(collection_url: &str, rel_path: &str) -> String {
 /// Validates a WebDAV URL against SSRF, internal networks, and insecure protocols.
 /// In production, requires HTTPS and blocks local/private/link-local addresses.
 pub fn validate_webdav_url(url_str: &str) -> Result<(), String> {
-    let allow_insecure = cfg!(test)
+    validate_webdav_url_internal(url_str, insecure_webdav_allowed())
+}
+
+/// Whether insecure WebDAV origins (plain HTTP, private addresses) are
+/// permitted in this process: unit tests, an explicit development override,
+/// or a configured live test server.
+pub(crate) fn insecure_webdav_allowed() -> bool {
+    cfg!(test)
         || std::env::var("ALLOW_INSECURE_WEBDAV").as_deref() == Ok("1")
-        || std::env::var("TEST_WEBDAV_URL").is_ok();
-    validate_webdav_url_internal(url_str, allow_insecure)
+        || std::env::var("TEST_WEBDAV_URL").is_ok()
 }
 
 pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Result<(), String> {
-    let url = rustydav::prelude::Url::parse(url_str)
+    let url = reqwest::Url::parse(url_str)
         .map_err(|e| format!("Invalid WebDAV URL: {}", e))?;
+
+    // Reject credentials embedded in the URL itself (https://user:pass@host/):
+    // the password would be persisted verbatim in the settings store, echoed
+    // into operation logs, and attached by the transport regardless of host —
+    // outside the keyring vault every other credential path uses.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "URL must not contain embedded credentials: set the username and password separately."
+                .to_string(),
+        );
+    }
 
     let scheme = url.scheme().to_ascii_lowercase();
     if scheme != "https" {
@@ -1178,49 +1236,159 @@ pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Resu
         return Err("Access to internal/loopback hostname is blocked for security.".to_string());
     }
 
-    // Check IP addresses for private / loopback / link-local / metadata ranges
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(ipv4) => {
-                if ipv4.is_loopback() {
-                    return Err("Access to loopback IP is blocked for security.".to_string());
-                }
-                if ipv4.is_link_local() {
-                    return Err("Access to link-local IP (cloud metadata) is blocked for security.".to_string());
-                }
-                if ipv4.is_private() {
-                    return Err("Access to private RFC 1918 IP is blocked for security.".to_string());
-                }
-                if ipv4.is_broadcast() || ipv4.is_unspecified() {
-                    return Err("Access to broadcast/unspecified IP is blocked for security.".to_string());
-                }
-                let octets = ipv4.octets();
-                // 100.64.0.0/10 Carrier-grade NAT
-                if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
-                    return Err("Access to shared carrier-grade NAT IP is blocked for security.".to_string());
-                }
-            }
-            std::net::IpAddr::V6(ipv6) => {
-                if ipv6.is_loopback() {
-                    return Err("Access to loopback IPv6 is blocked for security.".to_string());
-                }
-                if ipv6.is_unspecified() {
-                    return Err("Access to unspecified IPv6 is blocked for security.".to_string());
-                }
-                let segments = ipv6.segments();
-                // fe80::/10 link-local
-                if (segments[0] & 0xffc0) == 0xfe80 {
-                    return Err("Access to link-local IPv6 is blocked for security.".to_string());
-                }
-                // fc00::/7 unique local address
-                if (segments[0] & 0xfe00) == 0xfc00 {
-                    return Err("Access to unique local IPv6 is blocked for security.".to_string());
-                }
-            }
+    // Check IP addresses for private / loopback / link-local / metadata ranges.
+    // `host_str()` returns IPv6 hosts bracketed ([::1]), so strip the brackets
+    // before parsing — the old bare `host.parse()` never matched IPv6 literals.
+    let unbracketed = lower_host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        if let Some(reason) = blocked_ip_reason(ip) {
+            return Err(reason.to_string());
         }
+    } else {
+        // Resolve DNS names and reject any address in a blocked private range.
+        // The residual DNS rebinding TOCTOU (guard resolves, transport
+        // re-resolves) is closed at the transport: `dav_client` pins the
+        // validated addresses with `resolve_to_addrs`, so connect-time DNS is
+        // bypassed entirely.
+        check_resolved_host(unbracketed)?;
     }
 
     Ok(())
+}
+
+/// Resolves a hostname and rejects it when any address it maps to is blocked.
+///
+/// Fails closed: a lookup that cannot complete says nothing about where the
+/// request would land, so an unanswered resolution is an error, not a pass.
+///
+/// Deliberately not memoized, even though the download and delete loops call
+/// the guard once per item: a host that validates as public can rebind to a
+/// private address moments later, and a cached verdict would leave the guard
+/// switched off for that host for the rest of the process. Paying one blocking
+/// lookup per item keeps every request checked against current DNS.
+fn check_resolved_host(host: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+
+    let resolution_target = format!("{host}:0");
+    let addrs = resolution_target.to_socket_addrs().map_err(|e| {
+        format!("Could not resolve WebDAV host {host} ({e}); refusing to connect.")
+    })?;
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        if let Some(reason) = blocked_ip_reason(addr.ip()) {
+            return Err(reason.to_string());
+        }
+    }
+    if !resolved_any {
+        return Err(format!(
+            "Could not resolve WebDAV host {host}; refusing to connect."
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the block reason when the IP falls in a range the client must not
+/// reach, including when a blocked IPv4 range is spelled as an IPv6 address by
+/// a transition mechanism (IPv4-mapped, NAT64, 6to4, Teredo).
+pub(crate) fn blocked_ip_reason(ip: std::net::IpAddr) -> Option<&'static str> {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            if ipv4.is_loopback() {
+                return Some("Access to loopback IP is blocked for security.");
+            }
+            if ipv4.is_link_local() {
+                return Some("Access to link-local IP (cloud metadata) is blocked for security.");
+            }
+            if ipv4.is_private() {
+                return Some("Access to private RFC 1918 IP is blocked for security.");
+            }
+            if ipv4.is_broadcast() || ipv4.is_unspecified() {
+                return Some("Access to broadcast/unspecified IP is blocked for security.");
+            }
+            let octets = ipv4.octets();
+            // 100.64.0.0/10 Carrier-grade NAT
+            if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+                return Some("Access to shared carrier-grade NAT IP is blocked for security.");
+            }
+            None
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            if ipv6.is_loopback() {
+                return Some("Access to loopback IPv6 is blocked for security.");
+            }
+            if ipv6.is_unspecified() {
+                return Some("Access to unspecified IPv6 is blocked for security.");
+            }
+            let segments = ipv6.segments();
+            // fe80::/10 link-local
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return Some("Access to link-local IPv6 is blocked for security.");
+            }
+            // fc00::/7 unique local address
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return Some("Access to unique local IPv6 is blocked for security.");
+            }
+            // 64:ff9b:1::/48 is local-use NAT64 (RFC 8215): a private
+            // translation prefix, never a public WebDAV destination.
+            if segments[0] == 0x64 && segments[1] == 0xff9b && segments[2] == 1 {
+                return Some("Access to local-use NAT64 IPv6 is blocked for security.");
+            }
+            // IPv4 addresses carried inside an IPv6 spelling by a transition
+            // mechanism must not smuggle a blocked range past this check.
+            if let Some(reason) = embedded_ipv4_reason(ipv6) {
+                return Some(reason);
+            }
+            None
+        }
+    }
+}
+
+/// Returns some reason when a blocked IPv4 range is embedded in an IPv6
+/// address by a transition mechanism: IPv4-mapped (`::ffff:a.b.c.d`) and
+/// IPv4-compatible (`::a.b.c.d`), NAT64 well-known (`64:ff9b::/96`), 6to4
+/// (`2002:aabb:ccdd::/48`), and Teredo's server and bit-inverted client
+/// addresses (`2001:0::/32`).
+fn embedded_ipv4_reason(ipv6: std::net::Ipv6Addr) -> Option<&'static str> {
+    let octets = |hi: u16, lo: u16| {
+        std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+    };
+    let check = |v4: std::net::Ipv4Addr| blocked_ip_reason(std::net::IpAddr::V4(v4));
+
+    if let Some(compatible_or_mapped) = ipv6.to_ipv4() {
+        if let Some(reason) = check(compatible_or_mapped) {
+            return Some(reason);
+        }
+    }
+    let segments = ipv6.segments();
+    // RFC 6052 NAT64: 64:ff9b::/96 with segments 2..=5 zero. The embedded IPv4
+    // is the final 32 bits — reading segments 4 and 5 instead decoded every
+    // standard NAT64 address as 0.0.0.0.
+    if segments[0] == 0x64
+        && segments[1] == 0xff9b
+        && (segments[2] | segments[3] | segments[4] | segments[5]) == 0
+    {
+        if let Some(reason) = check(octets(segments[6], segments[7])) {
+            return Some(reason);
+        }
+    }
+    // 6to4: 2002:<IPv4 as two segments>::/48.
+    if segments[0] == 0x2002 {
+        if let Some(reason) = check(octets(segments[1], segments[2])) {
+            return Some(reason);
+        }
+    }
+    // Teredo: 2001:0:<server IPv4>:<flags|port>:<client IPv4, inverted>.
+    if segments[0] == 0x2001 && segments[1] == 0 {
+        if let Some(reason) = check(octets(segments[2], segments[3])) {
+            return Some(reason);
+        }
+        let client = !((u32::from(segments[6]) << 16) | u32::from(segments[7]));
+        if let Some(reason) = check(std::net::Ipv4Addr::from(client)) {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 /// Ensures all parent collections exist for a relative file path prior to PUT.
@@ -1229,7 +1397,7 @@ pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Resu
 /// attempt. A failure that survives all retries is returned to the caller, which logs it and
 /// skips only the affected file.
 pub fn ensure_remote_parent_dirs<L: FnMut(&str)>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     rel_path: &str,
     cancel_flag: &AtomicBool,
@@ -1250,7 +1418,7 @@ pub fn ensure_remote_parent_dirs<L: FnMut(&str)>(
         || {
             client
                 .mkcol(remote_url)
-                .map_err(|e| classify_reqwest_error(&format!("MKCOL {remote_url}"), &e))
+                .map_err(|e| classify_dav_error(&format!("MKCOL {remote_url}"), &e))
         },
     );
     match res {
@@ -1287,7 +1455,7 @@ pub fn ensure_remote_parent_dirs<L: FnMut(&str)>(
             || {
                 client
                     .mkcol(&dir_url)
-                    .map_err(|e| classify_reqwest_error(&format!("MKCOL {dir_url}"), &e))
+                    .map_err(|e| classify_dav_error(&format!("MKCOL {dir_url}"), &e))
             },
         )
         .map_err(|e| format!("Failed to create folder {}: {}", dir_url, e))?;
@@ -1306,7 +1474,7 @@ pub fn ensure_remote_parent_dirs<L: FnMut(&str)>(
 /// or returns 0 child items (e.g. server restricts Depth: infinity to Depth: 0),
 /// it falls back to breadth-first traversal using Depth: 1.
 pub fn list_remote_recursive(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
 ) -> Result<Vec<WebdavItem>, String> {
@@ -1315,7 +1483,7 @@ pub fn list_remote_recursive(
 
 /// Recursively lists remote WebDAV items under remote_url with streamed diagnostic logs.
 pub fn list_remote_recursive_with_log<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
     log: F,
@@ -1329,7 +1497,7 @@ where
 /// Recursively lists remote WebDAV items under remote_url with configurable worker concurrency and streamed diagnostic logs.
 ///
 /// Thread Safety:
-/// `rustydav::client::Client` implements `Send + Sync` (internally backed by `reqwest::blocking::Client` connection pool)
+/// `Client` implements `Send + Sync` (internally backed by `reqwest::blocking::Client` connection pool)
 /// allowing concurrent Depth: 1 requests across worker threads.
 ///
 /// Parameters:
@@ -1337,7 +1505,7 @@ where
 ///   `None` keeps the live limit (the environment default until the user changes it).
 /// - `auth_user`: Optional username for credential-scoped cache partitioning (CWE-287 / CWE-384).
 pub fn list_remote_recursive_with_concurrency_and_log<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
     concurrency: Option<usize>,
@@ -1369,7 +1537,7 @@ where
 /// This is the exclusion-free variant; [`list_remote_recursive_with_exclusions_and_log`]
 /// additionally prunes excluded folders from the traversal.
 pub fn list_remote_recursive_with_options_and_log<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
     concurrency: Option<usize>,
@@ -1403,7 +1571,7 @@ where
 /// - `use_cache`: Listing cache is bypassed while exclusions are active, because a cached
 ///   listing cannot be reconciled with patterns added or removed since it was saved.
 pub fn list_remote_recursive_with_exclusions_and_log<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     cancel_flag: &AtomicBool,
     concurrency: Option<usize>,
@@ -1451,7 +1619,7 @@ where
         &mut log,
         || {
             client.list(remote_url, "infinity").map_err(|e| {
-                classify_reqwest_error(&format!("PROPFIND Depth: infinity {remote_url}"), &e)
+                classify_dav_error(&format!("PROPFIND Depth: infinity {remote_url}"), &e)
             })
         },
     );
@@ -1513,7 +1681,7 @@ where
     if let Some(requested) = concurrency {
         set_scan_concurrency(requested);
     }
-    let remote_parsed = rustydav::prelude::Url::parse(remote_url)
+    let remote_parsed = reqwest::Url::parse(remote_url)
         .map_err(|e| format!("Invalid remote URL: {}", e))?;
 
     let root_visited_key = remote_url.trim_end_matches('/').to_ascii_lowercase();
@@ -1645,9 +1813,9 @@ where
     #[allow(clippy::too_many_arguments)]
     fn spawn_scan_worker<'scope, 'env: 'scope>(
         scope: &'scope std::thread::Scope<'scope, 'env>,
-        client: &'env rustydav::client::Client,
+        client: &'env Client,
         remote_url: &'env str,
-        remote_origin: rustydav::prelude::Url,
+        remote_origin: reqwest::Url,
         cancel_flag: &'env AtomicBool,
         state_ref: &'env Mutex<ScanState>,
         cvar_ref: &'env Condvar,
@@ -1697,7 +1865,7 @@ where
                         },
                         || {
                             client.list(&current_url, "1").map_err(|e| {
-                                classify_reqwest_error(
+                                classify_dav_error(
                                     &format!("PROPFIND Depth: 1 {current_url}"),
                                     &e,
                                 )
@@ -1791,7 +1959,7 @@ where
                         children_in_dir += 1;
                         if item.is_dir {
                             new_dirs += 1;
-                            if let Ok(parsed_sub) = rustydav::prelude::Url::parse(&item_url) {
+                            if let Ok(parsed_sub) = reqwest::Url::parse(&item_url) {
                                 if parsed_sub.origin() == worker_remote_origin
                                     && !rel_from_root.is_empty()
                                     && is_safe_relative_path(&rel_from_root)
@@ -1808,10 +1976,13 @@ where
                     }
 
                     if children_in_dir == 0 && current_url == remote_url {
-                        let snippet_len = body.len().min(400);
+                        // Char-based truncation: a fixed byte index can split a
+                        // multi-byte UTF-8 code point in a server-controlled body,
+                        // which panics and aborts the whole scan.
+                        let preview: String = body.chars().take(400).collect();
                         let _ = worker_log_tx.send(format!(
                             "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
-                            &body[..snippet_len]
+                            preview
                         ));
                     } else {
                         let _ = worker_log_tx.send(format!(
@@ -2101,7 +2272,7 @@ pub fn compute_sha256(bytes: &[u8]) -> String {
 /// Verifies authentication by sending PROPFIND depth 0 to the URL.
 pub fn verify_webdav_auth(url: &str, username: &str, password: &str) -> Result<(), String> {
     validate_webdav_url(url)?;
-    let client = rustydav::client::Client::init(username, password);
+    let client = Client::init(username, password, url)?;
     match client.list(url, "0") {
         Ok(res) => {
             let status = res.status();
@@ -2203,7 +2374,7 @@ impl Drop for WorkerSlot<'_> {
 /// - Work is distributed via a shared atomic cursor over `files`.
 /// - Per-file log lines are funneled through an mpsc channel because the `log`
 ///   callback is `FnMut` (not `Sync`).
-/// - `rustydav::client::Client` is `Send + Sync` (asserted at compile time above),
+/// - `Client` is `Send + Sync` (asserted at compile time above),
 ///   so workers share one connection pool.
 /// - Remote-cache updates are serialized behind a mutex because
 ///   `update_remote_cache_item` performs a read-modify-write of the cache file.
@@ -2212,7 +2383,7 @@ impl Drop for WorkerSlot<'_> {
 /// MKCOL, open, non-2xx status, and transport failures that survive every retry)
 /// are logged and skipped, while a worker panic still aborts the batch with `Err`.
 fn upload_files_concurrently<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     remote_url: &str,
     files: Vec<(PathBuf, String, u64)>,
     cancel_flag: &AtomicBool,
@@ -2279,7 +2450,7 @@ where
     /// Per-batch state shared by every upload worker.
     #[derive(Clone, Copy)]
     struct UploadCtx<'a> {
-        client: &'a rustydav::client::Client,
+        client: &'a Client,
         remote_url: &'a str,
         files: &'a [(PathBuf, String, u64)],
         next_idx: &'a AtomicUsize,
@@ -2411,7 +2582,7 @@ where
                                 ))
                             })?;
                             client.put(file, &file_url).map_err(|e| {
-                                classify_reqwest_error(&format!("PUT {file_url}"), &e)
+                                classify_dav_error(&format!("PUT {file_url}"), &e)
                             })
                         },
                     );
@@ -2519,7 +2690,7 @@ where
 
 /// Executes a native WebDAV action and streams logs through the callback.
 pub fn execute_webdav_action<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     action: &str,
     remote_url: &str,
     local_dir: &Path,
@@ -2538,7 +2709,7 @@ where
 /// pools (put/sync). The limit is re-read while they run, so a Settings "Threads"
 /// change applies to the phase that is already in progress.
 pub fn execute_webdav_action_with_options<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     action: &str,
     remote_url: &str,
     local_dir: &Path,
@@ -2569,7 +2740,7 @@ where
 /// descends into them and the remote traversal never requests them. As a result they
 /// are never uploaded, downloaded, compared, or deleted by a mirror (`sync`).
 pub fn execute_webdav_action_with_exclusions<F>(
-    client: &rustydav::client::Client,
+    client: &Client,
     action: &str,
     remote_url: &str,
     local_dir: &Path,
@@ -2643,7 +2814,7 @@ where
                 &mut log,
                 || {
                     client.list(remote_url, "1").map_err(|e| {
-                        classify_reqwest_error(&format!("PROPFIND Depth: 1 {remote_url}"), &e)
+                        classify_dav_error(&format!("PROPFIND Depth: 1 {remote_url}"), &e)
                     })
                 },
             )?;
@@ -2889,6 +3060,18 @@ where
                     "[{}/{}] Downloading: {} ({} bytes)...\n",
                     current_num, total_files, rel, item.size
                 ));
+                // A server-supplied href must not redirect an authenticated
+                // GET to another host: require the same origin as the
+                // configured remote and pass the SSRF guard. Checked before
+                // any filesystem touch — a skipped item creates nothing.
+                let download_url = resolve_item_url(remote_url, &item.href);
+                if let Err(reason) = guard_server_derived_url(remote_url, &download_url) {
+                    log(&format!(
+                        "[{}/{}] ERROR: Skipping {}: {}\n",
+                        current_num, total_files, rel, reason
+                    ));
+                    continue;
+                }
                 let target_file = match safe_join_path(local_dir, rel) {
                     Ok(p) => p,
                     Err(e) => {
@@ -2909,7 +3092,6 @@ where
                         }
                     }
                 }
-                let download_url = resolve_item_url(remote_url, &item.href);
                 let download_result = retry_webdav_operation(
                     &format!("GET {download_url}"),
                     cancel_flag,
@@ -2918,7 +3100,7 @@ where
                     &mut log,
                     || {
                         let get_res = client.get(&download_url).map_err(|e| {
-                            classify_reqwest_error(&format!("GET {download_url}"), &e)
+                            classify_dav_error(&format!("GET {download_url}"), &e)
                         })?;
                         let status = get_res.status();
                         if !status.is_success() {
@@ -3157,6 +3339,15 @@ where
                         return Ok(());
                     }
                     let file_url = resolve_item_url(remote_url, &item.href);
+                    // A server-supplied href must not redirect the
+                    // authenticated DELETE to another host.
+                    if let Err(reason) = guard_server_derived_url(remote_url, &file_url) {
+                        log(&format!(
+                            "ERROR: Skipping delete of {}: {}\n",
+                            rel, reason
+                        ));
+                        continue;
+                    }
                     let del_res = retry_webdav_operation(
                         &format!("DELETE {file_url}"),
                         cancel_flag,
@@ -3165,7 +3356,7 @@ where
                         &mut log,
                         || {
                             client.delete(&file_url).map_err(|e| {
-                                classify_reqwest_error(&format!("DELETE {file_url}"), &e)
+                                classify_dav_error(&format!("DELETE {file_url}"), &e)
                             })
                         },
                     );
@@ -3393,7 +3584,7 @@ mod tests {
         let base = "http://localhost:3923/docs/";
         let url = build_file_url(base, "my folder/my file.txt");
         assert_eq!(url, "http://localhost:3923/docs/my%20folder/my%20file.txt");
-        assert!(rustydav::prelude::Url::parse(&url).is_ok());
+        assert!(reqwest::Url::parse(&url).is_ok());
     }
 
     #[test]
@@ -3672,6 +3863,146 @@ mod tests {
 
         // In test / dev mode (allow_insecure = true):
         assert!(validate_webdav_url_internal("http://127.0.0.1:3923/content/", true).is_ok());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_ipv6_literals_and_mapped_ranges() {
+        // Bracketed IPv6 literals reach the IP check (host_str returns them
+        // bracketed, which the old bare host.parse() never matched).
+        assert!(validate_webdav_url_internal("https://[::1]/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://[fe80::1]/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://[fd00::1]/dav", false).is_err());
+        // IPv4-mapped IPv6 spellings of blocked ranges must not pass.
+        assert!(validate_webdav_url_internal("https://[::ffff:127.0.0.1]/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://[::ffff:10.0.0.1]/dav", false).is_err());
+        assert!(validate_webdav_url_internal(
+            "https://[::ffff:169.254.169.254]/latest/meta-data",
+            false
+        )
+        .is_err());
+        // NAT64 well-known prefix embedding a blocked IPv4.
+        assert!(validate_webdav_url_internal("https://[64:ff9b::a00:1]/dav", false).is_err());
+        // A public IPv6 literal is still accepted.
+        assert!(validate_webdav_url_internal("https://[2606:4700::6810:85e5]/dav", false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_embedded_ipv4_spellings() {
+        // NAT64 64:ff9b::/96 embeds the IPv4 in the last 32 bits, so the public
+        // form must be accepted and only genuinely blocked targets rejected.
+        assert!(validate_webdav_url_internal("https://[64:ff9b::808:808]/dav", false).is_ok());
+        assert!(validate_webdav_url_internal("https://[64:ff9b::a00:1]/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://[64:ff9b::7f00:1]/dav", false).is_err());
+        // 6to4 carries the IPv4 in segments 1-2 of the 2002::/16 prefix.
+        assert!(validate_webdav_url_internal("https://[2002:a00:1::]/dav", false).is_err());
+        assert!(validate_webdav_url_internal("https://[2002:808:808::]/dav", false).is_ok());
+        // Teredo carries a server IPv4 and a bit-inverted client IPv4.
+        assert!(validate_webdav_url_internal("https://[2001:0:a00:1::]/dav", false).is_err());
+        // Public Teredo server, client 10.0.0.1 inverted into the last 32 bits.
+        assert!(validate_webdav_url_internal(
+            "https://[2001:0:808:808:0:0:f5ff:fffe]/dav",
+            false
+        )
+        .is_err());
+        // Local-use NAT64 (RFC 8215) is not a public destination.
+        assert!(validate_webdav_url_internal("https://[64:ff9b:1::808:808]/dav", false).is_err());
+        // IPv4-compatible ::a.b.c.d spellings stay covered alongside mapped ones.
+        assert!(validate_webdav_url_internal("https://[::a00:1]/dav", false).is_err());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_fails_closed_when_host_does_not_resolve() {
+        // An unanswered lookup must not be read as "no blocked address found":
+        // a host that fails validation-time resolution can resolve to a private
+        // address when the request is actually issued.
+        let result = validate_webdav_url_internal("https://does-not-resolve.invalid/dav", false);
+        assert!(result.is_err(), "unresolvable host must be rejected");
+        assert!(result.unwrap_err().contains("Could not resolve"));
+    }
+
+    #[test]
+    fn test_same_remote_origin_rejects_crosshost_hrefs() {
+        let base = "https://example.com/remote.php/webdav/folder/";
+        // Same-origin absolute hrefs pass.
+        assert!(same_remote_origin(
+            base,
+            "https://example.com/remote.php/webdav/folder/file.txt"
+        ));
+        assert!(same_remote_origin(base, "https://example.com/other/path"));
+        // Cross-host hrefs are rejected — the SSRF/credential-leak guard.
+        assert!(!same_remote_origin(base, "https://attacker.example/harvest"));
+        assert!(!same_remote_origin(
+            base,
+            "http://169.254.169.254/latest/meta-data"
+        ));
+        assert!(!same_remote_origin(base, "http://localhost:9000/bucket/obj"));
+        // Scheme change is a different origin.
+        assert!(!same_remote_origin(
+            base,
+            "http://example.com/remote.php/webdav/folder/file.txt"
+        ));
+    }
+
+    #[test]
+    fn test_url_userinfo_credentials_rejected() {
+        // A password embedded in the URL is persisted to settings.json and
+        // logged verbatim — it must be rejected before any storage or request.
+        assert!(validate_webdav_url_internal(
+            "https://user:secretpass@example.com/dav/",
+            false
+        )
+        .is_err());
+        assert!(validate_webdav_url_internal(
+            "https://user:secretpass@example.com/dav/",
+            true
+        )
+        .is_err());
+        // Username-only userinfo is rejected too: it still bypasses the vault.
+        assert!(validate_webdav_url_internal(
+            "https://user@example.com/dav/",
+            false
+        )
+        .is_err());
+        // The same host without embedded credentials is fine.
+        assert!(validate_webdav_url_internal("https://example.com/dav/", false).is_ok());
+    }
+
+    #[test]
+    fn test_http_scheme_rejected_in_production_sniffer_cannot_read_credentials() {
+        // A passive sniffer on the local network reads every plain-text byte.
+        // Production mode must refuse any scheme it could read, so the
+        // Basic-auth password can never travel unencrypted.
+        for url in [
+            "http://example.com/",
+            "http://example.com/dav/",
+            "http://10.0.0.1/", // would also fail private-range, scheme first
+        ] {
+            assert!(
+                validate_webdav_url_internal(url, false).is_err(),
+                "production mode must reject sniffer-readable scheme: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cache_and_settings_never_store_password() {
+        // The listing cache must never carry the credential: serialize an
+        // entry with a marker "password" and prove the struct has no field
+        // that would emit it.
+        let entry = CachedRemoteListing {
+            remote_url: "https://example.com/dav/".to_string(),
+            auth_user: Some("user".to_string()),
+            timestamp: 0,
+            items: vec![WebdavItem::new("dav/file.txt", false, 3)],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.to_ascii_lowercase().contains("password"),
+            "cache serialization leaked a password field: {json}"
+        );
+        assert!(!json.contains("secretpass"));
+        // auth_user carries only the username, never the secret.
+        assert!(json.contains("user"));
     }
 
     #[test]
