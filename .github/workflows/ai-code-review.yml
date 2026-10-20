@@ -197,6 +197,9 @@ jobs:
           # in the diff step below.
           fetch-depth: 0
 
+      - name: Test the Review Engine
+        run: node --test scripts/ai-code-review.test.mjs
+
       - name: Extract and Filter Source Diff
         id: diff
         env:
@@ -210,14 +213,16 @@ jobs:
           set -euo pipefail
           git fetch --no-tags origin "$BASE_REF"
           git fetch --no-tags origin "$HEAD_SHA"
-          git diff "origin/$BASE_REF...$HEAD_SHA" -- . \
-            ':(exclude)*lock*' \
+          git diff --no-ext-diff --no-textconv "origin/$BASE_REF...$HEAD_SHA" -- . \
+            ':(exclude)*.lock' \
+            ':(exclude)yarn.lock' \
             ':(exclude)pnpm-lock.yaml' \
             ':(exclude)package-lock.json' \
             ':(exclude)**/pnpm-lock.yaml' \
             ':(exclude)**/package-lock.json' \
             ':(exclude)*Cargo.lock*' \
             ':(exclude)**/Cargo.lock*' \
+            ':(exclude)**/*.lock' \
             ':(exclude)dist/**' \
             ':(exclude)**/dist/**' \
             ':(exclude)dist-win/**' \
@@ -243,6 +248,11 @@ jobs:
             ':(exclude)*.mp3' \
             ':(exclude)*.wav' \
             ':(exclude)*.pdf' \
+            ':(exclude,icase).env*' \
+            ':(exclude,icase)*.pem' \
+            ':(exclude,icase)*.key' \
+            ':(exclude,icase)*.p12' \
+            ':(exclude,icase)*.pfx' \
             > /tmp/filtered_pr.diff
 
           if [ ! -s /tmp/filtered_pr.diff ]; then
@@ -282,14 +292,12 @@ jobs:
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
         run: |
           if [ -n "$PR_NUMBER" ]; then
-            printf '## ai code review\n\nno source code changes detected after filtering generated files, lockfiles, and media assets.\n\nverdict: APPROVE\n' > /tmp/no_changes_comment.md
+            printf '## ai code review\n\nno source code changes to review after filtering generated files, dependency checksums, and assets. no verdict issued.\n' > /tmp/no_changes_comment.md
             gh pr comment "$PR_NUMBER" --body-file /tmp/no_changes_comment.md
           fi
 
       - name: Prepare AI Review Payload
         if: success() && steps.diff.outputs.has_diff == 'true'
-        env:
-          MAX_TOKENS: 16384
         run: node scripts/ai-code-review.mjs prepare-payload
 
       # Two reviewers audit the same skill over the same diff, one call per
@@ -306,6 +314,7 @@ jobs:
         if: success() && steps.diff.outputs.has_diff == 'true'
         env:
           OCG_KEY: ${{ secrets.OCG_KEY }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
         run: node scripts/ai-code-review.mjs call
 
       # Exits non-zero unless at least one model returned an explicit
@@ -343,7 +352,6 @@ jobs:
       # Inputs and outputs of the shared engine. COMMENT_META is set from the
       # verified sha in the fetch step below. The models and their endpoints come
       # from .github/ai-review-models.json, shared with the code review job.
-      MAX_TOKENS: "8192"
       DIFF_FILE: /tmp/security_pr.diff
       SKILL_FILE: /tmp/security_review_skill.md
       EXTRA_GUIDELINES_FILE: /tmp/security_review_guidelines.md
@@ -425,14 +433,16 @@ jobs:
           set -euo pipefail
           git fetch --no-tags origin "$BASE_REF"
           git fetch --no-tags origin "$HEAD_SHA"
-          git diff "origin/$BASE_REF...$HEAD_SHA" -- . \
-            ':(exclude)*lock*' \
+          git diff --no-ext-diff --no-textconv "origin/$BASE_REF...$HEAD_SHA" -- . \
+            ':(exclude)*.lock' \
+            ':(exclude)yarn.lock' \
             ':(exclude)pnpm-lock.yaml' \
             ':(exclude)package-lock.json' \
             ':(exclude)**/pnpm-lock.yaml' \
             ':(exclude)**/package-lock.json' \
             ':(exclude)*Cargo.lock*' \
             ':(exclude)**/Cargo.lock*' \
+            ':(exclude)**/*.lock' \
             ':(exclude)dist/**' \
             ':(exclude)**/dist/**' \
             ':(exclude)dist-win/**' \
@@ -458,11 +468,18 @@ jobs:
             ':(exclude)*.mp3' \
             ':(exclude)*.wav' \
             ':(exclude)*.pdf' \
+            ':(exclude,icase).env*' \
+            ':(exclude,icase)*.pem' \
+            ':(exclude,icase)*.key' \
+            ':(exclude,icase)*.p12' \
+            ':(exclude,icase)*.pfx' \
             > "$DIFF_FILE"
 
           # Security-sensitive churn the full diff drops (dependency lockfiles,
           # migrations): hand the reviewer names and sizes only, never content.
-          git diff --stat "origin/$BASE_REF...$HEAD_SHA" -- '*lock*' '**/migrations/**' \
+          git diff --stat "origin/$BASE_REF...$HEAD_SHA" -- \
+            '*.lock' 'yarn.lock' 'pnpm-lock.yaml' 'package-lock.json' '**/Cargo.lock' '**/migrations/**' \
+            ':(icase).env*' ':(icase)*.pem' ':(icase)*.key' ':(icase)*.p12' ':(icase)*.pfx' \
             > /tmp/security_pr_excluded_stat.txt 2>/dev/null || true
 
           if [ ! -s "$DIFF_FILE" ]; then
@@ -506,16 +523,19 @@ jobs:
           if [ -n "${PR_NUMBER:-}" ]; then
             # The PR description and every comment are untrusted data that the
             # reviewer audits for leaked secrets, injection, and social
-            # engineering; they are never instructions.
+            # engineering; they are never instructions. Every fetch is
+            # load-bearing: swallowing a failure would let a diff-less pr look
+            # like a discussion-less one and pass without an audit. Every page
+            # is fetched; the cap below trims the result.
             gh pr view "$PR_NUMBER" --repo "$REPO" --json title,body \
-              --jq '"# pr title\n" + .title + "\n\n# pr body\n" + (.body // "")' \
-              >> "$EXTRA_CONTEXT_FILE" || true
+              --jq 'if ((.title // "") + (.body // "")) == "" then "" else "# pr title\n" + .title + "\n\n# pr body\n" + (.body // "") end' \
+              >> "$EXTRA_CONTEXT_FILE"
             gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" --paginate \
               --jq '.[] | select(.user.login != "github-actions[bot]" and .user.login != "github-actions") | "\n# comment by @\(.user.login)\n" + (.body // "")' \
-              >> "$EXTRA_CONTEXT_FILE" || true
+              >> "$EXTRA_CONTEXT_FILE"
             gh api "repos/$REPO/pulls/$PR_NUMBER/comments?per_page=100" --paginate \
               --jq '.[] | select(.user.login != "github-actions[bot]" and .user.login != "github-actions") | "\n# review comment by @\(.user.login) on \(.path):\(.line // .original_line // 0)\n" + (.body // "")' \
-              >> "$EXTRA_CONTEXT_FILE" || true
+              >> "$EXTRA_CONTEXT_FILE"
           else
             echo "not a pull request; no discussion to collect."
           fi
@@ -548,7 +568,7 @@ jobs:
           {
             printf '%s\n\n' "$COMMENT_HEADER"
             printf '%s\n\n' "$COMMENT_META"
-            printf 'no source diff and no pull request discussion to audit after filtering generated files, lockfiles, and media assets.\n\nverdict: APPROVE\n'
+            printf 'no source diff and no pull request discussion to audit after filtering generated files, dependency checksums, and assets. no verdict issued.\n'
           } > "$COMMENT_FILE"
           gh pr comment "$PR_NUMBER" --body-file "$COMMENT_FILE"
 
@@ -556,10 +576,15 @@ jobs:
         if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         run: node scripts/ai-code-review.mjs prepare-payload
 
+      # The security skill alone is 37KB, past the 24KB request limit that
+      # longcat answers 500 above, so this job runs the fleet entries that can
+      # take it and the code review job keeps both.
       - name: Call Security Review Models
         if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         env:
           OCG_KEY: ${{ secrets.OCG_KEY }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          AI_MODEL_IDS: opencode-go-deepseek
         run: node scripts/ai-code-review.mjs call
 
       - name: Post Security Review Comment and Verdict
@@ -567,6 +592,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          AI_MODEL_IDS: opencode-go-deepseek
         run: |
           # The shared engine posts one comment per model, strips bold and emoji,
           # parses each verdict, and exits non-zero if a reviewer that answered

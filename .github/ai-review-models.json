@@ -6,8 +6,9 @@
     "apiKeyEnv": "OCG_KEY",
     "sessionHeader": true,
     "reasoningEffort": "high",
-    "maxTokens": 32768,
-    "timeoutMs": 600000
+    "maxTokens": 262144,
+    "timeoutMs": 300000,
+    "maxPromptBytes": 20000
   },
   {
     "id": "opencode-go-deepseek",
@@ -16,7 +17,7 @@
     "apiKeyEnv": "OCG_KEY",
     "sessionHeader": true,
     "reasoningEffort": "high",
-    "maxTokens": 32768,
-    "timeoutMs": 600000
+    "maxTokens": 393216,
+    "timeoutMs": 480000
   }
 ]
