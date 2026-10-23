@@ -49,7 +49,10 @@ jobs:
 
   test-webdav-e2e:
     name: Test WebDAV Operations (Copyparty)
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest's 26.04 rollout makes copyparty reject WebDAV writes
+    # (MKCOL/PUT → 401) while reads still pass; 24.04 is the last-known-good host.
+    # Revisit when the write-path breakage on 26.04 is root-caused.
+    runs-on: ubuntu-24.04
     needs: [audit-glib, audit-pnpm]
     steps:
       - name: Checkout repository
