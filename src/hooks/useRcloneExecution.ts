@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { loadAppSettings } from "../settings";
+import { BULK_MIN_FOLDERS, formatBulkSummary, runBulkSequential } from "../bulk";
 
 export interface RcloneSettings {
   baseUrl: string;
@@ -50,6 +51,7 @@ export function useRcloneExecution(
   setIsRunning: (running: boolean) => void
 ) {
   const runningRef = useRef(false);
+  const cancelRequestedRef = useRef(false);
   const unlistenRef = useRef<UnlistenFn | null>(null);
 
   useEffect(() => {
@@ -87,6 +89,7 @@ export function useRcloneExecution(
   };
 
   const cancelCommand = async () => {
+    cancelRequestedRef.current = true;
     log((prev) => prev + "\nCanceling active operation...\n");
     try {
       await invoke("cancel_webdav_action");
@@ -95,9 +98,33 @@ export function useRcloneExecution(
     }
   };
 
-  const runRclone = async (action: RcloneActionType, opts?: { onDone?: (code: number | null) => void }) => {
+  const invokeWebdavAction = async (action: RcloneActionType, settings: RcloneSettings, subdir: string) => {
+    // Both backup actions are GETs whose local side is redirected under <mount>/backups;
+    // the dated variant nests one level deeper under today's date.
+    const isDatedBackup = action === "get-backup-dated";
+    const isBackup = action === "get-backup" || isDatedBackup;
+    await invoke("run_webdav_action", {
+      action: isBackup ? "get" : action,
+      baseUrl: settings.baseUrl,
+      subdir,
+      targetSubdir: settings.targetSubdir || undefined,
+      username: settings.username || undefined,
+      concurrency: settings.scanConcurrency,
+      backup: isBackup || undefined,
+      backupDated: isDatedBackup || undefined,
+      excludeFolders: settings.excludedFolders,
+    });
+  };
+
+  /**
+   * Runs `action` on one folder (today's behavior) or, when `opts.folders`
+   * holds a bulk selection, on each folder sequentially — logging a header
+   * per folder, continuing past failures, and finishing with a summary.
+   */
+  const runRclone = async (action: RcloneActionType, opts?: { folders?: string[]; onDone?: (code: number | null) => void }) => {
     if (runningRef.current || isRunning) return;
     runningRef.current = true;
+    cancelRequestedRef.current = false;
     setIsRunning(true);
     log("Loading configuration...\n");
 
@@ -109,43 +136,54 @@ export function useRcloneExecution(
         return;
       }
 
-      if (!settings.selectedSubdir) {
+      const bulkFolders = (opts?.folders ?? []).filter(Boolean);
+      const singleSubdir = bulkFolders[0] ?? settings.selectedSubdir;
+      if (bulkFolders.length === 0 && !singleSubdir) {
         log("Error: Please select a subdirectory first.\n");
         finishRun(opts?.onDone, null);
+        return;
+      }
+
+      // Listen for backend WebDAV logs (one listener spans the whole bulk loop).
+      const unlisten = await listen<string>("webdav-log", (event) => {
+        log(event.payload);
+      });
+      unlistenRef.current = unlisten;
+
+      if (bulkFolders.length < BULK_MIN_FOLDERS) {
+        log(
+          (prev) =>
+            prev +
+            `Selected Subdirectory: ${singleSubdir}\n` +
+            `Running native WebDAV ${action}...\n\n`
+        );
+        await invokeWebdavAction(action, settings, singleSubdir);
+        log(`\nWebDAV operation finished successfully.\n`);
+        finishRun(opts?.onDone, 0);
         return;
       }
 
       log(
         (prev) =>
           prev +
-          `Selected Subdirectory: ${settings.selectedSubdir}\n` +
-          `Running native WebDAV ${action}...\n\n`
+          `Bulk folders (${bulkFolders.length}): ${bulkFolders.join(", ")}\n` +
+          `Running native WebDAV ${action} sequentially...\n\n`
       );
-
-      // Listen for backend WebDAV logs
-      const unlisten = await listen<string>("webdav-log", (event) => {
-        log(event.payload);
-      });
-      unlistenRef.current = unlisten;
-
-      // Both backup actions are GETs whose local side is redirected under <mount>/backups;
-      // the dated variant nests one level deeper under today's date.
-      const isDatedBackup = action === "get-backup-dated";
-      const isBackup = action === "get-backup" || isDatedBackup;
-      await invoke("run_webdav_action", {
-        action: isBackup ? "get" : action,
-        baseUrl: settings.baseUrl,
-        subdir: settings.selectedSubdir,
-        targetSubdir: settings.targetSubdir || undefined,
-        username: settings.username || undefined,
-        concurrency: settings.scanConcurrency,
-        backup: isBackup || undefined,
-        backupDated: isDatedBackup || undefined,
-        excludeFolders: settings.excludedFolders,
-      });
-
-      log(`\nWebDAV operation finished successfully.\n`);
-      finishRun(opts?.onDone, 0);
+      const outcome = await runBulkSequential(
+        bulkFolders,
+        async (folder, index) => {
+          log(`\n=== [${index + 1}/${bulkFolders.length}] ${folder} ===\n`);
+          try {
+            await invokeWebdavAction(action, settings, folder);
+          } catch (e: any) {
+            log(`\nWebDAV Error on ${folder}: ${e?.message || e}\n`);
+            throw e;
+          }
+        },
+        () => cancelRequestedRef.current,
+      );
+      log(`\n${formatBulkSummary(outcome)}\n`);
+      finishRun(opts?.onDone, outcome.failed.length > 0 ? 1 : 0);
     } catch (e: any) {
       log(`\nWebDAV Error: ${e?.message || e}\n`);
       finishRun(opts?.onDone, 1);

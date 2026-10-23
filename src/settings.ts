@@ -9,6 +9,7 @@ export const STORE_KEYS = {
   targetSubdir: "target_subdirectory",
   legacyTestSubdir: "test_subdirectory",
   subdirectories: "subdirectories",
+  bulkSelectedSubdirs: "bulk_selected_subdirectories",
   scanConcurrency: "scan_concurrency",
   excludedFolders: "excluded_folders",
 } as const;
@@ -112,6 +113,17 @@ export async function getSubdirectories(): Promise<string[]> {
 
 export async function setSubdirectories(items: string[]): Promise<void> {
   await setWrapped(STORE_KEYS.subdirectories, items);
+}
+
+/** Folders ticked for bulk actions; normalized against the list by the caller. */
+export async function getBulkSelection(): Promise<string[]> {
+  const stored = await getWrapped<unknown>(STORE_KEYS.bulkSelectedSubdirs);
+  if (!Array.isArray(stored)) return [];
+  return stored.filter((entry): entry is string => typeof entry === "string");
+}
+
+export async function setBulkSelection(folders: readonly string[]): Promise<void> {
+  await setWrapped(STORE_KEYS.bulkSelectedSubdirs, folders);
 }
 
 /**

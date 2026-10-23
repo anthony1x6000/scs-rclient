@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useRcloneExecution, type RcloneActionType } from "../hooks/useRcloneExecution";
+import { BULK_MIN_FOLDERS } from "../bulk";
 
 interface RcloneActionsProps {
   onLog: (text: string | ((prev: string) => string)) => void;
   isRunning: boolean;
   setIsRunning: (running: boolean) => void;
+  /** Ticked subfolders; 2+ turns every action into a sequential bulk run. */
+  bulkFolders?: string[];
 }
 
 interface ActionDef {
@@ -26,10 +29,13 @@ const ACTIONS: ActionDef[] = [
 const ACTION_BUTTON_CLASS =
   "w-full bg-gray-800/25 border border-white/30 hover:border-white/70 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white";
 
-export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsProps) {
+export function RcloneActions({ onLog, isRunning, setIsRunning, bulkFolders = [] }: RcloneActionsProps) {
   const { runRclone, cancelCommand } = useRcloneExecution(onLog, isRunning, setIsRunning);
   const [overwriteArmed, setOverwriteArmed] = useState(false);
   const uploadButtonRef = useRef<HTMLButtonElement>(null);
+  const isBulk = bulkFolders.length >= BULK_MIN_FOLDERS;
+  const bulkSuffix = isBulk ? ` · ${bulkFolders.length} folders` : "";
+  const runFolders = bulkFolders.length > 0 ? { folders: bulkFolders } : undefined;
 
   // The webview starts sequential Tab navigation at the first control without ever
   // focusing it in the DOM, so the first Tab press lands on Download, not Upload
@@ -108,7 +114,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
   const runAction = (action: RcloneActionType) => {
     if (isRunning) return;
     setOverwriteArmed(false);
-    runRclone(action);
+    runRclone(action, runFolders);
   };
 
   const handleOverwriteClick = () => {
@@ -118,7 +124,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
       return;
     }
     setOverwriteArmed(false);
-    runRclone("sync");
+    runRclone("sync", runFolders);
   };
 
   return (
@@ -134,6 +140,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
               className={ACTION_BUTTON_CLASS}
             >
               {action.label}
+              {bulkSuffix}
             </button>
           </li>
         ))}
@@ -144,7 +151,9 @@ export function RcloneActions({ onLog, isRunning, setIsRunning }: RcloneActionsP
             onClick={handleOverwriteClick}
             className={ACTION_BUTTON_CLASS}
           >
-            {overwriteArmed ? "Press again to confirm overwrite" : "Overwrite remote"}
+            {overwriteArmed
+              ? `Press again to confirm overwrite${isBulk ? ` (${bulkFolders.length} folders)` : ""}`
+              : `Overwrite remote${bulkSuffix}`}
           </button>
         </li>
       </ul>
