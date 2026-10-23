@@ -47,6 +47,26 @@ jobs:
       - name: Audit NPM Dependencies
         run: pnpm audit
 
+  test-frontend-unit:
+    name: Frontend Unit Tests (Vitest)
+    runs-on: ubuntu-slim
+    needs: [audit-glib, audit-pnpm]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-env
+        with:
+          install-rust: 'false'
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run unit tests
+        run: pnpm test:unit
+
   test-webdav-e2e:
     name: Test WebDAV Operations (Copyparty)
     # Pinned: ubuntu-latest's 26.04 rollout makes copyparty reject WebDAV writes

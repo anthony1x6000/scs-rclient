@@ -1,5 +1,13 @@
 # Changelog
 
+## Bulk Subfolder Actions
+
+- **Multi-Select Subfolders**: The subdirectory dropdown now shows a checkbox on every row. Ticking two or more folders switches the whole action grid into bulk mode — every button (Upload, Download, previews, Compare, List, Backup, Overwrite) relabels with the folder count (e.g. "Upload · 7 folders") and runs the action on each ticked folder sequentially, in list order. Clicking a row's name still single-selects that folder and clears the ticks.
+- **Quick Add at the Bottom of the Dropdown**: A new input field at the bottom of the open dropdown adds subfolders — press Enter and the folder is appended to the list (or found if it already exists) and pre-ticked for bulk selection, and the input clears so the next one can be typed immediately. The top field is now filter-only.
+- **Bulk Run Semantics**: Each folder gets a `=== [2/7] folder ===` header in the console log; a failing folder is logged and the run continues, ending with a summary line ("Bulk finished: 5 ok, 2 failed (css, img)."). Cancel stops the current folder's operation and skips the rest, which the summary reports as skipped. Overwrite keeps its double-press confirm, worded with the folder count.
+- **Persistent Selection**: The ticked folders (and window title, which shows "scs-rclient: 7 folders" in bulk mode) survive app restarts, stored alongside the existing subdirectory settings.
+- **Frontend Unit Tests**: The repo now has a Vitest suite (`pnpm test:unit`) for the bulk selection/runner logic, wired into CI as the "Frontend Unit Tests (Vitest)" check.
+
 ## Live Thread Changes
 
 - **Settings Apply Mid-Operation**: Changing the Settings "Threads" value while a scan or upload is running now resizes its worker pool immediately instead of waiting for the next operation. Pools dispatch up to the live limit and re-check it as each worker claims work, so raising the value adds workers right away and lowering it stops new work from being dispatched (requests already in flight finish normally).

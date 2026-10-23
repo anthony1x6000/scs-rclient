@@ -10,7 +10,8 @@
     "typecheck": "tsc -b",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "bash scripts/test/test-repo-install.sh"
+    "test": "bash scripts/test/test-repo-install.sh",
+    "test:unit": "vitest run src"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -27,7 +28,8 @@
     "@vitejs/plugin-react": "^4.6.0",
     "tailwindcss": "^4.3.0",
     "typescript": "~5.8.3",
-    "vite": "^7.3.7"
+    "vite": "^7.3.7",
+    "vitest": "^4.1.12"
   },
   "overrides": {
     "esbuild": "^0.28.1",
