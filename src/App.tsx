@@ -9,11 +9,13 @@ import SettingsView from "./components/SettingsView";
 import { RcloneActions } from "./components/RcloneActions";
 import RcloneConsole from "./components/RcloneConsole";
 import { getTargetSubdir } from "./settings";
+import { BULK_MIN_FOLDERS } from "./bulk";
 
 function App() {
   const [mountDir, setMountDir] = useState<string>("");
   const [targetSubdir, setTargetSubdir] = useState<string>("");
   const [selectedSubdir, setSelectedSubdir] = useState<string>("");
+  const [bulkTicks, setBulkTicks] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [logs, setLogs] = useState<string>("");
   const [isRunning, setIsRunning] = useState<boolean>(false);
@@ -45,14 +47,16 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const trimmed = selectedSubdir.trim();
-    const title = trimmed
-      ? `scs-rclient: ${trimmed.endsWith("/") ? trimmed : `${trimmed}/`}`
-      : "scs-rclient";
+    const name = bulkTicks[0] ?? selectedSubdir.trim();
+    const title = bulkTicks.length >= BULK_MIN_FOLDERS
+      ? `scs-rclient: ${bulkTicks.length} folders`
+      : name
+        ? `scs-rclient: ${name.endsWith("/") ? name : `${name}/`}`
+        : "scs-rclient";
 
     document.title = title;
     getCurrentWindow().setTitle(title).catch(() => {});
-  }, [selectedSubdir]);
+  }, [selectedSubdir, bulkTicks]);
 
   const handleTargetSubdirChange = (newSub: string) => {
     setTargetSubdir(newSub);
@@ -78,6 +82,7 @@ function App() {
             onLog={setLogs}
             isRunning={isRunning}
             setIsRunning={setIsRunning}
+            bulkFolders={bulkTicks}
           />
         </div>
 
@@ -88,7 +93,7 @@ function App() {
         <div className="shrink-0 text-white flex flex-col gap-2 w-full">
           <div className="directory-pane px-2 font-light hide-on-short-height">
             <div className="flex items-baseline justify-between gap-4 w-full min-w-0">
-              <Dropdown onSelect={setSelectedSubdir} />
+              <Dropdown onSelect={setSelectedSubdir} onBulkChange={setBulkTicks} />
               <div
                 className="italic truncate shrink-[9999] min-w-0 ml-auto"
                 title="a subdirectory of your WebDAV drive"

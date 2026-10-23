@@ -1,8 +1,17 @@
 import { useState, useEffect, useRef, useMemo, useLayoutEffect, useCallback } from "react";
-import { getSubdirectories, getSelectedSubdir, setSubdirectories, setSelectedSubdir } from "../settings";
+import {
+  getSubdirectories,
+  getSelectedSubdir,
+  setSubdirectories,
+  setSelectedSubdir,
+  getBulkSelection,
+  setBulkSelection,
+} from "../settings";
+import { addFolderFromInput, normalizeBulkSelection, toggleBulkTick, BULK_MIN_FOLDERS } from "../bulk";
 
 interface DropdownProps {
   onSelect?: (item: string) => void;
+  onBulkChange?: (ticks: string[]) => void;
   variant?: "pocket" | "marquee" | "palette";
 }
 
@@ -11,33 +20,43 @@ const MIN_PAGE = 3;
 const MAX_PAGE_SIZE = 9;
 const DEFAULT_PAGE = 7;
 
-function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
+function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps) {
   const [items, setItems] = useState<string[]>([]);
+  const [bulkTicks, setBulkTicks] = useState<string[]>([]);
   const [selectedItem, setSelectedItem] = useState<string>("");
   const [isOpen, setIsOpen] = useState<boolean>(false);
   const [searchText, setSearchText] = useState<string>("");
+  const [addText, setAddText] = useState<string>("");
+  const [addError, setAddError] = useState<string>("");
   const [saveError, setSaveError] = useState<string>("");
   const [page, setPage] = useState(0);
   const [highlight, setHighlight] = useState(-1);
   const [availableHeight, setAvailableHeight] = useState(280);
 
   const inputRef = useRef<HTMLInputElement>(null);
+  const addInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const listWrapRef = useRef<HTMLDivElement>(null);
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
+  const onBulkChangeRef = useRef(onBulkChange);
+  onBulkChangeRef.current = onBulkChange;
 
   // Load
   useEffect(() => {
     async function loadStoredSettings() {
       try {
-        const [savedItems, savedSelected] = await Promise.all([
+        const [savedItems, savedSelected, savedTicks] = await Promise.all([
           getSubdirectories(),
           getSelectedSubdir(),
+          getBulkSelection(),
         ]);
+        const normalizedTicks = normalizeBulkSelection(savedItems, savedTicks);
         setItems(savedItems);
+        setBulkTicks(normalizedTicks);
         setSelectedItem(savedSelected);
         if (savedSelected) onSelectRef.current?.(savedSelected);
+        onBulkChangeRef.current?.(normalizedTicks);
       } catch (e) {
         console.error("Failed to load subdirectories settings:", e);
       }
@@ -77,12 +96,17 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
     };
   }, [isOpen, recomputeAvailable]);
 
-  const saveSettings = async (updatedItems: string[], updatedSelected: string) => {
+  const saveSettings = async (
+    updatedItems: string[],
+    updatedSelected: string,
+    updatedTicks: string[]
+  ) => {
     setSaveError("");
     try {
       await Promise.all([
         setSubdirectories(updatedItems),
         setSelectedSubdir(updatedSelected),
+        setBulkSelection(normalizeBulkSelection(updatedItems, updatedTicks)),
       ]);
     } catch (e) {
       console.error("Failed to save subdirectories settings:", e);
@@ -90,19 +114,50 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
     }
   };
 
+  const applyTicks = (updatedTicks: string[]) => {
+    setBulkTicks(updatedTicks);
+    onBulkChangeRef.current?.(updatedTicks);
+  };
+
   const handleSelectItem = (item: string) => {
     setSelectedItem(item);
     onSelect?.(item);
+    applyTicks([]); // choosing one folder means abandoning the bulk selection
     setIsOpen(false);
     setSearchText("");
+    setAddText("");
+    setAddError("");
     setPage(0);
     setHighlight(-1);
-    void saveSettings(items, item);
+    void saveSettings(items, item, []);
+  };
+
+  const handleToggleTick = (item: string) => {
+    const updatedTicks = normalizeBulkSelection(items, toggleBulkTick(bulkTicks, item));
+    applyTicks(updatedTicks);
+    void setBulkSelection(updatedTicks);
+  };
+
+  // Bottom add-input: Enter normalizes the text, appends the folder when new,
+  // ticks it for bulk, and clears the input so the next one can be typed.
+  const handleAddFromInput = () => {
+    const result = addFolderFromInput(items, bulkTicks, addText);
+    if (!result.ok) {
+      setAddError(result.error);
+      return;
+    }
+    setAddError("");
+    setAddText("");
+    setItems(result.items);
+    applyTicks(result.ticks);
+    void saveSettings(result.items, selectedItem, result.ticks);
   };
 
   const handleDeleteItem = (itemToDelete: string) => {
     const updatedItems = items.filter((item) => item !== itemToDelete);
     setItems(updatedItems);
+    const updatedTicks = normalizeBulkSelection(updatedItems, bulkTicks);
+    applyTicks(updatedTicks);
     let updatedSelected = selectedItem;
     if (selectedItem === itemToDelete) {
       updatedSelected = "";
@@ -110,7 +165,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
       onSelect?.("");
     }
     // keep page in bounds after delete
-    void saveSettings(updatedItems, updatedSelected);
+    void saveSettings(updatedItems, updatedSelected, updatedTicks);
   };
 
   const filteredItems = useMemo(
@@ -222,7 +277,8 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
       setHighlight(total - 1);
     } else if (e.key === "Enter") {
       e.preventDefault();
-      // If a list item is highlighted, select it
+      // Filter-only field: Enter picks the highlighted row; adding new
+      // subfolders happens in the bottom input.
       if (highlight >= 0 && highlight < filteredItems.length) {
         const chosen = filteredItems[highlight];
         if (chosen) {
@@ -230,24 +286,11 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
           return;
         }
       }
-      const trimmed = searchText.trim();
-      if (trimmed) {
-        let updatedItems = items;
-        if (!items.includes(trimmed)) {
-          updatedItems = [...items, trimmed];
-          setItems(updatedItems);
-        }
-        setSelectedItem(trimmed);
-        onSelect?.(trimmed);
-        setSearchText("");
-        setIsOpen(false);
-        setPage(0);
-        setHighlight(-1);
-        void saveSettings(updatedItems, trimmed);
-      }
     } else if (e.key === "Escape") {
       setIsOpen(false);
       setSearchText("");
+      setAddText("");
+      setAddError("");
       setPage(0);
       setHighlight(-1);
     }
@@ -257,6 +300,8 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
     if (!e.currentTarget.contains(e.relatedTarget)) {
       setIsOpen(false);
       setSearchText("");
+      setAddText("");
+      setAddError("");
       setHighlight(-1);
       // keep page at 0 for next open
       setPage(0);
@@ -274,6 +319,12 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
     selectedItem && filteredItems.includes(selectedItem) && !visibleItems.includes(selectedItem);
   const selectedPage = selectedItem ? Math.floor(filteredItems.indexOf(selectedItem) / pageSize) : -1;
 
+  // Bulk (2+ ticks) shows a count; a single tick is that folder's name.
+  const isBulk = bulkTicks.length >= BULK_MIN_FOLDERS;
+  const displayLabel = isBulk
+    ? `${bulkTicks.length} folders`
+    : (bulkTicks[0] ?? selectedItem) || "select";
+
   return (
     <div className="relative inline-block min-w-0 max-w-full" onBlur={handleBlur} ref={containerRef}>
       <label className="sr-only" htmlFor="scs-subdir-search">
@@ -287,7 +338,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
           value={searchText}
           onChange={(e) => setSearchText(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={selectedItem || "select"}
+          placeholder={displayLabel}
           aria-expanded={isOpen}
           aria-haspopup="listbox"
           aria-controls="scs-subdir-listbox"
@@ -308,14 +359,16 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
           aria-expanded={isOpen}
           aria-haspopup="listbox"
           aria-label={
-            selectedItem
-              ? `Sync subdirectory: ${selectedItem}. Activate to change.`
-              : "Select sync subdirectory"
+            isBulk
+              ? `Bulk selection: ${bulkTicks.length} subdirectories. Activate to change.`
+              : selectedItem
+                ? `Sync subdirectory: ${selectedItem}. Activate to change.`
+                : "Select sync subdirectory"
           }
           className="text-5xl text-gray-300 lowercase cursor-pointer text-left truncate max-w-full"
-          title={selectedItem || "select"}
+          title={displayLabel}
         >
-          {selectedItem || "select"}
+          {displayLabel}
         </button>
       )}
 
@@ -353,6 +406,7 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
                   const globalIdx = filteredItems.indexOf(item);
                   const isSelected = item === selectedItem;
                   const isHighlighted = globalIdx === highlight;
+                  const isTicked = bulkTicks.includes(item);
                   return (
                     <li
                       key={item}
@@ -361,6 +415,15 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
                       role="option"
                       aria-selected={isSelected}
                     >
+                      <input
+                        type="checkbox"
+                        checked={isTicked}
+                        onChange={() => handleToggleTick(item)}
+                        onMouseDown={(e) => e.preventDefault()}
+                        aria-label={`Include ${item} in bulk selection`}
+                        title="Include in bulk selection"
+                        className="shrink-0 ml-2 w-3.5 h-3.5 accent-white cursor-pointer"
+                      />
                       <button
                         type="button"
                         onMouseDown={(e) => e.preventDefault()}
@@ -386,8 +449,8 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
                 {filteredItems.length === 0 && (
                   <li className="py-2 px-2 text-sm text-gray-400 italic">
                     {searchText.trim()
-                      ? `Press Enter to add "${searchText.trim()}"`
-                      : "Type to search or add a subdirectory…"}
+                      ? `No match — add "${searchText.trim()}" below`
+                      : "Type below to add a subdirectory…"}
                   </li>
                 )}
                 {/* Off-page selected hint */}
@@ -471,11 +534,47 @@ function Dropdown({ onSelect, variant = "pocket" }: DropdownProps) {
                 <span className="text-gray-500 italic">scroll · swipe · arrows</span>
               )}
             </div>
+            {/* Add-input — Enter appends (or finds) the folder, ticks it for bulk, clears */}
+            <div className="flex items-center gap-2 px-2 py-1.5 border-t border-white/10 bg-black/40">
+              <label className="sr-only" htmlFor="scs-subdir-add">
+                Add a subdirectory to the bulk selection
+              </label>
+              <input
+                id="scs-subdir-add"
+                ref={addInputRef}
+                type="text"
+                value={addText}
+                onChange={(e) => {
+                  setAddText(e.target.value);
+                  if (addError) setAddError("");
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    handleAddFromInput();
+                  } else if (e.key === "Escape") {
+                    setIsOpen(false);
+                    setSearchText("");
+                    setAddText("");
+                    setAddError("");
+                    setPage(0);
+                    setHighlight(-1);
+                  }
+                }}
+                placeholder="add subfolder + Enter (bulk-select)"
+                className="flex-1 min-w-0 bg-transparent border-none outline-none text-sm text-gray-200 placeholder:text-gray-500 py-[5px] cursor-text"
+              />
+              {addError && (
+                <span className="text-[11px] text-red-400 shrink-0 max-w-[55%] truncate" role="alert" title={addError}>
+                  {addError}
+                </span>
+              )}
+            </div>
           </div>
           {/* Keyboard hint */}
           <div className="mt-1.5 text-[10px] leading-none text-gray-500 px-1">
-            <span className="hidden sm:inline">↑↓ highlight · PgUp/PgDn page · wheel/swipe · Enter select</span>
-            <span className="sm:hidden">tap · swipe to page</span>
+            <span className="hidden sm:inline">↑↓ highlight · PgUp/PgDn page · Enter select · tick ☑ for bulk</span>
+            <span className="sm:hidden">tap · swipe to page · ☑ = bulk</span>
           </div>
         </div>
       )}
