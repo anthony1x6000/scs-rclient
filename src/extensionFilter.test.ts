@@ -6,6 +6,7 @@ import {
   normalizeExtensionList,
   parseExtensionCsv,
   resolveExtensionFilter,
+  sanitizeExtensionMap,
   type ExtensionFilterState,
 } from "./extensionFilter";
 
@@ -130,5 +131,30 @@ describe("resolveExtensionFilter", () => {
     expect(
       resolveExtensionFilter("/course/a/", state({ perDirWhitelist: { "course/a": wl } })),
     ).toEqual({ mode: "whitelist", extensions: wl });
+  });
+});
+
+describe("sanitizeExtensionMap", () => {
+  it("drops invalid keys and empty lists, keeps valid entries", () => {
+    const sanitized = sanitizeExtensionMap({
+      "course/a": [".HTML", "html"],
+      "a/../b": ["html"],
+      "course/c": [],
+      "course/d": "not-a-list",
+    });
+    expect(Object.keys(sanitized)).toEqual(["course/a"]);
+    expect(sanitized["course/a"]).toEqual(["html"]);
+  });
+
+  it("keeps a folder literally named __proto__ as an own key", () => {
+    // JSON.parse produces an own "__proto__" property; a plain object literal would
+    // not, so this mirrors what actually comes back from the settings store.
+    const stored = JSON.parse('{"__proto__": [".html"]}');
+    const sanitized = sanitizeExtensionMap(stored);
+    expect(Object.prototype.hasOwnProperty.call(sanitized, "__proto__")).toBe(true);
+    expect(sanitized["__proto__"]).toEqual(["html"]);
+    expect(
+      resolveExtensionFilter("__proto__", state({ perDirWhitelist: sanitized })),
+    ).toEqual({ mode: "whitelist", extensions: ["html"] });
   });
 });

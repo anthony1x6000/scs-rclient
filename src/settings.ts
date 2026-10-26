@@ -1,10 +1,11 @@
 import { load, type Store } from "@tauri-apps/plugin-store";
 import {
   normalizeExtensionList,
+  sanitizeExtensionMap,
+  subdirKey,
   type ExtensionFilterMode,
   type ExtensionFilterState,
 } from "./extensionFilter";
-import { normalizeSubdir } from "./utils/rclone";
 
 export const SETTINGS_FILE = "settings.json";
 
@@ -222,21 +223,6 @@ export async function setExcludedFolders(folders: readonly string[]): Promise<vo
   await setWrapped(STORE_KEYS.excludedFolders, normalizeExcludedFolders(folders));
 }
 
-/** Sanitizes a stored per-dir map: valid subdir keys, valid lists, empty entries dropped. */
-function sanitizeExtensionMap(raw: unknown): Record<string, string[]> {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  const sanitized: Record<string, string[]> = {};
-  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-    try {
-      const normalizedKey = normalizeSubdir(key);
-      const list = normalizeExtensionList(Array.isArray(value) ? value : []);
-      if (normalizedKey && list.length > 0) sanitized[normalizedKey] = list;
-    } catch {
-      // A key that is not a valid subdir (e.g. stored with "..") is unusable: drop it.
-    }
-  }
-  return sanitized;
-}
 
 /** Loads every persisted extension filter; each read is sanitized independently. */
 export async function getExtensionFilterState(): Promise<ExtensionFilterState> {
@@ -274,7 +260,7 @@ export async function setSubdirExtensionFilter(
     mode === "whitelist"
       ? STORE_KEYS.extensionWhitelistBySubdir
       : STORE_KEYS.extensionBlacklistBySubdir;
-  const dirKey = normalizeSubdir(subdir);
+  const dirKey = subdirKey(subdir);
   if (!dirKey) throw new Error("Enter a subdirectory first.");
   const state = await getExtensionFilterState();
   const map = mode === "whitelist" ? state.perDirWhitelist : state.perDirBlacklist;

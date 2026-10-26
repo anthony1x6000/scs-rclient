@@ -91,6 +91,22 @@ export function subdirKey(subdir: string | null | undefined): string | null {
   }
 }
 
+/** Sanitizes a stored per-dir map: valid subdir keys, valid lists, empty entries dropped. */
+export function sanitizeExtensionMap(raw: unknown): Record<string, string[]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return Object.create(null) as Record<string, string[]>;
+  }
+  // Null prototype so a folder literally named "__proto__" stays an own property
+  // instead of silently landing on (and being lost via) the Object prototype.
+  const sanitized: Record<string, string[]> = Object.create(null);
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const normalizedKey = subdirKey(key);
+    const list = normalizeExtensionList(Array.isArray(value) ? value : []);
+    if (normalizedKey && list.length > 0) sanitized[normalizedKey] = list;
+  }
+  return sanitized;
+}
+
 /**
  * Resolves the filter that governs `subdir`: a per-dir filter (either kind)
  * replaces the global one entirely, and a whitelist beats a blacklist within
