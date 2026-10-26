@@ -5026,6 +5026,31 @@ mod tests {
     }
 
     #[test]
+    fn test_inflight_listing_budget_bounds_concurrent_bodies() {
+        // The per-body cap alone would let MAX_SCAN_CONCURRENCY workers each
+        // buffer a full MAX_LISTING_BODY_BYTES body (~4 GiB aggregate) before
+        // any aggregate check runs: every listing read reserves its worst
+        // case against a shared ceiling and fails closed beyond it.
+        let mut held: Vec<InflightListingGuard> = Vec::new();
+        let max_guards = MAX_INFLIGHT_LISTING_BYTES / MAX_LISTING_BODY_BYTES as usize;
+        for _ in 0..max_guards {
+            held.push(
+                reserve_inflight_listing()
+                    .expect("reservation within the ceiling must succeed"),
+            );
+        }
+        assert!(
+            reserve_inflight_listing().is_err(),
+            "beyond the shared ceiling the reservation must fail closed"
+        );
+        drop(held);
+        assert!(
+            reserve_inflight_listing().is_ok(),
+            "released reservations must be reusable"
+        );
+    }
+
+    #[test]
     fn test_parse_propfind_xml_rejects_truncation_after_complete_response() {
         // quick_xml raises no syntax error for XML that simply stops after a
         // complete </D:response>: unclosed ancestors are only detectable at
