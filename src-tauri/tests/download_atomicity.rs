@@ -171,9 +171,16 @@ fn test_temp_name_collision_cannot_destroy_sibling_file() {
     // real local file. Neither a failed nor a successful download may
     // truncate or delete it.
     let collide = format!("a.scs-part-{}", std::process::id());
+    // A pre-existing file shaped exactly like the new hidden temp form:
+    // create_new must skip this name, never truncate it.
+    let hidden = ".scs-part-0000000000000000".to_string();
     let stop = Arc::new(AtomicBool::new(false));
     let port = spawn_server(
-        vec![("a.txt".to_string(), 4096), (collide.clone(), 4096)],
+        vec![
+            ("a.txt".to_string(), 4096),
+            (collide.clone(), 4096),
+            (hidden.clone(), 4096),
+        ],
         false,
         stop.clone(),
     )
@@ -183,14 +190,17 @@ fn test_temp_name_collision_cannot_destroy_sibling_file() {
     std::fs::create_dir_all(&local_dir).unwrap();
     let original_a = b"PRECIOUS A";
     let original_b = b"PRECIOUS B";
+    let original_c = b"PRECIOUS C";
     std::fs::write(local_dir.join("a.txt"), original_a).unwrap();
     std::fs::write(local_dir.join(&collide), original_b).unwrap();
+    std::fs::write(local_dir.join(&hidden), original_c).unwrap();
     let mut logs = Vec::new();
     run_get_action(port, &local_dir, &mut logs);
     stop.store(true, Ordering::SeqCst);
 
     let after_a = std::fs::read(local_dir.join("a.txt")).unwrap_or_default();
     let after_b = std::fs::read(local_dir.join(&collide)).unwrap_or_default();
+    let after_c = std::fs::read(local_dir.join(&hidden)).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&local_dir);
     std::env::remove_var("ALLOW_INSECURE_WEBDAV");
     std::env::remove_var("WEBDAV_CACHE_DISABLED");
@@ -199,6 +209,10 @@ fn test_temp_name_collision_cannot_destroy_sibling_file() {
     assert_eq!(
         after_b, original_b,
         "the download temp must never coincide with a real sibling file (logs: {logs:?})"
+    );
+    assert_eq!(
+        after_c, original_c,
+        "a file named like the hidden temp form must never be truncated (logs: {logs:?})"
     );
 }
 
@@ -235,5 +249,54 @@ fn test_successful_download_preserves_target_permissions() {
         mode & 0o777,
         0o600,
         "replacing the target must keep the prior file's mode (logs: {logs:?})"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_read_only_target_is_refused_not_replaced() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env_guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var("ALLOW_INSECURE_WEBDAV", "1");
+    std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let port = spawn_server(vec![("a.txt".to_string(), 8)], true, stop.clone()).unwrap();
+    let local_dir = std::env::temp_dir().join(format!("scs-atomic-ro-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&local_dir);
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let original = b"READONLY CONTENT";
+    std::fs::write(local_dir.join("a.txt"), original).unwrap();
+    std::fs::set_permissions(local_dir.join("a.txt"), std::fs::Permissions::from_mode(0o444))
+        .unwrap();
+    let mut logs = Vec::new();
+    run_get_action(port, &local_dir, &mut logs);
+    stop.store(true, Ordering::SeqCst);
+
+    let after = std::fs::read(local_dir.join("a.txt")).unwrap_or_default();
+    let temps: Vec<_> = std::fs::read_dir(&local_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".scs-part-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    std::fs::set_permissions(local_dir.join("a.txt"), std::fs::Permissions::from_mode(0o644))
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&local_dir);
+    std::env::remove_var("ALLOW_INSECURE_WEBDAV");
+    std::env::remove_var("WEBDAV_CACHE_DISABLED");
+
+    assert_eq!(
+        after, original,
+        "a read-only target must keep its content — the old truncate path failed loudly and the replace must too (logs: {logs:?})"
+    );
+    assert!(
+        temps.is_empty(),
+        "no partial temp may survive a refused download (logs: {logs:?})"
+    );
+    assert!(
+        logs.iter().any(|l| l.to_ascii_lowercase().contains("permission") || l.to_ascii_lowercase().contains("not writable")),
+        "the refusal must say why (logs: {logs:?})"
     );
 }
