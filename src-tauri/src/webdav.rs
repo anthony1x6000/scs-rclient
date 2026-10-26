@@ -4502,7 +4502,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn test_aggregate_remote_folders_credits_ancestors_and_includes_empty_dirs() {
         let base = "http://127.0.0.1:3923/docs/";
         let items = vec![
