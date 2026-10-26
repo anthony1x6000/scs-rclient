@@ -16,6 +16,13 @@ pub const MAX_SCAN_CONCURRENCY: usize = 64;
 /// Set to 10,000 to comfortably accommodate very large course hierarchies (typical max depth ~10 * breadth ~100)
 /// while bounding memory usage and avoiding infinite traversal cycles.
 pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
+/// Hard byte cap for a single server-controlled listing body (PROPFIND
+/// multistatus). GET downloads are capped by `DEFAULT_MAX_FILE_SIZE`; listing
+/// bodies must be bounded the same way or one response can exhaust memory.
+pub const MAX_LISTING_BODY_BYTES: u64 = 64 * 1024 * 1024;
+/// Aggregate item cap across one scan: bounds memory, the cache file, and the
+/// number of local files a hostile listing can materialize via `get`.
+pub const MAX_REMOTE_ITEMS: usize = 100_000;
 /// Maximum number of excluded folder patterns applied to a single action.
 pub const MAX_EXCLUDE_PATTERNS: usize = 64;
 /// Maximum length (in characters) of one excluded folder pattern.
@@ -944,6 +951,23 @@ pub fn clear_remote_cache() -> Result<(), String> {
 }
 
 /// Parses a WebDAV date string into a UNIX timestamp (seconds since epoch).
+/// Reads a server-controlled listing body with a hard byte cap and strict
+/// UTF-8 (fail closed). Unbounded buffering of a hostile response is a
+/// memory-exhaustion vector; the cap turns it into a listing failure.
+pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<String, String> {
+    let mut limited = body.take(MAX_LISTING_BODY_BYTES + 1);
+    let mut buf = String::new();
+    limited
+        .read_to_string(&mut buf)
+        .map_err(|e| format!("listing body read failed: {e}"))?;
+    if buf.len() as u64 > MAX_LISTING_BODY_BYTES {
+        return Err(format!(
+            "listing body exceeds the {MAX_LISTING_BODY_BYTES} byte limit"
+        ));
+    }
+    Ok(buf)
+}
+
 pub fn parse_webdav_date(date_str: &str) -> Option<u64> {
     let s = date_str.trim();
     if s.is_empty() {
@@ -2149,15 +2173,14 @@ where
         },
     );
     match infinity_result {
-        Ok(res) => {
+        Ok(mut res) => {
             let status = res.status();
             if status.is_success() || status.as_u16() == 207 {
                 // A failed body read must not degrade into an empty listing:
-                // it flows through the same fallback as a malformed body.
-                let parsed: Result<Vec<WebdavItem>, String> = res
-                    .text()
-                    .map_err(|e| format!("failed to read PROPFIND response body: {e}"))
-                    .and_then(|body| parse_propfind_xml(&body));
+                // it flows through the same fallback as a malformed body, and
+                // the body itself is read through the bounded reader.
+                let parsed: Result<Vec<WebdavItem>, String> =
+                    read_listing_body(&mut res).and_then(|body| parse_propfind_xml(&body));
                 let items: Vec<WebdavItem> = match parsed {
                     Ok(items) => items,
                     Err(reason) => {
@@ -2464,13 +2487,12 @@ where
                         return;
                     }
 
-                    let body = match res.text() {
+                    let mut res = res;
+                    let body = match read_listing_body(&mut res) {
                         Ok(body) => body,
-                        Err(e) => {
+                        Err(reason) => {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                            state.error = Some(format!(
-                                "Failed to read PROPFIND response body for {current_url}: {e}"
-                            ));
+                            state.error = Some(reason);
                             state.stopped = true;
                             return;
                         }
@@ -2569,6 +2591,13 @@ where
                         for item in discovered_items {
                             let key = (item.is_dir, item.href.clone());
                             if state.seen_items.insert(key) {
+                                if state.all_items.len() >= MAX_REMOTE_ITEMS {
+                                    state.error = Some(format!(
+                                        "Remote listing exceeded the {MAX_REMOTE_ITEMS} item limit. Aborting for security."
+                                    ));
+                                    state.stopped = true;
+                                    return;
+                                }
                                 state.all_items.push(item);
                             }
                         }
@@ -3472,9 +3501,8 @@ where
             if !res.status().is_success() && res.status().as_u16() != 207 {
                 return Err(format!("Server returned HTTP {}", res.status()));
             }
-            let body = res
-                .text()
-                .map_err(|e| format!("failed to read PROPFIND response body: {e}"))?;
+            let mut res = res;
+            let body = read_listing_body(&mut res)?;
             let items = parse_propfind_xml(&body)?;
             if items.is_empty() {
                 return Err(
@@ -4659,7 +4687,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn test_relative_item_path_multibyte_char_boundary_is_panic_free() {
         // decode_percent turns server hrefs into multi-byte UTF-8; splitting
         // the item path at the byte length of the base path must never land
@@ -4674,7 +4701,9 @@ mod tests {
             let item = format!("/{}%C3%A9x", "a".repeat(n));
             let _ = relative_item_path(base, &item);
         }
-=======
+    }
+
+    #[test]
     fn test_listing_body_is_byte_bounded() {
         // Server-controlled listing bodies must never be buffered without a
         // bound: a response larger than the cap is an error, not a String.
@@ -4689,7 +4718,6 @@ mod tests {
         // Invalid UTF-8 is a read error (fail closed), not lossy acceptance.
         let mut cursor = std::io::Cursor::new(vec![0xff, 0xfe, 0x00]);
         assert!(read_listing_body(&mut cursor).is_err());
->>>>>>> 62a0fc9 (test(security): server listings must be byte- and item-bounded)
     }
 
     #[test]
