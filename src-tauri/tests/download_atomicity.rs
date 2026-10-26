@@ -18,10 +18,24 @@ fn test_failed_download_preserves_existing_local_file() {
     std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    // Nonblocking accept + stop flag: a blocking `incoming()` loop never
+    // ends, so join()ing it below would hang the test (and CI) forever
+    // once the action finishes and stops making connections.
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
     let handle = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let mut stream = stream.unwrap();
+        while !stop_clone.load(Ordering::SeqCst) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let mut buf = Vec::new();
             let mut chunk = [0u8; 4096];
@@ -75,6 +89,7 @@ fn test_failed_download_preserves_existing_local_file() {
         &[],
         |m: &str| logs.push(m.to_string()),
     );
+    stop.store(true, Ordering::SeqCst);
     let _ = handle.join();
     let after = std::fs::read(local_dir.join("a.txt")).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&local_dir);
