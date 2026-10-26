@@ -226,7 +226,7 @@ fn test_xml_parsing_robustness() {
         </D:response>
     </D:multistatus>"#;
 
-    let items = parse_propfind_xml(xml);
+    let items = parse_propfind_xml(xml).unwrap();
     assert_eq!(items.len(), 3);
     assert!(items[0].is_dir);
     assert_eq!(items[0].href, "/webdav/");
@@ -313,7 +313,7 @@ fn test_iis_depth_infinity_degradation_detected() {
         </D:Response>
     </D:multistatus>"#;
 
-    let items = parse_propfind_xml(xml);
+    let items = parse_propfind_xml(xml).unwrap();
     assert_eq!(items.len(), 1);
     assert!(items[0].is_dir);
 

@@ -835,7 +835,7 @@ pub fn parse_webdav_date(date_str: &str) -> Option<u64> {
 }
 
 /// Parses the WebDAV PROPFIND XML response into WebdavItem records.
-pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
+pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
     let mut items = Vec::new();
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -852,11 +852,42 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
     let mut current_size: u64 = 0;
     let mut current_mtime: Option<u64> = None;
 
+    // A PROPFIND response is a single multistatus document. quick_xml only
+    // raises syntax errors; a body that never opens a multistatus root or
+    // one truncated after a complete child element still parses "fine", so
+    // the document shape is tracked here and enforced at EOF.
+    let mut depth: i64 = 0;
+    let mut saw_multistatus_root = false;
+
     let mut buf = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(ref e)) => {
+                if depth == 0 {
+                    // Fail closed on document shape: the first element must
+                    // be the multistatus root, and nothing may follow the
+                    // closed root — a response before or after the root is
+                    // not part of the document and must not inject items.
+                    if saw_multistatus_root {
+                        return Err(
+                            "malformed PROPFIND XML: content after the multistatus root"
+                                .to_string(),
+                        );
+                    }
+                    if !e
+                        .local_name()
+                        .as_ref()
+                        .eq_ignore_ascii_case(b"multistatus")
+                    {
+                        return Err(
+                            "malformed PROPFIND XML: root element is not multistatus"
+                                .to_string(),
+                        );
+                    }
+                    saw_multistatus_root = true;
+                }
+                depth += 1;
                 let local = e.local_name();
                 let name = local.as_ref();
                 if name.eq_ignore_ascii_case(b"response") {
@@ -883,6 +914,28 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                 }
             }
             Ok(quick_xml::events::Event::Empty(ref e)) => {
+                if depth == 0 {
+                    // Same root-shape rules as Start: a self-closing element
+                    // at document level is either the multistatus root or an
+                    // error, never silent content before/after it.
+                    if saw_multistatus_root {
+                        return Err(
+                            "malformed PROPFIND XML: content after the multistatus root"
+                                .to_string(),
+                        );
+                    }
+                    if !e
+                        .local_name()
+                        .as_ref()
+                        .eq_ignore_ascii_case(b"multistatus")
+                    {
+                        return Err(
+                            "malformed PROPFIND XML: root element is not multistatus"
+                                .to_string(),
+                        );
+                    }
+                    saw_multistatus_root = true;
+                }
                 let local = e.local_name();
                 let name = local.as_ref();
                 if in_resourcetype && name.eq_ignore_ascii_case(b"collection") {
@@ -934,6 +987,7 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                 }
             }
             Ok(quick_xml::events::Event::End(ref e)) => {
+                depth = depth.saturating_sub(1);
                 let local = e.local_name();
                 let name = local.as_ref();
                 if name.eq_ignore_ascii_case(b"response") {
@@ -962,14 +1016,34 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                     in_iscollection = false;
                 }
             }
-            Ok(quick_xml::events::Event::Eof) => break,
-            Err(_) => break,
+            Ok(quick_xml::events::Event::Eof) => {
+                if !saw_multistatus_root {
+                    return Err(
+                        "malformed PROPFIND XML: no multistatus root element (empty or non-WebDAV body)"
+                            .to_string(),
+                    );
+                }
+                if depth != 0 {
+                    return Err(format!(
+                        "malformed PROPFIND XML: truncated body with {depth} unclosed element(s)"
+                    ));
+                }
+                break;
+            }
+            Err(e) => {
+                // A malformed document must fail the whole listing: callers
+                // treat the returned set as complete ground truth (sync
+                // upload/delete decisions, the listing cache). Silently
+                // returning the items parsed so far turns a broken response
+                // into a wrong-but-plausible listing.
+                return Err(format!("malformed PROPFIND XML: {e}"));
+            }
             _ => {}
         }
         buf.clear();
     }
 
-    items
+    Ok(items)
 }
 
 /// Simple percent decoder for URI path segments.
@@ -1645,9 +1719,25 @@ where
         Ok(res) => {
             let status = res.status();
             if status.is_success() || status.as_u16() == 207 {
-                let body = res.text().unwrap_or_default();
-                let items: Vec<WebdavItem> = parse_propfind_xml(&body)
-                    .into_iter()
+                // A failed body read must not degrade into an empty listing:
+                // it flows through the same fallback as a malformed body.
+                let parsed: Result<Vec<WebdavItem>, String> = res
+                    .text()
+                    .map_err(|e| format!("failed to read PROPFIND response body: {e}"))
+                    .and_then(|body| parse_propfind_xml(&body));
+                let items: Vec<WebdavItem> = match parsed {
+                    Ok(items) => items,
+                    Err(reason) => {
+                        // A malformed listing must not be treated as a
+                        // complete result: fall back to the Depth:1 traversal
+                        // below instead of trusting a partial parse.
+                        log(&format!(
+                            "{reason}; falling back to Depth: 1 traversal...\n"
+                        ));
+                        Vec::new()
+                    }
+                }
+                .into_iter()
                     // A Depth: infinity response is expanded server-side, so drop excluded
                     // folders and everything under them before they can be cached or used.
                     .filter(|item| {
@@ -1942,8 +2032,38 @@ where
                         return;
                     }
 
-                    let body = res.text().unwrap_or_default();
-                    let items = parse_propfind_xml(&body);
+                    let body = match res.text() {
+                        Ok(body) => body,
+                        Err(e) => {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.error = Some(format!(
+                                "Failed to read PROPFIND response body for {current_url}: {e}"
+                            ));
+                            state.stopped = true;
+                            return;
+                        }
+                    };
+                    let items = match parse_propfind_xml(&body) {
+                        Ok(items) => items,
+                        Err(reason) => {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.error = Some(reason);
+                            state.stopped = true;
+                            return;
+                        }
+                    };
+                    if items.is_empty() {
+                        // A Depth: 1 listing always contains at least the
+                        // collection itself; zero responses means the body
+                        // was never a real listing and must not be trusted as
+                        // "directory is empty" ground truth for deletes.
+                        let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                        state.error = Some(format!(
+                            "PROPFIND returned an empty multistatus for {current_url}"
+                        ));
+                        state.stopped = true;
+                        return;
+                    }
 
                     let mut children_in_dir = 0;
                     let mut new_dirs = 0;
@@ -2839,8 +2959,16 @@ where
             if !res.status().is_success() && res.status().as_u16() != 207 {
                 return Err(format!("Server returned HTTP {}", res.status()));
             }
-            let body = res.text().unwrap_or_default();
-            let items = parse_propfind_xml(&body);
+            let body = res
+                .text()
+                .map_err(|e| format!("failed to read PROPFIND response body: {e}"))?;
+            let items = parse_propfind_xml(&body)?;
+            if items.is_empty() {
+                return Err(
+                    "PROPFIND returned an empty multistatus (no resources, not even the collection)"
+                        .to_string(),
+                );
+            }
             let mut count = 0;
             for item in &items {
                 if !item.is_dir {
@@ -3607,7 +3735,7 @@ mod tests {
             </D:response>
         </D:multistatus>"#;
 
-        let items = parse_propfind_xml(sample);
+        let items = parse_propfind_xml(sample).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].href, "/files/myuser/docs/");
         assert!(items[0].is_dir);
@@ -3693,7 +3821,7 @@ mod tests {
             </D:Response>
         </D:multistatus>"#;
 
-        let items = parse_propfind_xml(xml);
+        let items = parse_propfind_xml(xml).unwrap();
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].href, "/content/enforced/1052175-dev_asteve18/");
         assert!(items[0].is_dir);
@@ -3811,7 +3939,7 @@ mod tests {
 </d:multistatus>"#;
 
         let base = "https://courselinkdav.desire2learn.com/content/enforced/1052175-dev_asteve18/";
-        let items = parse_propfind_xml(xml);
+        let items = parse_propfind_xml(xml).unwrap();
         assert_eq!(items.len(), 5);
 
         // Item 0: Root collection
@@ -3950,6 +4078,108 @@ mod tests {
             let item = format!("/{}%C3%A9x", "a".repeat(n));
             let _ = relative_item_path(base, &item);
         }
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_rejects_malformed_tail() {
+        // A malformed tail must fail the whole listing, not silently return
+        // the items parsed so far: sync treats the returned set as ground
+        // truth (files missing from it get re-uploaded unconditionally, and
+        // the truncated set is cached for 24h).
+        let body = concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?>",
+            "<D:multistatus xmlns:D=\"DAV:\">",
+            "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+            "<D:response><D:href>/c/b.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+            "<D:response><D:href>/c/c.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:respo",
+        );
+        let parsed = parse_propfind_xml(body);
+        assert!(
+            parsed.is_err(),
+            "malformed XML tail must be an error, not a silent 2-item listing"
+        );
+        // Complete only the truncated tail. Appending — instead of replacing
+        // "</D:respo", which also matches inside the first two blocks'
+        // "</D:response>" close tags — leaves the well-formed responses
+        // untouched.
+        let ok_body = format!("{body}nse></D:multistatus>");
+        assert_eq!(parse_propfind_xml(&ok_body).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_requires_multistatus_root() {
+        // An empty body (e.g. a defaulted body read) or well-formed
+        // non-multistatus XML (proxied HTML error pages) must not parse as
+        // an empty-but-complete listing: callers treat Ok(vec![]) as ground
+        // truth and act on everything "missing" from it.
+        assert!(
+            parse_propfind_xml("").is_err(),
+            "empty body must be an error, not an empty listing"
+        );
+        assert!(
+            parse_propfind_xml("<html><body><h1>404 Not Found</h1></body></html>").is_err(),
+            "well-formed non-multistatus XML must be an error"
+        );
+        assert!(
+            parse_propfind_xml(
+                "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>\
+                 <D:resourcetype/></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+                 </D:propstat></D:response>"
+            )
+            .is_err(),
+            "response without a multistatus root must be an error"
+        );
+        // Elements BEFORE the root are not part of the document: a response
+        // ahead of a real multistatus root must fail the parse outright, not
+        // inject its items into the listing.
+        assert!(
+            parse_propfind_xml(
+                "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>\
+                 <D:resourcetype/></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+                 </D:propstat></D:response>\
+                 <D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/c/b.txt</D:href>\
+                 <D:propstat><D:prop><D:resourcetype/></D:prop>\
+                 <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+                 </D:multistatus>"
+            )
+            .is_err(),
+            "a response before the multistatus root must be an error"
+        );
+        // Nothing may follow the closed root either.
+        assert!(
+            parse_propfind_xml(
+                "<D:multistatus xmlns:D=\"DAV:\"></D:multistatus><D:multistatus xmlns:D=\"DAV:\"/>"
+            )
+            .is_err(),
+            "a second root after the closed multistatus must be an error"
+        );
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_rejects_truncation_after_complete_response() {
+        // quick_xml raises no syntax error for XML that simply stops after a
+        // complete </D:response>: unclosed ancestors are only detectable at
+        // EOF, so the parser must track element depth itself.
+        let body = concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?>",
+            "<D:multistatus xmlns:D=\"DAV:\">",
+            "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+        );
+        let parsed = parse_propfind_xml(body);
+        assert!(
+            parsed.is_err(),
+            "truncation after a complete response must be an error, not a 1-item listing"
+        );
+        let ok_body = format!("{body}</D:multistatus>");
+        assert_eq!(parse_propfind_xml(&ok_body).unwrap().len(), 1);
     }
 
     #[test]
