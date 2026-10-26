@@ -1264,18 +1264,19 @@ fn is_within_collection(remote_url: &str, target_url: &str) -> bool {
 /// Non-empty path segments, or `None` when the path is ambiguous. Segments
 /// are split on RAW '/' separators before decoding, so a percent-encoded
 /// separator can never shift a segment boundary: a segment that decodes to
-/// contain '/' or '\', decodes to "." / "..", or an internal empty segment
-/// (duplicate slash) is rejected wholesale — servers may resolve any of
-/// those differently from this client, so they can never be proven inside
-/// the collection. The URL parser has already resolved literal dot
-/// segments, so any that appear after decoding came from encoded forms.
+/// contain '/' or '\', an internal empty segment (duplicate slash), or any
+/// spelling that a server could normalize into a dot segment is rejected
+/// wholesale — servers may resolve any of those differently from this
+/// client, so they can never be proven inside the collection. The URL
+/// parser has already resolved literal dot segments, so anything dot-like
+/// that appears after decoding came from encoded or aliased forms.
 fn collection_path_segments(path: &str) -> Option<Vec<String>> {
     let raw_segs: Vec<&str> = path.split('/').collect();
     let last_idx = raw_segs.len() - 1;
     let mut segs = Vec::with_capacity(raw_segs.len());
     for (idx, raw) in raw_segs.iter().enumerate() {
         let decoded = decode_percent(raw);
-        if decoded.contains('/') || decoded.contains('\\') {
+        if decoded.contains('/') || decoded.contains('\\') || decoded.contains('\0') {
             return None;
         }
         if decoded.is_empty() {
@@ -1287,12 +1288,24 @@ fn collection_path_segments(path: &str) -> Option<Vec<String>> {
             }
             continue;
         }
-        if decoded == "." || decoded == ".." {
+        if normalizes_to_dot_segment(&decoded) {
             return None;
         }
         segs.push(decoded);
     }
     Some(segs)
+}
+
+/// True for segments a server could resolve to "." or "..": the literal dot
+/// segments themselves, spellings with trailing ASCII spaces or dots (which
+/// Windows/IIS-family servers trim, so "..%20" and "..." re-alias to dot
+/// segments), and path-parameter aliases (servlet containers strip ";..."
+/// suffixes, so "..;" names the parent directory).
+fn normalizes_to_dot_segment(seg: &str) -> bool {
+    fn dot_ish(s: &str) -> bool {
+        s == "." || s == ".." || s.ends_with(' ') || s.ends_with('.') || s.ends_with('\0')
+    }
+    dot_ish(seg) || dot_ish(seg.split(';').next().unwrap_or(""))
 }
 
 /// Gate for any URL taken from a server response before it becomes a request:
@@ -4302,6 +4315,25 @@ mod tests {
         assert!(
             guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123//file.txt").is_err(),
             "duplicate slashes must be refused as ambiguous"
+        );
+        // Dot-segment aliases that normalizing servers collapse: servlet
+        // path parameters (";..."), Windows-style trailing space/dot
+        // trimming, and embedded NULs.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%20/othercourse/file.txt").is_err(),
+            "trailing-space dot segments must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%3B/othercourse/file.txt").is_err(),
+            "path-parameter dot aliases must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%00/othercourse/file.txt").is_err(),
+            "NUL-terminated dot segments must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/.../othercourse/file.txt").is_err(),
+            "trailing-dot aliases of dot segments must be refused"
         );
         // In-collection targets still pass: deeper exact-case paths, explicit
         // default port, and percent-encoded ordinary characters.
