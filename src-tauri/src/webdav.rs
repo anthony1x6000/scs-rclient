@@ -1243,9 +1243,37 @@ fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
 /// builds its reqwest client with `redirect::Policy::none()`, so a 3xx sent
 /// by the remote is returned as a plain non-success response instead of
 /// being followed with the Basic-auth header attached.
+/// True when `target_url`'s decoded path equals or lies under the configured
+/// collection path of `remote_url` (case-insensitive to absorb D2L/IIS case
+/// variance; explicit default ports are absorbed by origin equality).
+fn is_within_collection(remote_url: &str, target_url: &str) -> bool {
+    let (Ok(base), Ok(target)) = (reqwest::Url::parse(remote_url), reqwest::Url::parse(target_url))
+    else {
+        return false;
+    };
+    let base_path = decode_percent(base.path());
+    let target_path = decode_percent(target.path());
+    let trimmed_base = base_path.trim_end_matches('/');
+    if trimmed_base.is_empty() {
+        // Origin-root collection: every same-origin path is inside it.
+        return true;
+    }
+    let trimmed_target = target_path.trim_end_matches('/');
+    if trimmed_target.eq_ignore_ascii_case(trimmed_base) {
+        return true;
+    }
+    match trimmed_target.split_at_checked(trimmed_base.len()) {
+        Some((prefix, rest)) => prefix.eq_ignore_ascii_case(trimmed_base) && rest.starts_with('/'),
+        None => false,
+    }
+}
+
 fn guard_server_derived_url(remote_url: &str, target_url: &str) -> Result<(), String> {
     if !same_remote_origin(remote_url, target_url) {
         return Err("href resolves outside the configured remote origin".to_string());
+    }
+    if !is_within_collection(remote_url, target_url) {
+        return Err("href resolves outside the configured collection directory".to_string());
     }
     validate_webdav_url(target_url)
 }
@@ -2102,6 +2130,7 @@ where
                                     && !rel_from_root.is_empty()
                                     && is_safe_relative_path(&rel_from_root)
                                     && validate_webdav_url(&item_url).is_ok()
+                                    && is_within_collection(remote_url, &item_url)
                                 {
                                     discovered_sub_urls.push(item_url);
                                 }
