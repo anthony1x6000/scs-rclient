@@ -1424,8 +1424,11 @@ fn has_url_dot_segment(raw: &str) -> bool {
         Some((_, rest)) => rest,
         None => raw,
     };
+    // A backslash directly after the authority is the path start too: the
+    // WHATWG parser accepts `\` as a path separator for special schemes, so
+    // `https://host\..\x` parses with a path of `/x` after the parent pop.
     let path_start = after_scheme
-        .find(['/', '?', '#'])
+        .find(['/', '\\', '?', '#'])
         .unwrap_or(after_scheme.len());
     let path_and_rest = &after_scheme[path_start..];
     let path = path_and_rest
@@ -4305,7 +4308,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn test_relative_item_path_multibyte_char_boundary_is_panic_free() {
         // decode_percent turns server hrefs into multi-byte UTF-8; splitting
         // the item path at the byte length of the base path must never land
@@ -4320,7 +4322,35 @@ mod tests {
             let item = format!("/{}%C3%A9x", "a".repeat(n));
             let _ = relative_item_path(base, &item);
         }
-=======
+    fn test_validate_webdav_url_rejects_backslash_after_authority() {
+        // The WHATWG parser treats a backslash as a path separator for
+        // special schemes, so `https://host\..\x` parses with a path of
+        // `/x` after the parent pop. The guard must recognize the backslash
+        // as the path start rather than part of the authority, or the
+        // traversal escapes the configured scope unseen. The error message
+        // pins the rejection to the dot-segment guard itself.
+        for raw in [
+            r"https://courselinkdav.desire2learn.com\..\secret",
+            r"https://courselinkdav.desire2learn.com:8443\..\secret",
+            r"https://courselinkdav.desire2learn.com\%2e%2e/secret",
+            r"https://courselinkdav.desire2learn.com\.\secret",
+        ] {
+            let err = validate_webdav_url_internal(raw, false).unwrap_err();
+            assert!(
+                err.contains("dot-segment"),
+                "{raw} must be rejected as a dot-segment, got: {err}"
+            );
+        }
+        // A backslash separating ordinary segments is a path separator, not
+        // a traversal, and stays accepted.
+        assert!(validate_webdav_url_internal(
+            r"https://courselinkdav.desire2learn.com\dav\",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn test_validate_webdav_url_rejects_encoded_dot_segments() {
         // The WHATWG URL parser treats these path segments as double-dot
         // segments and pops the parent directory, so a literal '.'/'..'
@@ -4357,7 +4387,6 @@ mod tests {
         }
         let url = build_remote_url("https://courselinkdav.desire2learn.com/content/enforced/1234", "notes");
         assert!(validate_webdav_url_internal(&url, false).is_ok());
->>>>>>> c422262 (test(security): encoded dot-segment subdirs must be rejected)
     }
 
     #[test]

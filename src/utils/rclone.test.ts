@@ -23,6 +23,18 @@ describe("normalizeSubdir traversal scope", () => {
     expect(normalizeSubdir(" My Folder ")).toBe("My Folder");
   });
 
+  it("keeps encoded separators as literal names, not traversal", () => {
+    // resolveRemoteUrl re-encodes the `%`, so an encoded separator reaches
+    // the backend as a literal `%2f` inside one segment and cannot split
+    // the path or pop a parent.
+    expect(resolveRemoteUrl("https://h.example/dav", "a%2fb")).toBe(
+      "https://h.example/dav/a%252fb",
+    );
+    expect(resolveRemoteUrl("https://h.example/dav", "a%5Cb")).toBe(
+      "https://h.example/dav/a%255cb",
+    );
+  });
+
   it("resolveRemoteUrl keeps the segment inside the base", () => {
     expect(resolveRemoteUrl("https://h.example/dav", "notes")).toBe("https://h.example/dav/notes");
   });

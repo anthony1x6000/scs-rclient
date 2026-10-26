@@ -9,15 +9,18 @@ export function normalizeUrl(url: string): string {
   return clean;
 }
 
-/**
- * Normalizes a subdirectory path by trimming whitespace, leading slashes, and trailing slashes.
- * Rejects `.` / `..` segments and backslash separators to prevent scope escape.
- */
 /** WHATWG dot-segment spellings the URL parser collapses into parent pops. */
 const DOT_SEGMENT = /^(\.|\.\.|%2e|\.%2e|%2e\.|%2e%2e)$/i;
 /** Control characters never valid in a folder name handed to the backend. */
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
+/**
+ * Normalizes a subdirectory path by trimming whitespace, leading slashes, and trailing slashes.
+ * Rejects `.` / `..` segments and backslash separators to prevent scope escape.
+ * Encoded separators (`%2f`/`%5c`) cannot traverse: `resolveRemoteUrl` passes each
+ * segment through `encodeURIComponent`, which re-encodes the `%` (so `%2f` is sent
+ * as `%252f`) and the backend decodes it back to a literal, separator-free name.
+ */
 export function normalizeSubdir(subdir: string): string {
   const trimmed = subdir.trim().replace(/\\/g, "/");
   const parts = trimmed.split("/").filter((p) => p.length > 0);
