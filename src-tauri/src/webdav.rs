@@ -4659,6 +4659,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn test_relative_item_path_multibyte_char_boundary_is_panic_free() {
         // decode_percent turns server hrefs into multi-byte UTF-8; splitting
         // the item path at the byte length of the base path must never land
@@ -4673,6 +4674,22 @@ mod tests {
             let item = format!("/{}%C3%A9x", "a".repeat(n));
             let _ = relative_item_path(base, &item);
         }
+=======
+    fn test_listing_body_is_byte_bounded() {
+        // Server-controlled listing bodies must never be buffered without a
+        // bound: a response larger than the cap is an error, not a String.
+        let over: String = "x".repeat(MAX_LISTING_BODY_BYTES as usize + 1);
+        let mut cursor = std::io::Cursor::new(over.into_bytes());
+        assert!(read_listing_body(&mut cursor).is_err());
+
+        let under: String = "x".repeat(1024);
+        let mut cursor = std::io::Cursor::new(under.clone().into_bytes());
+        assert_eq!(read_listing_body(&mut cursor).unwrap(), under);
+
+        // Invalid UTF-8 is a read error (fail closed), not lossy acceptance.
+        let mut cursor = std::io::Cursor::new(vec![0xff, 0xfe, 0x00]);
+        assert!(read_listing_body(&mut cursor).is_err());
+>>>>>>> 62a0fc9 (test(security): server listings must be byte- and item-bounded)
     }
 
     #[test]
