@@ -67,12 +67,69 @@ fn start_listener(
     (port, hits, stop, handle)
 }
 
-fn probe_with_proxy(proxy_var: &str) {
+/// Snapshots every environment variable this file touches and stops the
+/// probe listeners when dropped, so every exit path — including a panic —
+/// restores the process-global state it found.
+struct EnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+    listeners: Vec<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
+}
+
+impl EnvGuard {
+    fn new() -> Self {
+        const VARS: [&str; 8] = [
+            "ALLOW_INSECURE_WEBDAV",
+            "WEBDAV_CACHE_DISABLED",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        Self {
+            saved: VARS.iter().map(|k| (*k, std::env::var(k).ok())).collect(),
+            listeners: Vec::new(),
+        }
+    }
+
+    fn track(&mut self, stop: Arc<AtomicBool>, handle: std::thread::JoinHandle<()>) {
+        self.listeners.push((stop, handle));
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (stop, handle) in self.listeners.drain(..) {
+            stop.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+        }
+        for (key, value) in self.saved.drain(..) {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+fn probe_with_proxy(proxy_var: &'static str) {
+    let mut guard = EnvGuard::new();
     std::env::set_var("ALLOW_INSECURE_WEBDAV", "1");
     std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
+    // A leftover ambient NO_PROXY (or lowercase proxy spelling) could bypass
+    // the proxy for loopback and let the test pass without the transport
+    // fix, so clear every proxy variable first and set only the one under
+    // test.
+    for var in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"] {
+        std::env::remove_var(var);
+    }
 
     let (base_port, base_hits, base_stop, base_handle) = start_listener("base-ok");
-    let (proxy_port, proxy_hits, proxy_stop, proxy_handle) = start_listener("proxy-must-not-see-this");
+    guard.track(base_stop, base_handle);
+    let (proxy_port, proxy_hits, proxy_stop, proxy_handle) =
+        start_listener("proxy-must-not-see-this");
+    guard.track(proxy_stop, proxy_handle);
     std::env::set_var(proxy_var, format!("http://127.0.0.1:{proxy_port}/"));
 
     let base_url = format!("http://127.0.0.1:{base_port}/dav/");
@@ -80,12 +137,6 @@ fn probe_with_proxy(proxy_var: &str) {
     let _ = client.get(&base_url);
 
     std::thread::sleep(Duration::from_millis(300));
-    std::env::remove_var(proxy_var);
-    base_stop.store(true, Ordering::SeqCst);
-    proxy_stop.store(true, Ordering::SeqCst);
-    let _ = base_handle.join();
-    let _ = proxy_handle.join();
-    std::env::remove_var("ALLOW_INSECURE_WEBDAV");
 
     let proxy_seen = proxy_hits.lock().unwrap_or_else(|p| p.into_inner()).clone();
     assert!(
@@ -100,11 +151,13 @@ fn probe_with_proxy(proxy_var: &str) {
 }
 
 #[test]
-fn test_http_proxy_cannot_reroute_pinned_transport() {
+fn test_ambient_proxy_env_cannot_reroute_pinned_transport() {
+    // One test, not two: the harness runs #[test] fns on parallel threads
+    // and each probe mutates process-global environment variables, so
+    // parallel probes race (one probe's cleanup can remove
+    // ALLOW_INSECURE_WEBDAV while the other's Client::init still needs it).
+    // Probing both variables in sequence keeps them serialized; the guard
+    // restores the environment between and after them.
     probe_with_proxy("HTTP_PROXY");
-}
-
-#[test]
-fn test_all_proxy_cannot_reroute_pinned_transport() {
     probe_with_proxy("ALL_PROXY");
 }
