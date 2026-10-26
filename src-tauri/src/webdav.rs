@@ -4271,6 +4271,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn test_relative_item_path_multibyte_char_boundary_is_panic_free() {
         // decode_percent turns server hrefs into multi-byte UTF-8; splitting
         // the item path at the byte length of the base path must never land
@@ -4285,6 +4286,44 @@ mod tests {
             let item = format!("/{}%C3%A9x", "a".repeat(n));
             let _ = relative_item_path(base, &item);
         }
+=======
+    fn test_validate_webdav_url_rejects_encoded_dot_segments() {
+        // The WHATWG URL parser treats these path segments as double-dot
+        // segments and pops the parent directory, so a literal '.'/'..'
+        // check never sees them: the remote scope would silently shift
+        // above the configured base path.
+        for path in [
+            "/dav/%2e%2e/",
+            "/dav/.%2e/",
+            "/dav/%2e./",
+            "/dav/notes/%2e%2e",
+            "/dav/%2E%2E/",
+        ] {
+            assert!(
+                validate_webdav_url_internal(&format!("https://courselinkdav.desire2learn.com{path}"), false).is_err(),
+                "encoded dot-dot path segment must be rejected: {path}"
+            );
+        }
+        // The encoded single-dot form is silently dropped by the same rule.
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/%2e", false).is_err());
+        // Ordinary percent-encoded characters stay allowed.
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/my%20course/", false).is_ok());
+    }
+
+    #[test]
+    fn test_build_remote_url_scope_cannot_escape_via_encoded_subdir() {
+        // build_remote_url concatenates the user-supplied subdir into the
+        // remote URL; the guard must reject the result before any request.
+        for subdir in ["%2e%2e", "notes/.%2e", "notes/%2e%2e/sub"] {
+            let url = build_remote_url("https://courselinkdav.desire2learn.com/content/enforced/1234", subdir);
+            assert!(
+                validate_webdav_url_internal(&url, false).is_err(),
+                "subdir {subdir:?} must not shift the remote scope"
+            );
+        }
+        let url = build_remote_url("https://courselinkdav.desire2learn.com/content/enforced/1234", "notes");
+        assert!(validate_webdav_url_internal(&url, false).is_ok());
+>>>>>>> c422262 (test(security): encoded dot-segment subdirs must be rejected)
     }
 
     #[test]

@@ -128,7 +128,7 @@ export TEST_WEBDAV_USER="testuser"
 export TEST_WEBDAV_PASS="testpass"
 
 echo "=== Running WebDAV lib unit tests ==="
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --nocapture
+cargo test --manifest-path src-tauri/Cargo.toml  -- --nocapture --test-threads=1
 
 echo "=== Running WebDAV integration, roundtrip, and live concurrency tests against simulated D2L endpoint ==="
 cargo test --manifest-path src-tauri/Cargo.toml --test webdav_e2e --test live_concurrency --test insecure_mode_env --test download_cancel_deadline -- --nocapture --test-threads=1
