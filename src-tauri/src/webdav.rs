@@ -4548,6 +4548,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn test_relative_item_path_multibyte_char_boundary_is_panic_free() {
         // decode_percent turns server hrefs into multi-byte UTF-8; splitting
         // the item path at the byte length of the base path must never land
@@ -4562,6 +4563,27 @@ mod tests {
             let item = format!("/{}%C3%A9x", "a".repeat(n));
             let _ = relative_item_path(base, &item);
         }
+=======
+    fn test_cache_key_does_not_fold_url_path_case() {
+        // URL paths are case-sensitive (RFC 3986 6.2.2.1): two collections
+        // differing only in path case are distinct remotes and must never
+        // share a listing-cache entry (a shared entry steers sync's
+        // delete set at the wrong collection).
+        assert_ne!(
+            cache_key("https://h.example/dav/A/", Some("u")),
+            cache_key("https://h.example/dav/a/", Some("u"))
+        );
+        // Scheme and host remain case-insensitive by URL grammar.
+        assert_eq!(
+            cache_key("https://H.EXAMPLE/dav/A/", Some("u")),
+            cache_key("https://h.example/dav/A/", Some("u"))
+        );
+        // Host case folding must not leak into the path.
+        assert_ne!(
+            cache_key("https://h.example/dav/A/", Some("u")),
+            cache_key("https://H.example/dav/a/", Some("u"))
+        );
+>>>>>>> b374dce (test(security): cache keys must not fold URL path case)
     }
 
     #[test]
