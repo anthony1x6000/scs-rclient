@@ -664,6 +664,21 @@ jobs:
             exit 0
           fi
 
+          # The reviewed diff was computed against the BASE snapshotted at gate
+          # time. If the PR's base was edited since (a same-repo author can
+          # retarget it), the squash would contain merge-base(current base,
+          # head)..head — content no reviewer ever saw. Re-bind both sides.
+          CURRENT_BASE=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .base.ref_name)
+          CURRENT_STATE=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .state)
+          if [ "$CURRENT_BASE" != "$BASE_REF" ]; then
+            echo "::warning title=auto-merge skipped::pr base moved from $BASE_REF to $CURRENT_BASE after the review; the reviewed diff no longer matches. the retargeted pr gets its own review."
+            exit 0
+          fi
+          if [ "$CURRENT_STATE" != "OPEN" ]; then
+            echo "::warning title=auto-merge skipped::pr is $CURRENT_STATE; nothing to merge."
+            exit 0
+          fi
+
           # One snapshot, no wait. The gate opened before about eleven minutes of
           # model time, so a check that re-ran and went red in that window must
           # leave the pr open instead of merging on a stale verdict. The
