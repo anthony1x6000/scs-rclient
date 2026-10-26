@@ -131,6 +131,10 @@ echo "=== Running WebDAV lib unit tests ==="
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --nocapture
 
 echo "=== Running WebDAV integration, roundtrip, and live concurrency tests against simulated D2L endpoint ==="
+<<<<<<< HEAD
 cargo test --manifest-path src-tauri/Cargo.toml --test webdav_e2e --test live_concurrency --test insecure_mode_env -- --nocapture --test-threads=1
+=======
+cargo test --manifest-path src-tauri/Cargo.toml --test webdav_e2e --test live_concurrency --test insecure_mode_env --test download_cancel_deadline -- --nocapture --test-threads=1
+>>>>>>> 17dc72c (fix(security): cancel-able, time-bounded streamed downloads)
 
 echo "✓ All WebDAV tests passed successfully against D2L simulation setup!"

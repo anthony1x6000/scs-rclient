@@ -357,6 +357,18 @@ fn register_concurrency_wakeup(wake: &Arc<PoolWake>) {
 }
 
 /// Retrieves maximum allowed WebDAV file size in bytes, configurable via MAX_WEBDAV_FILE_SIZE_BYTES.
+/// End-to-end deadline for one streamed download body. reqwest's blocking
+/// client applies its 30s timeout per individual `read()`, so a body dripped
+/// at one byte per 29 seconds never times out; this ceiling bounds the whole
+/// transfer and the copy loop also observes the cancel flag every chunk.
+pub fn get_download_body_timeout_secs() -> u64 {
+    std::env::var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(600)
+}
+
 pub fn get_max_file_size() -> u64 {
     std::env::var("MAX_WEBDAV_FILE_SIZE_BYTES")
         .ok()
@@ -3119,10 +3131,55 @@ where
                             ))
                         })?;
                         let mut limited_reader = std::io::Read::take(get_res, max_size + 1);
-                        let written =
-                            std::io::copy(&mut limited_reader, &mut dest_file).map_err(|e| {
-                                classify_io_error(&format!("streaming GET {download_url}"), &e)
-                            })?;
+                        // Manual copy loop: io::copy neither observes the
+                        // cancel flag nor any whole-body deadline, and each
+                        // blocking read gets a fresh 30s window from reqwest,
+                        // so a slow-drip body would hang the attempt forever.
+                        let body_deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(get_download_body_timeout_secs());
+                        let mut buffer = [0u8; 65536];
+                        let mut written: u64 = 0;
+                        loop {
+                            if cancel_flag.load(Ordering::SeqCst) {
+                                // The outer error path checks the flag again,
+                                // cleans the partial, and ends the operation
+                                // as a user cancellation.
+                                return Err(AttemptError::Fatal(
+                                    "Operation canceled by user.".to_string(),
+                                ));
+                            }
+                            if std::time::Instant::now() >= body_deadline {
+                                return Err(AttemptError::Fatal(format!(
+                                    "Download body exceeded the {}s time limit",
+                                    get_download_body_timeout_secs()
+                                )));
+                            }
+                            use std::io::Read as _;
+                            match limited_reader.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    dest_file
+                                        .write_all(&buffer[..n])
+                                        .map_err(|e| {
+                                            classify_io_error(
+                                                &format!("writing GET {download_url}"),
+                                                &e,
+                                            )
+                                        })?;
+                                    written += n as u64;
+                                    if written > max_size {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    return Err(classify_io_error(
+                                        &format!("streaming GET {download_url}"),
+                                        &e,
+                                    ))
+                                }
+                            }
+                        }
+                        use std::io::Write as _;
                         if written > max_size {
                             drop(dest_file);
                             let _ = std::fs::remove_file(&target_file);
