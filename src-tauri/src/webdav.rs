@@ -965,46 +965,63 @@ pub fn clear_remote_cache() -> Result<(), String> {
 /// listings default to UTF-8, and guessing a declared charset would hand
 /// the server influence over decoding, so exotic encodings fail loudly
 /// and the caller falls back (Depth: 1) or errors.
-static INFLIGHT_LISTING_BYTES: AtomicUsize = AtomicUsize::new(0);
+static INFLIGHT_LISTING_BYTES: Mutex<usize> = Mutex::new(0);
+static INFLIGHT_LISTING_ROOM: Condvar = Condvar::new();
+
+/// How long a scan worker parks waiting for in-flight listing capacity
+/// before failing closed: real listings cycle through the budget in
+/// milliseconds, so only a server keeping many worst-case bodies pinned
+/// (exactly the attack the budget bounds) can exhaust this.
+const INFLIGHT_LISTING_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// RAII proof that one listing body's worst-case bytes are inside the shared
-/// in-flight ceiling; dropping it returns the reservation.
+/// in-flight ceiling; dropping it returns the reservation and wakes a waiter.
 pub(crate) struct InflightListingGuard {
     reserved: usize,
 }
 
 impl Drop for InflightListingGuard {
     fn drop(&mut self) {
-        INFLIGHT_LISTING_BYTES.fetch_sub(self.reserved, Ordering::Release);
+        let mut current = INFLIGHT_LISTING_BYTES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *current = current.saturating_sub(self.reserved);
+        drop(current);
+        INFLIGHT_LISTING_ROOM.notify_all();
     }
 }
 
 /// Reserves one worst-case listing body against `MAX_INFLIGHT_LISTING_BYTES`,
 /// bounding the aggregate memory concurrent scan workers can pour into
-/// server-controlled listing bodies. Fails closed when the ceiling is hit:
-/// the caller's existing error handling then skips the directory or fails
-/// the action instead of buffering beyond the budget.
+/// server-controlled listing bodies. A worker that finds the ceiling full
+/// WAITS for another reservation to be released — legitimate scans at every
+/// thread count keep succeeding — and only fails closed after
+/// `INFLIGHT_LISTING_WAIT`, at which point the caller's existing error
+/// handling skips the directory or fails the action instead of buffering
+/// beyond the budget.
 fn reserve_inflight_listing() -> Result<InflightListingGuard, String> {
     let want = MAX_LISTING_BODY_BYTES as usize;
-    let mut current = INFLIGHT_LISTING_BYTES.load(Ordering::Acquire);
+    let deadline = std::time::Instant::now() + INFLIGHT_LISTING_WAIT;
+    let mut current = INFLIGHT_LISTING_BYTES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     loop {
-        let Some(next) = current.checked_add(want) else {
-            return Err("aggregate in-flight listing bytes overflow".to_string());
-        };
-        if next > MAX_INFLIGHT_LISTING_BYTES {
+        if let Some(next) = current.checked_add(want) {
+            if next <= MAX_INFLIGHT_LISTING_BYTES {
+                *current = next;
+                return Ok(InflightListingGuard { reserved: want });
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
             return Err(format!(
-                "aggregate in-flight listing bytes would exceed {MAX_INFLIGHT_LISTING_BYTES}; too many concurrent listing bodies"
+                "aggregate in-flight listing bytes stayed above {MAX_INFLIGHT_LISTING_BYTES} for {INFLIGHT_LISTING_WAIT:?}; too many pinned listing bodies"
             ));
         }
-        match INFLIGHT_LISTING_BYTES.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Ok(InflightListingGuard { reserved: want }),
-            Err(observed) => current = observed,
-        }
+        let (guard, _timeout) = INFLIGHT_LISTING_ROOM
+            .wait_timeout(current, deadline - now)
+            .unwrap_or_else(|p| p.into_inner());
+        current = guard;
     }
 }
 
