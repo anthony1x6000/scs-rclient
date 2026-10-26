@@ -1148,10 +1148,6 @@ pub fn is_safe_relative_path(path: &str) -> bool {
 fn create_unique_part_file(target: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
     use std::hash::{BuildHasher, Hasher};
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    let file_stem = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("download");
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for attempt in 0..64u64 {
         let mut noise = std::time::SystemTime::now()
@@ -1167,21 +1163,62 @@ fn create_unique_part_file(target: &Path) -> std::io::Result<(std::fs::File, Pat
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (attempt << 32);
-        let candidate = dir.join(format!(".{file_stem}.{noise:016x}.scs-part"));
-        match std::fs::OpenOptions::new()
+        // Fixed-form, target-independent name: embedding the target name
+        // would push long (valid) targets past the filesystem component
+        // limit, and the noise alone is both the uniqueness and the
+        // unguessability.
+        let candidate = dir.join(format!(".scs-part-{noise:016x}"));
+        let file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&candidate)
         {
-            Ok(file) => return Ok((file, candidate)),
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
+        };
+        // Restrictive permissions from the very first byte: default umask
+        // would leave the partial body readable by other local users for
+        // the whole transfer. On Unix the prior target's mode (when it
+        // exists) is applied instead, so the replace also preserves it.
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(target)
+                .map(|m| m.permissions())
+                .unwrap_or_else(|_| {
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600)
+                });
+            file.set_permissions(mode).map_err(|e| {
+                let _ = std::fs::remove_file(&candidate);
+                e
+            })?;
         }
+        #[cfg(not(unix))]
+        {
+            // Windows: std permissions only carry the read-only bit; the
+            // temp is created writable so the replace below cannot strand a
+            // read-only partial, and ACLs were never copied by std anyway.
+            let _ = target;
+        }
+        return Ok((file, candidate));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         "no unique temporary sibling available after 64 attempts",
     ))
+}
+
+/// Removes a partial temp file this call created, coping with a temp that
+/// ended up read-only (a read-only bit blocks deletion on Windows).
+fn remove_part_file(temp: &Path) {
+    if std::fs::remove_file(temp).is_err() {
+        let mut perms = std::fs::metadata(temp).map(|m| m.permissions());
+        if let Ok(p) = &mut perms {
+            p.set_readonly(false);
+            let _ = std::fs::set_permissions(temp, p.clone());
+        }
+        let _ = std::fs::remove_file(temp);
+    }
 }
 
 /// Safely joins a relative path to a base directory, rejecting any path traversal attempts.
@@ -3628,14 +3665,14 @@ where
                                 // and ends the operation as a user
                                 // cancellation; this exit owns the temp file.
                                 drop(dest_file);
-                                let _ = std::fs::remove_file(&temp_file);
+                                remove_part_file(&temp_file);
                                 return Err(AttemptError::Fatal(
                                     "Operation canceled by user.".to_string(),
                                 ));
                             }
                             if std::time::Instant::now() >= body_deadline {
                                 drop(dest_file);
-                                let _ = std::fs::remove_file(&temp_file);
+                                remove_part_file(&temp_file);
                                 return Err(AttemptError::Fatal(format!(
                                     "Download body exceeded the {}s time limit",
                                     get_download_body_timeout_secs()
@@ -3649,7 +3686,7 @@ where
                                         // Close before remove so Windows can
                                         // delete this call's own temp file.
                                         drop(dest_file);
-                                        let _ = std::fs::remove_file(&temp_file);
+                                        remove_part_file(&temp_file);
                                         return Err(classify_io_error(
                                             &format!("writing GET {download_url}"),
                                             &e,
@@ -3666,7 +3703,7 @@ where
                                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                                 Err(e) => {
                                     drop(dest_file);
-                                    let _ = std::fs::remove_file(&temp_file);
+                                    remove_part_file(&temp_file);
                                     return Err(classify_io_error(
                                         &format!("streaming GET {download_url}"),
                                         &e,
@@ -3677,17 +3714,11 @@ where
                         use std::io::Write as _;
                         if written > max_size {
                             drop(dest_file);
-                            let _ = std::fs::remove_file(&temp_file);
+                            remove_part_file(&temp_file);
                             return Err(AttemptError::Fatal(format!(
                                 "Downloaded file exceeded the maximum size limit ({} bytes > {} bytes)",
                                 written, max_size
                             )));
-                        }
-                        // Keep the prior file's mode/ACLs across the replace:
-                        // the temp was created with default permissions,
-                        // which would otherwise widen a private file.
-                        if let Ok(prior) = std::fs::metadata(&target_file) {
-                            let _ = std::fs::set_permissions(&temp_file, prior.permissions());
                         }
                         // Atomic replace: the destination is only ever touched
                         // with a complete, size-checked body. std's rename
@@ -3695,7 +3726,7 @@ where
                         // well (MoveFileExW with MOVEFILE_REPLACE_EXISTING).
                         drop(dest_file);
                         std::fs::rename(&temp_file, &target_file).map_err(|e| {
-                            let _ = std::fs::remove_file(&temp_file);
+                            remove_part_file(&temp_file);
                             AttemptError::Fatal(format!(
                                 "Failed to finalize {}: {}",
                                 target_file.display(),
@@ -5035,7 +5066,7 @@ mod tests {
         let computed = compute_file_sha256(&temp_file).unwrap();
         let direct = compute_sha256(b"test payload for streaming sha256");
         assert_eq!(computed, direct);
-        let _ = std::fs::remove_file(&temp_file);
+        remove_part_file(&temp_file);
     }
 
     #[test]
