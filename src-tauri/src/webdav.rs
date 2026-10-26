@@ -485,7 +485,18 @@ pub fn has_traversal_sequence(s: &str) -> bool {
 /// Cache keys include the authenticated username when available (`username@clean_url`) to prevent
 /// cache collisions across different user credentials accessing the same WebDAV host (CWE-287 / CWE-384).
 pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
-    let clean_url = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    // Fold case only where the URL grammar is case-insensitive (scheme,
+    // host); the path selects the collection and is case-sensitive
+    // (RFC 3986 6.2.2.1), so /dav/A/ and /dav/a/ must keep distinct keys.
+    let clean_url = match reqwest::Url::parse(remote_url) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+            let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+            let trimmed_path = url.path().trim_end_matches('/');
+            format!("{}://{}{}{}", url.scheme(), host, port, trimmed_path)
+        }
+        Err(_) => remote_url.trim_end_matches('/').to_string(),
+    };
     match auth_user {
         Some(user) if !user.trim().is_empty() => {
             format!("{}@{}", user.trim().to_ascii_lowercase(), clean_url)
@@ -674,7 +685,12 @@ pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Ve
     let path = get_cache_file_path()?;
     let cache = read_cache_map(&path);
     let key = cache_key(remote_url, auth_user);
-    let entry = cache.get(&key)?;
+    let entry = cache.get(&key).filter(|entry| {
+        // Key equality is necessary but not sufficient: the stored exact-case
+        // URL must match the requested collection as well, so no entry can
+        // ever be served for a different collection.
+        entry.remote_url.trim_end_matches('/') == remote_url.trim_end_matches('/')
+    })?;
 
     let ttl = get_cache_ttl_secs();
     if ttl > 0 {
