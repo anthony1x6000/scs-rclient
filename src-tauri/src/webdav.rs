@@ -3544,12 +3544,20 @@ where
                                 "GET {download_url} returned HTTP {status}"
                             )));
                         }
-                        // Recreate the file on every attempt so a retried download never appends
-                        // to bytes left behind by a timed-out body stream.
-                        let mut dest_file = std::fs::File::create(&target_file).map_err(|e| {
+                        // Stream to a temporary sibling and replace the destination
+                        // only after the body completed: File::create would
+                        // truncate the user's existing copy before the first
+                        // body byte arrives, and the failure path used to
+                        // delete that truncated remnant — a hostile or flaky
+                        // server could destroy prior local versions.
+                        let temp_file = target_file.with_extension(format!(
+                            "scs-part-{}",
+                            std::process::id()
+                        ));
+                        let mut dest_file = std::fs::File::create(&temp_file).map_err(|e| {
                             AttemptError::Fatal(format!(
                                 "Failed to create {}: {}",
-                                target_file.display(),
+                                temp_file.display(),
                                 e
                             ))
                         })?;
@@ -3612,19 +3620,37 @@ where
                         use std::io::Write as _;
                         if written > max_size {
                             drop(dest_file);
-                            let _ = std::fs::remove_file(&target_file);
+                            let _ = std::fs::remove_file(&temp_file);
                             return Err(AttemptError::Fatal(format!(
                                 "Downloaded file exceeded the maximum size limit ({} bytes > {} bytes)",
                                 written, max_size
                             )));
                         }
+                        // Atomic replace: the destination is only ever touched
+                        // with a complete, size-checked body.
+                        drop(dest_file);
+                        std::fs::rename(&temp_file, &target_file).map_err(|e| {
+                            let _ = std::fs::remove_file(&temp_file);
+                            AttemptError::Fatal(format!(
+                                "Failed to finalize {}: {}",
+                                target_file.display(),
+                                e
+                            ))
+                        })?;
                         Ok(written)
                     },
                 );
                 let downloaded_len = match download_result {
                     Ok(len) => len,
                     Err(e) => {
-                        // Never leave a truncated partial behind after the final attempt.
+                        // Never leave a truncated partial behind after the final attempt
+                        // (the partial lives in the temp sibling; the destination was
+                        // never touched).
+                        let temp_file = target_file.with_extension(format!(
+                            "scs-part-{}",
+                            std::process::id()
+                        ));
+                        let _ = std::fs::remove_file(&temp_file);
                         if let Err(remove_err) = std::fs::remove_file(&target_file) {
                             if remove_err.kind() != std::io::ErrorKind::NotFound {
                                 log(&format!(
