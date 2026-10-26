@@ -13,12 +13,17 @@ export function normalizeUrl(url: string): string {
  * Normalizes a subdirectory path by trimming whitespace, leading slashes, and trailing slashes.
  * Rejects `.` / `..` segments and backslash separators to prevent scope escape.
  */
+/** WHATWG dot-segment spellings the URL parser collapses into parent pops. */
+const DOT_SEGMENT = /^(\.|\.\.|%2e|\.%2e|%2e\.|%2e%2e)$/i;
+/** Control characters never valid in a folder name handed to the backend. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
 export function normalizeSubdir(subdir: string): string {
   const trimmed = subdir.trim().replace(/\\/g, "/");
   const parts = trimmed.split("/").filter((p) => p.length > 0);
   for (const part of parts) {
-    if (part === "." || part === "..") {
-      throw new Error(`Invalid subdirectory "${subdir}": "." and ".." segments are not allowed.`);
+    if (part === "." || part === ".." || DOT_SEGMENT.test(part) || CONTROL_CHARS.test(part)) {
+      throw new Error(`Invalid subdirectory "${subdir}": dot segments, encoded dot segments, and control characters are not allowed.`);
     }
   }
   return parts.join("/");

@@ -1414,9 +1414,43 @@ pub(crate) fn insecure_webdav_allowed() -> bool {
     cfg!(test) || std::env::var("ALLOW_INSECURE_WEBDAV").as_deref() == Ok("1")
 }
 
+/// Path-segment spellings the WHATWG URL parser collapses into dot segments
+/// (`.` removed, `..` pops the parent) even though they contain no literal
+/// `.` component: `%2e`, `.%2e`, `%2e.`, `%2e%2e` (ASCII case-insensitive).
+/// Popping happens inside `Url::parse`, i.e. after this guard, so a raw-string
+/// check is the only place the user-configured scope can be held to.
+fn has_url_dot_segment(raw: &str) -> bool {
+    let after_scheme = match raw.split_once("://") {
+        Some((_, rest)) => rest,
+        None => raw,
+    };
+    let path_start = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let path_and_rest = &after_scheme[path_start..];
+    let path = path_and_rest
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+    path.split(['/', '\\']).any(|seg| {
+        let s = seg.to_ascii_lowercase();
+        matches!(s.as_str(), "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e")
+    })
+}
+
 pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Result<(), String> {
     let url = reqwest::Url::parse(url_str)
         .map_err(|e| format!("Invalid WebDAV URL: {}", e))?;
+
+    // Reject dot-segment spellings in their raw form: `Url::parse` collapses
+    // `..`/`.%2e`/`%2e.`/`%2e%2e` path segments (and drops `%2e`), silently
+    // shifting the effective remote scope above the configured base path.
+    if has_url_dot_segment(url_str) {
+        return Err(
+            "URL path contains a dot-segment ('.', '..' or percent-encoded form) that would resolve above the configured directory."
+                .to_string(),
+        );
+    }
 
     // Reject credentials embedded in the URL itself (https://user:pass@host/):
     // the password would be persisted verbatim in the settings store, echoed
