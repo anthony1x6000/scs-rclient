@@ -5082,18 +5082,29 @@ mod tests {
         // The per-body cap alone would let MAX_SCAN_CONCURRENCY workers each
         // buffer a full MAX_LISTING_BODY_BYTES body (~4 GiB aggregate) before
         // any aggregate check runs: every listing read reserves its worst
-        // case against a shared ceiling and fails closed beyond it.
-        let mut held: Vec<InflightListingGuard> = Vec::new();
+        // case against a shared ceiling. A worker that finds the ceiling
+        // full WAITS for capacity (scans at every thread count must still
+        // succeed) and only fails closed once the wait budget is exhausted.
         let max_guards = MAX_INFLIGHT_LISTING_BYTES / MAX_LISTING_BODY_BYTES as usize;
+        let mut held: Vec<InflightListingGuard> = Vec::new();
         for _ in 0..max_guards {
             held.push(
                 reserve_inflight_listing()
                     .expect("reservation within the ceiling must succeed"),
             );
         }
+        // Ceiling full: a waiter must park instead of failing or overbooking.
+        let waiter = std::thread::spawn(|| reserve_inflight_listing().is_ok());
+        std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
-            reserve_inflight_listing().is_err(),
-            "beyond the shared ceiling the reservation must fail closed"
+            !waiter.is_finished(),
+            "a waiter must block while the ceiling is full"
+        );
+        // Releasing one reservation must admit the waiter.
+        drop(held.pop().expect("guards held"));
+        assert!(
+            waiter.join().expect("waiter must not panic"),
+            "the waiter must acquire after a release"
         );
         drop(held);
         assert!(
