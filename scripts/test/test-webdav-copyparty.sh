@@ -121,6 +121,9 @@ echo "  - Rejects 'Depth: infinity' with HTTP 403 Forbidden"
 echo "  - Wraps PROPFIND hrefs with <d:href><![CDATA[...]]></d:href>"
 
 export TEST_WEBDAV_URL="http://127.0.0.1:$PROXY_PORT/$COURSE_DIR/"
+# The explicit override is what authorizes cleartext loopback WebDAV in the
+# library; TEST_WEBDAV_URL alone no longer disables the production guard.
+export ALLOW_INSECURE_WEBDAV="1"
 export TEST_WEBDAV_USER="testuser"
 export TEST_WEBDAV_PASS="testpass"
 
@@ -128,6 +131,6 @@ echo "=== Running WebDAV lib unit tests ==="
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --nocapture
 
 echo "=== Running WebDAV integration, roundtrip, and live concurrency tests against simulated D2L endpoint ==="
-cargo test --manifest-path src-tauri/Cargo.toml --test webdav_e2e --test live_concurrency -- --nocapture --test-threads=1
+cargo test --manifest-path src-tauri/Cargo.toml --test webdav_e2e --test live_concurrency --test insecure_mode_env -- --nocapture --test-threads=1
 
 echo "✓ All WebDAV tests passed successfully against D2L simulation setup!"
