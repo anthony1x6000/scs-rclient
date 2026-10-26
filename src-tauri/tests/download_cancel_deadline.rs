@@ -10,6 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Both tests below mutate process-global env vars (`ALLOW_INSECURE_WEBDAV`,
+/// the body-timeout override); this guard self-serializes them so cargo
+/// test's parallel harness cannot interleave one test's env with the other's.
+static ENV_GUARD: Mutex<()> = Mutex::new(());
+
 fn start_drip_server() -> (u16, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -63,6 +68,7 @@ fn start_drip_server() -> (u16, Arc<AtomicBool>) {
 
 #[test]
 fn test_cancel_interrupts_dripping_download_body() {
+    let _env_guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     std::env::set_var("ALLOW_INSECURE_WEBDAV", "1");
     std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
 
@@ -73,14 +79,12 @@ fn test_cancel_interrupts_dripping_download_body() {
     std::fs::create_dir_all(&local_dir).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_thread = cancel.clone();
-    let started = Arc::new(Mutex::new(false));
-    let started_for_thread = started.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(2));
-        *started_for_thread.lock().unwrap() = true;
         cancel_for_thread.store(true, Ordering::SeqCst);
     });
 
+    let test_started = Instant::now();
     let mut logs = Vec::new();
     let result = execute_webdav_action_with_exclusions(
         &client,
@@ -93,12 +97,17 @@ fn test_cancel_interrupts_dripping_download_body() {
         &[],
         |m: &str| logs.push(m.to_string()),
     );
+    let elapsed = test_started.elapsed();
     let elapsed_ok = result.is_ok();
     stop.store(true, Ordering::SeqCst);
     let _ = std::fs::remove_dir_all(&local_dir);
     std::env::remove_var("ALLOW_INSECURE_WEBDAV");
 
     assert!(elapsed_ok, "action must terminate after cancel: {result:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cancel at t=2s must interrupt the in-flight transfer promptly, took {elapsed:?}"
+    );
     assert!(
         logs.iter().any(|l| l.contains("canceled") || l.contains("canceled by user")),
         "expected a cancellation log line, got: {logs:?}"
@@ -107,6 +116,7 @@ fn test_cancel_interrupts_dripping_download_body() {
 
 #[test]
 fn test_body_deadline_stops_dripping_download() {
+    let _env_guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     std::env::set_var("ALLOW_INSECURE_WEBDAV", "1");
     std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
     // 1s whole-body budget against a body that drips forever otherwise: the

@@ -4389,5 +4389,24 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_download_body_timeout_clamps_instead_of_overflowing() {
+        // A huge configured deadline must clamp to a sane maximum
+        // (DOWNLOAD_BODY_TIMEOUT_MAX_SECS, one day) instead of reaching the
+        // copy loop, where `Instant::now() + Duration::from_secs(u64::MAX)`
+        // would panic on overflow.
+        std::env::set_var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS", "18446744073709551615");
+        let configured = get_download_body_timeout_secs();
+        std::env::remove_var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS");
+        assert!(
+            configured <= 86_400,
+            "configured deadline must clamp to one day, got {configured}"
+        );
+        // The clamped ceiling must stay panic-free in deadline arithmetic.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(configured.max(1));
+        assert!(deadline > std::time::Instant::now());
+    }
 }
 
