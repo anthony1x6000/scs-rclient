@@ -1,5 +1,23 @@
 import { load, type Store } from "@tauri-apps/plugin-store";
 import type { BulkPreset } from "./bulkPresets";
+import {
+  excludedFoldersFor,
+  exclusionScopeKey,
+  normalizeExcludedFolders,
+  parseExcludedFoldersMap,
+  type ExcludedFoldersByDir,
+} from "./exclusions";
+
+// Re-exported for existing consumers; the logic lives in the pure `exclusions` module.
+export {
+  normalizeExcludedFolder,
+  normalizeExcludedFolders,
+  excludedFoldersFor,
+  exclusionScopeKey,
+  MAX_EXCLUDED_FOLDERS,
+  MAX_EXCLUDED_FOLDER_LENGTH,
+} from "./exclusions";
+export type { ExcludedFoldersByDir } from "./exclusions";
 
 export const SETTINGS_FILE = "settings.json";
 
@@ -19,10 +37,6 @@ export const STORE_KEYS = {
 export const DEFAULT_SCAN_CONCURRENCY = 6;
 export const MIN_SCAN_CONCURRENCY = 1;
 export const MAX_SCAN_CONCURRENCY = 64;
-
-/** Upper bounds shared with the Rust-side normalization so the UI and backend agree. */
-export const MAX_EXCLUDED_FOLDERS = 64;
-export const MAX_EXCLUDED_FOLDER_LENGTH = 256;
 
 interface WrappedValue<T> {
   value: T;
@@ -186,49 +200,21 @@ export async function setScanConcurrency(threads: number): Promise<void> {
   await setWrapped(STORE_KEYS.scanConcurrency, clamped);
 }
 
-/**
- * Normalizes a user-supplied excluded folder into a slash-separated relative path.
- * Leading/trailing slashes, `.` segments, backslashes, and repeated separators are
- * dropped, so `.git/`, `/.git`, and `.git` all become `.git`. Returns null for empty
- * input, `..` escapes, control characters, or over-long patterns. Matching itself happens
- * in Rust.
- */
-export function normalizeExcludedFolder(raw: string): string | null {
-  const parts = raw
-    .trim()
-    .replace(/\\/g, "/")
-    .split("/")
-    .filter((part) => part.length > 0 && part !== ".");
-  if (parts.some((part) => part === ".." || /[\u0000-\u001f\u007f]/.test(part))) return null;
-  const normalized = parts.join("/");
-  if (!normalized || normalized.length > MAX_EXCLUDED_FOLDER_LENGTH) return null;
-  return normalized;
-}
-
-/** Normalizes, drops invalid entries, and deduplicates exclusion patterns in order. */
-export function normalizeExcludedFolders(raw: readonly string[]): string[] {
-  const seen = new Set<string>();
-  const normalized: string[] = [];
-  for (const entry of raw) {
-    if (normalized.length >= MAX_EXCLUDED_FOLDERS) break;
-    if (typeof entry !== "string") continue;
-    const folder = normalizeExcludedFolder(entry);
-    if (!folder || seen.has(folder)) continue;
-    seen.add(folder);
-    normalized.push(folder);
-  }
-  return normalized;
-}
-
-/** Folders skipped by local and remote scanning for uploads and downloads. */
-export async function getExcludedFolders(): Promise<string[]> {
+/** Legacy pre-scope values were a flat array; they start fresh under the per-dir map. */
+async function getExcludedFoldersMap(): Promise<ExcludedFoldersByDir> {
   const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
-  if (!Array.isArray(stored)) return [];
-  return normalizeExcludedFolders(stored.filter((entry): entry is string => typeof entry === "string"));
+  return parseExcludedFoldersMap(stored);
 }
 
-export async function setExcludedFolders(folders: readonly string[]): Promise<void> {
-  await setWrapped(STORE_KEYS.excludedFolders, normalizeExcludedFolders(folders));
+/** Folders skipped by local and remote scanning of `subdir` (patterns relative to it). */
+export async function getExcludedFolders(subdir: string): Promise<string[]> {
+  return excludedFoldersFor(await getExcludedFoldersMap(), subdir);
+}
+
+export async function setExcludedFolders(subdir: string, folders: readonly string[]): Promise<void> {
+  const byDir = await getExcludedFoldersMap();
+  byDir[exclusionScopeKey(subdir)] = normalizeExcludedFolders(folders);
+  await setWrapped(STORE_KEYS.excludedFolders, byDir);
 }
 
 /** Load the independent settings reads in parallel (no sequential waterfall). */
@@ -238,18 +224,18 @@ export async function loadAppSettings(): Promise<{
   targetSubdir: string;
   username: string;
   scanConcurrency: number;
-  excludedFolders: string[];
+  excludedFoldersByDir: ExcludedFoldersByDir;
 }> {
-  const [baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency, excludedFolders] =
+  const [baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency, excludedFoldersByDir] =
     await Promise.all([
       getWebDAVBase(),
       getSelectedSubdir(),
       getTargetSubdir(),
       getSavedUsername(),
       getScanConcurrency(),
-      getExcludedFolders(),
+      getExcludedFoldersMap(),
     ]);
-  return { baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency, excludedFolders };
+  return { baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency, excludedFoldersByDir };
 }
 
 /**

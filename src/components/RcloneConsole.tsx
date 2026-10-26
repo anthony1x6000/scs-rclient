@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useLayoutEffect } from "react";
 import ExcludeFolders from "./ExcludeFolders";
+import ExcludeFolderSelect from "./ExcludeFolderSelect";
 
 interface RcloneConsoleProps {
   logs: string;
@@ -13,6 +14,7 @@ export function RcloneConsole({ logs, onClear, onOpenFolder }: RcloneConsoleProp
   const [follow, setFollow] = useState(true);
   const [copied, setCopied] = useState(false);
   const [showExcludeFolders, setShowExcludeFolders] = useState(false);
+  const [showExcludeFolderSelect, setShowExcludeFolderSelect] = useState(false);
   const [hasOverflow, setHasOverflow] = useState(false);
   const [atTop, setAtTop] = useState(true);
   const [atBottom, setAtBottom] = useState(true);
@@ -110,8 +112,18 @@ export function RcloneConsole({ logs, onClear, onOpenFolder }: RcloneConsoleProp
         >
           Exclude folder
         </button>
+        <button
+          type="button"
+          onClick={() => setShowExcludeFolderSelect((open) => !open)}
+          aria-expanded={showExcludeFolderSelect}
+          aria-controls="scs-exclude-folder-select"
+          className={`px-2 py-1 border bg-transparent text-white cursor-pointer transition-all duration-150 ${showExcludeFolderSelect ? "border-white/60" : "border-white/20 hover:border-white/50"}`}
+        >
+          Exclude folder select
+        </button>
       </div>
       {showExcludeFolders && <ExcludeFolders />}
+      {showExcludeFolderSelect && <ExcludeFolderSelect />}
       <label className="sr-only" htmlFor="scs-console">WebDAV console output</label>
       <div ref={wrapRef} className="relative flex-1 min-h-0 flex flex-col overflow-hidden px-2 pb-1">
         {/* top fade */}

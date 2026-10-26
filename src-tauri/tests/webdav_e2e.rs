@@ -1,10 +1,11 @@
 use scs_rclient_lib::dav_client::Client;
 use scs_rclient_lib::webdav::{
     build_file_url, collect_local_files, collect_local_files_excluding, compute_sha256,
-    execute_webdav_action, execute_webdav_action_with_exclusions, list_remote_recursive,
-    list_remote_recursive_with_exclusions_and_log, list_remote_recursive_with_options_and_log,
-    normalize_exclude_folders, parse_propfind_xml, parse_webdav_date, relative_item_path,
-    resolve_item_url, should_download_file, should_upload_file, verify_webdav_auth,
+    ensure_remote_parent_dirs, execute_webdav_action, execute_webdav_action_with_exclusions,
+    list_remote_folders, list_remote_recursive, list_remote_recursive_with_exclusions_and_log,
+    list_remote_recursive_with_options_and_log, normalize_exclude_folders, parse_propfind_xml,
+    parse_webdav_date, relative_item_path, resolve_item_url, should_download_file,
+    should_upload_file, verify_webdav_auth,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -2503,4 +2504,74 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
     is_running.store(false, Ordering::SeqCst);
     let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
     let _ = server_handle.join();
+}
+
+/// The folder picker must surface every remote folder with the total size of the
+/// files beneath it: nested sums credit every ancestor, loose root files count
+/// only toward the root, and the result is sorted with the root first.
+#[test]
+fn test_live_list_remote_folders_aggregates_sizes() {
+    let base_url = match std::env::var("TEST_WEBDAV_URL") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            eprintln!("SKIPPED: TEST_WEBDAV_URL not set; skipping live folder listing test.");
+            return;
+        }
+    };
+    let username = std::env::var("TEST_WEBDAV_USER").unwrap_or_else(|_| "testuser".to_string());
+    let password = std::env::var("TEST_WEBDAV_PASS").unwrap_or_else(|_| "testpass".to_string());
+
+    let cancel_flag = AtomicBool::new(false);
+    let client = Client::init(&username, &password, &base_url).expect("client init");
+
+    // Unique subtree so parallel tests cannot collide.
+    let unique = format!(
+        "folders-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let root_url = format!("{base_url}{unique}/");
+
+    // Layout (sizes in bytes):
+    //   a/b/f1.bin 10   -> a = 15, a/b = 10
+    //   a/f2.bin   5
+    //   root.txt   3    -> root = 18
+    let uploads: [(&str, &[u8]); 3] = [
+        ("a/b/f1.bin", &[0u8; 10]),
+        ("a/f2.bin", &[0u8; 5]),
+        ("root.txt", &[0u8; 3]),
+    ];
+    for (rel, bytes) in uploads {
+        ensure_remote_parent_dirs(&client, &root_url, rel, &cancel_flag, &mut |_| {}).expect("mkcol");
+        let put = client
+            .put(bytes.to_vec(), &build_file_url(&root_url, rel))
+            .expect("PUT failed");
+        assert!(
+            put.status().is_success(),
+            "PUT {} returned HTTP {}",
+            rel,
+            put.status()
+        );
+    }
+
+    let folders =
+        list_remote_folders(&client, &root_url, &cancel_flag, None, None, |_| {})
+            .expect("folder listing failed");
+    let by_path: Vec<(String, u64)> = folders
+        .into_iter()
+        .map(|f| (f.path, f.size))
+        .collect();
+    assert_eq!(
+        by_path,
+        vec![
+            (String::new(), 18),
+            ("a".to_string(), 15),
+            ("a/b".to_string(), 10),
+        ]
+    );
+
+    remove_remote_tree(&client, &root_url, &cancel_flag);
 }

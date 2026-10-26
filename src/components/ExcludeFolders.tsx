@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   getExcludedFolders,
   setExcludedFolders,
+  getSelectedSubdir,
   normalizeExcludedFolder,
   MAX_EXCLUDED_FOLDERS,
 } from "../settings";
@@ -9,8 +10,8 @@ import TextInput from "./TextInput";
 
 /**
  * Editor for the persisted list of folders that scan/transfer actions must skip.
- * Patterns are stored relative to the selected remote subdirectory and applied by
- * the Rust backend to both local walks and remote listings.
+ * Patterns are stored per selected remote subdirectory — relative to it — and
+ * applied by the Rust backend to both local walks and remote listings.
  */
 export function ExcludeFolders() {
   const [folders, setFolders] = useState<string[]>([]);
@@ -19,10 +20,15 @@ export function ExcludeFolders() {
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const activeRef = useRef(true);
+  const subdirRef = useRef("");
 
   useEffect(() => {
     activeRef.current = true;
-    getExcludedFolders()
+    getSelectedSubdir()
+      .then((subdir) => {
+        subdirRef.current = subdir;
+        return getExcludedFolders(subdir);
+      })
       .then((stored) => {
         if (activeRef.current) setFolders(stored);
       })
@@ -43,7 +49,7 @@ export function ExcludeFolders() {
     setFolders(next);
     setSaving(true);
     try {
-      await setExcludedFolders(next);
+      await setExcludedFolders(subdirRef.current, next);
       setError(null);
     } catch (e) {
       console.error("Failed to save excluded folders:", e);
@@ -119,7 +125,8 @@ export function ExcludeFolders() {
       >
         Excluded folders are not scanned, uploaded, downloaded, or deleted by sync.
         A name like <code>.git/</code> matches at any depth; a path like{" "}
-        <code>assets/cache</code> matches that relative folder.
+        <code>assets/cache</code> matches that relative folder. Saved for the
+        selected remote directory.
       </p>
       {error && (
         <p role="alert" className="mt-1 text-red-300">

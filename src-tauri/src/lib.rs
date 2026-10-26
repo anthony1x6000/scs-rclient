@@ -310,6 +310,46 @@ fn clear_webdav_cache() -> Result<(), String> {
     webdav::clear_remote_cache()
 }
 
+/// Lists every folder beneath the remote directory `subdir`, each with the total
+/// size of the files beneath it (PROPFIND metadata only — no downloads).
+///
+/// Powers the "Exclude folder select" picker. Uses its own cancel flag so
+/// opening the picker never resets cancellation of a running action.
+#[tauri::command]
+async fn list_remote_folders(
+    base_url: String,
+    subdir: String,
+    username: Option<String>,
+    concurrency: Option<usize>,
+) -> Result<Vec<webdav::RemoteFolder>, String> {
+    let remote_url = webdav::build_remote_url(&base_url, &subdir);
+    webdav::validate_webdav_url(&remote_url)?;
+
+    let (user, pass) = if let Some(u) = username.filter(|u| !u.trim().is_empty()) {
+        let p = get_credentials(u.clone()).unwrap_or_default();
+        (u, p)
+    } else {
+        (String::new(), String::new())
+    };
+    let auth_user = if user.is_empty() { None } else { Some(user.clone()) };
+
+    let client = dav_client::Client::init(&user, &pass, &remote_url)?;
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    tauri::async_runtime::spawn_blocking(move || {
+        webdav::list_remote_folders(
+            &client,
+            &remote_url,
+            &cancel_flag,
+            concurrency,
+            auth_user.as_deref(),
+            |_| {},
+        )
+    })
+    .await
+    .map_err(|e| format!("Task execution error: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -366,6 +406,7 @@ pub fn run() {
             cancel_webdav_action,
             set_scan_concurrency,
             run_webdav_action,
+            list_remote_folders,
             clear_webdav_cache
         ])
         .run(tauri::generate_context!())
