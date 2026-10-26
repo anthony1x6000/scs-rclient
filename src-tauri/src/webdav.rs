@@ -4282,11 +4282,14 @@ mod tests {
         assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/notes/a.txt").is_ok());
         assert!(guard_server_derived_url(base, "https://h.example:443/content/enforced/COURSE123/a.txt").is_ok());
         assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/my%20file.txt").is_ok());
-        // Origin-root collection contains every traversal-free path on the origin.
+        // Origin-root collection contains every traversal-free path on the
+        // origin. (A bare /%2e%2e/ segment is already collapsed by URL
+        // parsing itself; boundary-shifting separators inside one segment
+        // are what this guard must still catch.)
         assert!(guard_server_derived_url("https://h.example/", "https://h.example/any/path.txt").is_ok());
         assert!(
-            guard_server_derived_url("https://h.example/", "https://h.example/any/%2e%2e/other.txt").is_err(),
-            "traversal is refused even for origin-root collections"
+            guard_server_derived_url("https://h.example/", "https://h.example/any/course%2F..%2Fother.txt").is_err(),
+            "encoded-separator traversal is refused even for origin-root collections"
         );
     }
 
