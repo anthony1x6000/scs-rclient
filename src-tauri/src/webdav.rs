@@ -489,12 +489,17 @@ pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
     // Fold case only where the URL grammar is case-insensitive (scheme,
     // host); the path selects the collection and is case-sensitive
     // (RFC 3986 6.2.2.1), so /dav/A/ and /dav/a/ must keep distinct keys.
+    // The query selects the collection on query-aware endpoints (share
+    // tokens, tenants), so it partitions the key exactly as sent. URL
+    // userinfo never reaches here: validate_webdav_url_internal rejects
+    // credentials embedded in the URL before any client exists.
     let clean_url = match reqwest::Url::parse(remote_url) {
         Ok(url) => {
             let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
             let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
             let trimmed_path = url.path().trim_end_matches('/');
-            format!("{}://{}{}{}", url.scheme(), host, port, trimmed_path)
+            let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+            format!("{}://{}{}{}{}", url.scheme(), host, port, trimmed_path, query)
         }
         Err(_) => remote_url.trim_end_matches('/').to_string(),
     };
@@ -704,13 +709,17 @@ pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Ve
     })?;
 
 /// Equality modulo the case-insensitive parts of the URL grammar: scheme and
-/// host compare case-insensitively; path (and query) compare exactly.
+/// host compare case-insensitively; path (modulo insignificant trailing
+/// slashes, matching the key) and query compare exactly.
 fn url_same_collection(a: &str, b: &str) -> bool {
     match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
         (Ok(a), Ok(b)) => {
             let host_a = a.host_str().unwrap_or_default().to_ascii_lowercase();
             let host_b = b.host_str().unwrap_or_default().to_ascii_lowercase();
-            a.scheme() == b.scheme() && host_a == host_b && a.path() == b.path()
+            a.scheme() == b.scheme()
+                && host_a == host_b
+                && a.path().trim_end_matches('/') == b.path().trim_end_matches('/')
+                && a.query() == b.query()
         }
         // Unparseable stored entries never match a parseable request.
         (Err(_), Err(_)) => a.trim_end_matches('/') == b.trim_end_matches('/'),
@@ -4604,7 +4613,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn test_relative_item_path_multibyte_char_boundary_is_panic_free() {
         // decode_percent turns server hrefs into multi-byte UTF-8; splitting
         // the item path at the byte length of the base path must never land
@@ -4619,7 +4627,9 @@ mod tests {
             let item = format!("/{}%C3%A9x", "a".repeat(n));
             let _ = relative_item_path(base, &item);
         }
-=======
+    }
+
+    #[test]
     fn test_cache_key_does_not_fold_url_path_case() {
         // URL paths are case-sensitive (RFC 3986 6.2.2.1): two collections
         // differing only in path case are distinct remotes and must never
@@ -4639,7 +4649,6 @@ mod tests {
             cache_key("https://h.example/dav/A/", Some("u")),
             cache_key("https://H.example/dav/a/", Some("u"))
         );
->>>>>>> b374dce (test(security): cache keys must not fold URL path case)
     }
 
     #[test]
@@ -4875,6 +4884,21 @@ mod tests {
             )
             .is_err(),
             "a second root after the closed multistatus must be an error"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_keeps_query_distinct() {
+        // Queries select distinct collections on query-aware WebDAV
+        // endpoints (share tokens, tenants), so they must partition the
+        // key; the path's insignificant trailing slash must not.
+        assert_ne!(
+            cache_key("https://h.example/dav?share=a", Some("u")),
+            cache_key("https://h.example/dav?share=b", Some("u"))
+        );
+        assert_eq!(
+            cache_key("https://h.example/dav/?share=a", Some("u")),
+            cache_key("https://h.example/dav?share=a", Some("u"))
         );
     }
 
@@ -5356,6 +5380,23 @@ mod tests {
         assert!(!has_traversal_sequence(".gitignore"));
         assert!(!has_traversal_sequence(".env"));
         assert!(!has_traversal_sequence("subdir/.hidden_file"));
+
+        // Query-scoped collections are distinct listings: a different
+        // share token must never read another token's entry, and the same
+        // token spelled with or without the trailing slash is one
+        // collection and must still hit its entry.
+        let query_url = "https://example.com/remote/files/?share=token1";
+        save_remote_cache(query_url, alice_user, &items);
+        assert!(
+            load_remote_cache("https://example.com/remote/files?share=token2", alice_user).is_none(),
+            "a different share token must not read another token's cached listing"
+        );
+        assert_eq!(
+            load_remote_cache("https://example.com/remote/files?share=token1", alice_user)
+                .expect("trailing-slash variant of the same collection must hit its entry")
+                .len(),
+            items.len()
+        );
 
         clear_remote_cache().unwrap();
         assert!(!temp_cache.exists());
