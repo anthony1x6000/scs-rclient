@@ -4183,6 +4183,32 @@ mod tests {
     }
 
     #[test]
+    fn test_guard_server_derived_url_bounds_targets_to_the_collection() {
+        // The user confirms an action for ONE collection (base_url + subdir).
+        // A server-advertised href may point anywhere on the same origin; the
+        // guard must refuse to let it steer authenticated DELETE/GET outside
+        // the configured collection.
+        let base = "https://h.example/content/enforced/COURSE123/";
+        assert!(
+            guard_server_derived_url(base, "https://h.example/othercourse/file.txt").is_err(),
+            "same-origin out-of-collection href must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "/othercourse/file.txt").is_err(),
+            "relative out-of-collection href must be refused"
+        );
+        // In-collection targets still pass: exact, deeper, case-variant,
+        // explicit default port, and percent-encoded forms.
+        assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/").is_ok());
+        assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/notes/a.txt").is_ok());
+        assert!(guard_server_derived_url(base, "https://h.example/Content/Enforced/course123/notes/a.txt").is_ok());
+        assert!(guard_server_derived_url(base, "https://h.example:443/content/enforced/COURSE123/a.txt").is_ok());
+        assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/my%20file.txt").is_ok());
+        // Origin-root collection contains everything on the origin.
+        assert!(guard_server_derived_url("https://h.example/", "https://h.example/any/path.txt").is_ok());
+    }
+
+    #[test]
     fn test_validate_webdav_url_ipv6_literals_and_mapped_ranges() {
         // Bracketed IPv6 literals reach the IP check (host_str returns them
         // bracketed, which the old bare host.parse() never matched).
