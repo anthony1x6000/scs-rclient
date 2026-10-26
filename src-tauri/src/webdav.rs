@@ -4433,6 +4433,22 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_webdav_url_rejects_windows_trim_dot_aliases() {
+        // Windows/IIS-family servers strip trailing ASCII spaces and dots
+        // (including their %20 spelling) from each path component, so these
+        // alias onto "." / ".." at resolve time even though an exact-match
+        // dot check passes them.
+        for path in ["/dav/.. /", "/dav/.../", "/dav/..%20/", "/dav/. /", "/dav/notes/..%20/x"] {
+            assert!(
+                validate_webdav_url_internal(&format!("https://courselinkdav.desire2learn.com{path}"), false).is_err(),
+                "windows-trim dot alias must be rejected: {path}"
+            );
+        }
+        // A name that merely ends in a dot is not a dot segment.
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/report./", false).is_ok());
+    }
+
+    #[test]
     fn test_build_remote_url_scope_cannot_escape_via_encoded_subdir() {
         // build_remote_url concatenates the user-supplied subdir into the
         // remote URL; the guard must reject the result before any request.

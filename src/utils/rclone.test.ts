@@ -18,9 +18,21 @@ describe("normalizeSubdir traversal scope", () => {
     expect(() => normalizeSubdir("a\nb")).toThrow();
   });
 
+  it("rejects trailing-space/dot aliases of dot segments (Windows-style trimming)", () => {
+    // Windows/IIS-family servers strip trailing ASCII spaces and dots from
+    // each path component, so these spellings resolve to "." / ".." despite
+    // passing an exact-match dot check.
+    for (const bad of [".. ", ".. /secret", "notes/.. /x", "...", ". ", "notes/...", "..%20", "notes/..%20/x"]) {
+      expect(() => normalizeSubdir(bad), `subdir ${bad} must be rejected`).toThrow();
+    }
+  });
+
   it("accepts ordinary folder names", () => {
     expect(normalizeSubdir("notes")).toBe("notes");
     expect(normalizeSubdir(" My Folder ")).toBe("My Folder");
+    // A name that merely ends in a dot is not a dot-segment alias.
+    expect(normalizeSubdir("report.")).toBe("report.");
+    expect(normalizeSubdir("v1.2/notes")).toBe("v1.2/notes");
   });
 
   it("keeps encoded separators as literal names, not traversal", () => {
