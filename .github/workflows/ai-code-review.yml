@@ -300,18 +300,16 @@ jobs:
         if: success() && steps.diff.outputs.has_diff == 'true'
         run: node scripts/ai-code-review.mjs prepare-payload
 
-      # Two reviewers audit the same skill over the same diff, one call per
-      # model, all concurrent: longcat-2.5-preview-free and
-      # deepseek-v4.1-flash, both on the opencode go plan. The list, the
-      # endpoints, the secret each model needs, any per-model completion budget,
-      # and the reasoning level every reviewer runs at live in
+      # One reviewer audits the same skill over the same diff:
+      # deepseek-v4.1-flash on the opencode go plan. The list, the endpoints,
+      # the secret each model needs, any per-model completion budget, and the
+      # reasoning level every reviewer runs at live in
       # .github/ai-review-models.json; that level is high, the step under the
       # endpoint's own ceiling, so a reviewer reasons harder than its default
       # without spending its whole completion budget on the trace. A model that
-      # returns no review text abstains, so an unavailable endpoint cannot block
-      # a merge on its own. Each review is posted the moment that reviewer
-      # answers, so the one that stalls on its endpoint no longer keeps the
-      # other's review off the pull request for the rest of its timeout.
+      # returns no review text abstains; with a single reviewer that leaves no
+      # explicit approval, so the job fails closed rather than merging a diff
+      # nothing reviewed. Each review is posted the moment its reviewer answers.
       - name: Call AI Code Review Models
         if: success() && steps.diff.outputs.has_diff == 'true'
         env:
@@ -579,9 +577,9 @@ jobs:
         if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         run: node scripts/ai-code-review.mjs prepare-payload
 
-      # The security skill alone is 37KB, past the 24KB request limit that
-      # longcat answers 500 above, so this job runs the fleet entries that can
-      # take it and the code review job keeps both.
+      # The security skill alone is 37KB, past the prompt budget a capped fleet
+      # entry accepts, so this job names the entry that can take the full skill
+      # instead of running the whole fleet.
       - name: Call Security Review Models
         if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         env:
