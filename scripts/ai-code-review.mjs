@@ -40,7 +40,8 @@ const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "
 // variable out of the runner environment. Matching the whole url, not just the
 // host, also rules out a swapped path on an allowed host.
 const ALLOWED_ENDPOINTS = {
-  "https://opencode.ai/zen/go/v1/chat/completions": "OCG_KEY"
+  "https://opencode.ai/zen/go/v1/chat/completions": "OCG_KEY",
+  "https://opencode.ai/inference/go/openai/v1/chat/completions": "OCG_KEY"
 };
 
 function sleep(ms) {
