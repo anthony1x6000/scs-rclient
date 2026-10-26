@@ -3643,25 +3643,15 @@ where
                 let downloaded_len = match download_result {
                     Ok(len) => len,
                     Err(e) => {
-                        // Never leave a truncated partial behind after the final attempt
-                        // (the partial lives in the temp sibling; the destination was
-                        // never touched).
+                        // Never leave a partial behind after the final attempt:
+                        // the partial lives in the temp sibling, and the
+                        // destination was never touched, so the prior local
+                        // file survives a failed download as-is.
                         let temp_file = target_file.with_extension(format!(
                             "scs-part-{}",
                             std::process::id()
                         ));
                         let _ = std::fs::remove_file(&temp_file);
-                        if let Err(remove_err) = std::fs::remove_file(&target_file) {
-                            if remove_err.kind() != std::io::ErrorKind::NotFound {
-                                log(&format!(
-                                    "[{}/{}] WARNING: Could not remove partial download {}: {}\n",
-                                    current_num,
-                                    total_files,
-                                    target_file.display(),
-                                    remove_err
-                                ));
-                            }
-                        }
                         if cancel_flag.load(Ordering::SeqCst) {
                             log("Operation canceled by user.\n");
                             return Ok(());
