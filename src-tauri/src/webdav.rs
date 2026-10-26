@@ -4002,7 +4002,11 @@ mod tests {
             parsed.is_err(),
             "malformed XML tail must be an error, not a silent 2-item listing"
         );
-        let ok_body = body.replace("</D:respo", "</D:response></D:multistatus>");
+        // Complete only the truncated tail. Appending — instead of replacing
+        // "</D:respo", which also matches inside the first two blocks'
+        // "</D:response>" close tags — leaves the well-formed responses
+        // untouched.
+        let ok_body = format!("{body}nse></D:multistatus>");
         assert_eq!(parse_propfind_xml(&ok_body).unwrap().len(), 3);
     }
 
