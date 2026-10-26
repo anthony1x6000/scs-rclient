@@ -104,3 +104,53 @@ fn test_cancel_interrupts_dripping_download_body() {
         "expected a cancellation log line, got: {logs:?}"
     );
 }
+
+#[test]
+fn test_body_deadline_stops_dripping_download() {
+    std::env::set_var("ALLOW_INSECURE_WEBDAV", "1");
+    std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
+    // 1s whole-body budget against a body that drips forever otherwise: the
+    // drip makes steady progress, so only the deadline can end the transfer.
+    std::env::set_var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS", "1");
+
+    let (port, stop) = start_drip_server();
+    let base_url = format!("http://127.0.0.1:{port}/course/");
+    let client = scs_rclient_lib::dav_client::Client::init("", "", &base_url).unwrap();
+    let local_dir = std::env::temp_dir().join(format!("scs-deadline-{}", std::process::id()));
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    let mut logs = Vec::new();
+    let started = Instant::now();
+    let result = execute_webdav_action_with_exclusions(
+        &client,
+        "get",
+        &base_url,
+        &local_dir,
+        &cancel,
+        None,
+        None,
+        &[],
+        |m: &str| logs.push(m.to_string()),
+    );
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::SeqCst);
+
+    let action_ok = result.is_ok();
+    let partial_left = local_dir.join("drip.bin").exists();
+    let _ = std::fs::remove_dir_all(&local_dir);
+    std::env::remove_var("ALLOW_INSECURE_WEBDAV");
+    std::env::remove_var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS");
+
+    // The action completes; the doomed file is skipped with a deadline error.
+    assert!(action_ok, "action must terminate on the body deadline: {result:?}");
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the deadline must stop the 30s drip early, took {elapsed:?}"
+    );
+    assert!(
+        logs.iter().any(|l| l.contains("exceeded the 1s time limit")),
+        "expected the deadline error in the log, got: {logs:?}"
+    );
+    assert!(!partial_left, "the partial download must be cleaned up");
+}

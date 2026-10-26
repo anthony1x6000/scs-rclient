@@ -357,6 +357,13 @@ fn register_concurrency_wakeup(wake: &Arc<PoolWake>) {
 }
 
 /// Retrieves maximum allowed WebDAV file size in bytes, configurable via MAX_WEBDAV_FILE_SIZE_BYTES.
+pub fn get_max_file_size() -> u64 {
+    std::env::var("MAX_WEBDAV_FILE_SIZE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_FILE_SIZE)
+}
+
 /// End-to-end deadline for one streamed download body. reqwest's blocking
 /// client applies its 30s timeout per individual `read()`, so a body dripped
 /// at one byte per 29 seconds never times out; this ceiling bounds the whole
@@ -367,13 +374,6 @@ pub fn get_download_body_timeout_secs() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(600)
-}
-
-pub fn get_max_file_size() -> u64 {
-    std::env::var("MAX_WEBDAV_FILE_SIZE_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MAX_FILE_SIZE)
 }
 
 /// Computes SHA256 checksum of a file on disk by streaming chunks to avoid buffering large files in RAM.
@@ -3135,6 +3135,9 @@ where
                         // cancel flag nor any whole-body deadline, and each
                         // blocking read gets a fresh 30s window from reqwest,
                         // so a slow-drip body would hang the attempt forever.
+                        // One read parked inside reqwest can still delay the
+                        // checks below by at most that per-read timeout; the
+                        // deadline bounds every other stretch of the transfer.
                         let body_deadline = std::time::Instant::now()
                             + std::time::Duration::from_secs(get_download_body_timeout_secs());
                         let mut buffer = [0u8; 65536];
@@ -3171,6 +3174,10 @@ where
                                         break;
                                     }
                                 }
+                                // io::copy retried EINTR reads; keep that
+                                // contract so a signal does not fail an
+                                // otherwise healthy transfer.
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                                 Err(e) => {
                                     return Err(classify_io_error(
                                         &format!("streaming GET {download_url}"),
