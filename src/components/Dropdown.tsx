@@ -6,8 +6,17 @@ import {
   setSelectedSubdir,
   getBulkSelection,
   setBulkSelection,
+  getBulkPresets,
+  setBulkPresets,
 } from "../settings";
 import { addFolderFromInput, normalizeBulkSelection, toggleBulkTick, BULK_MIN_FOLDERS } from "../bulk";
+import {
+  type BulkPreset,
+  livePresetFolders,
+  buildPresetLabels,
+  presetTooltip,
+  filterBulkPresets,
+} from "../bulkPresets";
 
 interface DropdownProps {
   onSelect?: (item: string) => void;
@@ -23,6 +32,7 @@ const DEFAULT_PAGE = 7;
 function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps) {
   const [items, setItems] = useState<string[]>([]);
   const [bulkTicks, setBulkTicks] = useState<string[]>([]);
+  const [presets, setPresets] = useState<BulkPreset[]>([]);
   const [selectedItem, setSelectedItem] = useState<string>("");
   const [isOpen, setIsOpen] = useState<boolean>(false);
   const [searchText, setSearchText] = useState<string>("");
@@ -46,15 +56,17 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
   useEffect(() => {
     async function loadStoredSettings() {
       try {
-        const [savedItems, savedSelected, savedTicks] = await Promise.all([
+        const [savedItems, savedSelected, savedTicks, savedPresets] = await Promise.all([
           getSubdirectories(),
           getSelectedSubdir(),
           getBulkSelection(),
+          getBulkPresets(),
         ]);
         const normalizedTicks = normalizeBulkSelection(savedItems, savedTicks);
         setItems(savedItems);
         setBulkTicks(normalizedTicks);
         setSelectedItem(savedSelected);
+        setPresets(savedPresets);
         if (savedSelected) onSelectRef.current?.(savedSelected);
         onBulkChangeRef.current?.(normalizedTicks);
       } catch (e) {
@@ -114,6 +126,15 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
     }
   };
 
+  // Presets are re-read on every open so runs finished elsewhere show up fresh.
+  const refreshPresets = async () => {
+    try {
+      setPresets(await getBulkPresets());
+    } catch (e) {
+      console.error("Failed to load bulk presets:", e);
+    }
+  };
+
   const applyTicks = (updatedTicks: string[]) => {
     setBulkTicks(updatedTicks);
     onBulkChangeRef.current?.(updatedTicks);
@@ -136,6 +157,25 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
     const updatedTicks = normalizeBulkSelection(items, toggleBulkTick(bulkTicks, item));
     applyTicks(updatedTicks);
     void setBulkSelection(updatedTicks);
+  };
+
+  // Preset click = bulk ticking its live members: no action fires, single selection stays.
+  const handleApplyPreset = (preset: BulkPreset) => {
+    const live = normalizeBulkSelection(items, livePresetFolders(preset, items));
+    applyTicks(live);
+    void setBulkSelection(live);
+    setIsOpen(false);
+    setSearchText("");
+    setAddText("");
+    setAddError("");
+    setPage(0);
+    setHighlight(-1);
+  };
+
+  const handleDeletePreset = (preset: BulkPreset) => {
+    const updated = presets.filter((p) => p !== preset);
+    setPresets(updated);
+    setBulkPresets(updated).catch((e) => console.error("Failed to save bulk presets:", e));
   };
 
   // Bottom add-input: Enter normalizes the text, appends the folder when new,
@@ -172,6 +212,10 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
     () => items.filter((item) => item.toLowerCase().includes(searchText.toLowerCase())),
     [items, searchText]
   );
+
+  // Presets follow the folder list, most recent first; labels align with the filtered rows.
+  const visiblePresets = useMemo(() => filterBulkPresets(presets, searchText), [presets, searchText]);
+  const presetLabels = useMemo(() => buildPresetLabels(visiblePresets), [visiblePresets]);
 
   // Derive paging
   const pageSize = useMemo(() => {
@@ -354,6 +398,7 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
             setIsOpen(true);
             setSearchText("");
             setHighlight(-1);
+            void refreshPresets();
             recomputeAvailable();
           }}
           aria-expanded={isOpen}
@@ -471,6 +516,41 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
                   </li>
                 )}
               </ul>
+              {/* Saved bulk presets — act like ticking, not selecting; outside the paging index */}
+              {visiblePresets.length > 0 && (
+                <>
+                  <div aria-hidden className="border-t border-white/10 mx-1.5" />
+                  <ul className="list-none p-1 pt-0 m-0" aria-label="Bulk folder presets">
+                    {visiblePresets.map((preset, i) => {
+                      // Labels are unique by construction (collision suffixes), unlike folder joins.
+                      const label = presetLabels[i] ?? preset.folders[0] ?? "preset";
+                      return (
+                        <li key={label} className="flex items-center">
+                          <button
+                            type="button"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => handleApplyPreset(preset)}
+                            title={presetTooltip(preset)}
+                            aria-label={`Bulk preset: ${label}`}
+                            className="flex-1 text-left bg-transparent border-none py-[5px] px-[10px] cursor-pointer text-sm text-gray-200 hover:text-white focus:text-white focus:outline-none truncate"
+                          >
+                            {label}
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={`Remove preset ${label}`}
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => handleDeletePreset(preset)}
+                            className="shrink-0 bg-transparent border-none py-[5px] px-[10px] cursor-pointer text-xs text-red-400 hover:text-red-300 font-bold"
+                          >
+                            ×
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </>
+              )}
             </div>
             {/* Bottom fade */}
             <div

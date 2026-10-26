@@ -1,4 +1,5 @@
 import { load, type Store } from "@tauri-apps/plugin-store";
+import type { BulkPreset } from "./bulkPresets";
 
 export const SETTINGS_FILE = "settings.json";
 
@@ -10,6 +11,7 @@ export const STORE_KEYS = {
   legacyTestSubdir: "test_subdirectory",
   subdirectories: "subdirectories",
   bulkSelectedSubdirs: "bulk_selected_subdirectories",
+  bulkPresets: "bulk_presets",
   scanConcurrency: "scan_concurrency",
   excludedFolders: "excluded_folders",
 } as const;
@@ -124,6 +126,23 @@ export async function getBulkSelection(): Promise<string[]> {
 
 export async function setBulkSelection(folders: readonly string[]): Promise<void> {
   await setWrapped(STORE_KEYS.bulkSelectedSubdirs, folders);
+}
+
+/** Recently run bulk folder sets, recency-ordered (index 0 = most recent). */
+export async function getBulkPresets(): Promise<BulkPreset[]> {
+  const stored = await getWrapped<unknown>(STORE_KEYS.bulkPresets);
+  if (!Array.isArray(stored)) return [];
+  return stored.filter(
+    (entry): entry is BulkPreset =>
+      typeof entry === "object" &&
+      entry !== null &&
+      Array.isArray((entry as BulkPreset).folders) &&
+      (entry as BulkPreset).folders.every((folder) => typeof folder === "string"),
+  );
+}
+
+export async function setBulkPresets(presets: BulkPreset[]): Promise<void> {
+  await setWrapped(STORE_KEYS.bulkPresets, presets);
 }
 
 /**

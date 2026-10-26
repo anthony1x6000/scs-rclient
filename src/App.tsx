@@ -8,7 +8,8 @@ import CredentialsForm from "./components/CredentialsForm";
 import SettingsView from "./components/SettingsView";
 import { RcloneActions } from "./components/RcloneActions";
 import RcloneConsole from "./components/RcloneConsole";
-import { getTargetSubdir } from "./settings";
+import { getBulkPresets, getTargetSubdir, setBulkPresets } from "./settings";
+import { upsertBulkPreset } from "./bulkPresets";
 import { BULK_MIN_FOLDERS } from "./bulk";
 
 function App() {
@@ -74,6 +75,13 @@ function App() {
     }
   };
 
+  // Auto-remember the folder set a bulk action fired on; never blocks the run itself.
+  const handleBulkRun = (folders: string[]) => {
+    getBulkPresets()
+      .then((presets) => setBulkPresets(upsertBulkPreset(presets, folders)))
+      .catch((e) => console.error("Failed to save bulk preset:", e));
+  };
+
   return (
     <BackgroundWrapper>
       <div className="flex flex-col h-screen w-full box-border overflow-hidden p-2 justify-between">
@@ -83,6 +91,7 @@ function App() {
             isRunning={isRunning}
             setIsRunning={setIsRunning}
             bulkFolders={bulkTicks}
+            onBulkRun={handleBulkRun}
           />
         </div>
 
