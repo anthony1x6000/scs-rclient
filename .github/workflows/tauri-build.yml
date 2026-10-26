@@ -288,13 +288,33 @@ jobs:
             build-dir \
             .github/flatpak/online.anthonyis.scs-rclient.yml
 
-      - name: Update OSTree Static Repository & Deltas
+      - name: Import Flatpak Repository Signing Key
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
         run: |
+          set -euo pipefail
+          # Fail closed: an unsigned update channel must never be published.
+          if [ -z "${FLATPAK_GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error title=signing key missing::secrets.FLATPAK_GPG_PRIVATE_KEY is not configured; refusing to build an unsigned update repository. See the PR description for the one-time key setup."
+            exit 1
+          fi
+          printf '%s' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Update OSTree Static Repository & Deltas
+        env:
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FLATPAK_GPG_KEY_ID:-}" ]; then
+            echo "::error title=signing key id missing::secrets.FLATPAK_GPG_KEY_ID is not configured; refusing to build an unsigned update repository."
+            exit 1
+          fi
           flatpak build-update-repo \
             --title="scs-rclient" \
             --comment="GUI wrapper for rclone" \
             --description="Flatpak repository for scs-rclient desktop application" \
             --homepage="https://github.com/anthony1x6000/scs-rclient" \
+            --gpg-sign="${FLATPAK_GPG_KEY_ID}" \
             --generate-static-deltas \
             repo
 
@@ -458,8 +478,11 @@ jobs:
   deploy-gh-pages:
     name: Deploy Flatpak Repository to gh-pages
     runs-on: ubuntu-latest
-    needs: [flatpak, test-repo-install]
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'release' || github.event_name == 'workflow_dispatch')
+    needs: [flatpak, test-repo-install, test-webdav-e2e, test-e2e-flatpak, test-e2e-linux, test-e2e-rpm, test-e2e-windows]
+    # The update channel is security-critical infrastructure: publish only on
+    # an authorized release decision, after the full test matrix, never on a
+    # plain push to main.
+    if: github.event_name == 'release' && github.event.action == 'published'
     permissions:
       contents: write
     steps:

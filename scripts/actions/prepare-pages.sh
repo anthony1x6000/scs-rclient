@@ -151,6 +151,15 @@ with open(output_html_file, "w", encoding="utf-8") as f:
     f.write(index_html)
 
 # 6. Dynamically write Flatpak repository & ref configuration files
+signing_key_path = os.path.join(root, ".github", "flatpak", "repo-signing-key.asc")
+if not os.path.isfile(signing_key_path):
+    raise SystemExit(
+        "missing .github/flatpak/repo-signing-key.asc: the update channel must "
+        "ship a GpgKey with gpg-verify=true; refusing to publish unsigned."
+    )
+with open(signing_key_path, "r", encoding="utf-8") as key_file:
+    gpg_key_b64 = base64.b64encode(key_file.read().encode()).decode()
+
 flatpakrepo_content = f"""[Flatpak Repo]
 Title=scs-rclient
 Url=https://{owner}.github.io/{repo_name}/repo/
@@ -158,7 +167,8 @@ Homepage=https://github.com/{repo}
 Comment=Flatpak repository for scs-rclient
 Description=Automated Flatpak repository for scs-rclient hosted via GitHub Pages.
 Icon=https://raw.githubusercontent.com/{repo}/main/src-tauri/icons/128x128.png
-gpg-verify=false
+GpgKey={gpg_key_b64}
+gpg-verify=true
 """
 
 flatpakref_content = f"""[Flatpak Ref]
@@ -173,7 +183,8 @@ Homepage=https://github.com/{repo}
 Comment=GUI wrapper for rclone
 Description=Flatpak packaging for scs-rclient desktop application
 Icon=https://raw.githubusercontent.com/{repo}/main/src-tauri/icons/128x128.png
-gpg-verify=false
+GpgKey={gpg_key_b64}
+gpg-verify=true
 """
 
 for name in ["online.anthonyis.scs-rclient", repo_name]:
