@@ -20,6 +20,12 @@ pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
 /// multistatus). GET downloads are capped by `DEFAULT_MAX_FILE_SIZE`; listing
 /// bodies must be bounded the same way or one response can exhaust memory.
 pub const MAX_LISTING_BODY_BYTES: u64 = 64 * 1024 * 1024;
+/// Ceiling on the total bytes of listing bodies buffered concurrently across
+/// scan workers. The per-body cap alone would let `MAX_SCAN_CONCURRENCY`
+/// workers each hold a full `MAX_LISTING_BODY_BYTES` body (~4 GiB) before any
+/// aggregate check runs, so every listing read reserves its worst case
+/// against this shared budget and fails closed beyond it.
+pub const MAX_INFLIGHT_LISTING_BYTES: usize = 256 * 1024 * 1024;
 /// Aggregate item cap across one scan: bounds memory, the cache file, and the
 /// number of local files a hostile listing can materialize via `get`. The
 /// same bound is enforced per listing during XML item collection, so no
@@ -959,7 +965,53 @@ pub fn clear_remote_cache() -> Result<(), String> {
 /// listings default to UTF-8, and guessing a declared charset would hand
 /// the server influence over decoding, so exotic encodings fail loudly
 /// and the caller falls back (Depth: 1) or errors.
+static INFLIGHT_LISTING_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII proof that one listing body's worst-case bytes are inside the shared
+/// in-flight ceiling; dropping it returns the reservation.
+pub(crate) struct InflightListingGuard {
+    reserved: usize,
+}
+
+impl Drop for InflightListingGuard {
+    fn drop(&mut self) {
+        INFLIGHT_LISTING_BYTES.fetch_sub(self.reserved, Ordering::Release);
+    }
+}
+
+/// Reserves one worst-case listing body against `MAX_INFLIGHT_LISTING_BYTES`,
+/// bounding the aggregate memory concurrent scan workers can pour into
+/// server-controlled listing bodies. Fails closed when the ceiling is hit:
+/// the caller's existing error handling then skips the directory or fails
+/// the action instead of buffering beyond the budget.
+fn reserve_inflight_listing() -> Result<InflightListingGuard, String> {
+    let want = MAX_LISTING_BODY_BYTES as usize;
+    let mut current = INFLIGHT_LISTING_BYTES.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(want) else {
+            return Err("aggregate in-flight listing bytes overflow".to_string());
+        };
+        if next > MAX_INFLIGHT_LISTING_BYTES {
+            return Err(format!(
+                "aggregate in-flight listing bytes would exceed {MAX_INFLIGHT_LISTING_BYTES}; too many concurrent listing bodies"
+            ));
+        }
+        match INFLIGHT_LISTING_BYTES.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(InflightListingGuard { reserved: want }),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<String, String> {
+    // Hold the worst-case reservation for the whole read so concurrent
+    // workers cannot each buffer a full body past the shared ceiling.
+    let _inflight = reserve_inflight_listing()?;
     let mut limited = body.take(MAX_LISTING_BODY_BYTES + 1);
     let mut buf = String::new();
     limited
