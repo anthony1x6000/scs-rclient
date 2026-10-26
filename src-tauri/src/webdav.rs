@@ -4340,6 +4340,17 @@ mod tests {
         assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/notes/a.txt").is_ok());
         assert!(guard_server_derived_url(base, "https://h.example:443/content/enforced/COURSE123/a.txt").is_ok());
         assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/my%20file.txt").is_ok());
+        // A legitimate name that merely ENDS in a dot or space is not a dot
+        // segment: only spellings whose trailing-trimmed remainder collapses
+        // to "", ".", or ".." can re-alias onto a dot segment.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/report./a.txt").is_ok(),
+            "trailing-dot file names must not be rejected as dot aliases"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/note%20file.txt").is_ok(),
+            "in-segment spaces are ordinary characters"
+        );
         // Origin-root collection: any unambiguous non-root path is a strict
         // descendant, but the origin root itself is never an item target.
         assert!(guard_server_derived_url("https://h.example/", "https://h.example/any/path.txt").is_ok());
