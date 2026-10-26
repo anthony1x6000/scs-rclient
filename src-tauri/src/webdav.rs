@@ -3953,6 +3953,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_propfind_xml_rejects_malformed_tail() {
+        // A malformed tail must fail the whole listing, not silently return
+        // the items parsed so far: sync treats the returned set as ground
+        // truth (files missing from it get re-uploaded unconditionally, and
+        // the truncated set is cached for 24h).
+        let body = concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?>",
+            "<D:multistatus xmlns:D=\"DAV:\">",
+            "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+            "<D:response><D:href>/c/b.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+            "<D:response><D:href>/c/c.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:respo",
+        );
+        let parsed = parse_propfind_xml(body);
+        assert!(
+            parsed.is_err(),
+            "malformed XML tail must be an error, not a silent 2-item listing"
+        );
+        let ok_body = body.replace("</D:respo", "</D:response></D:multistatus>");
+        assert_eq!(parse_propfind_xml(&ok_body).unwrap().len(), 3);
+    }
+
+    #[test]
     fn test_validate_webdav_url_ipv6_literals_and_mapped_ranges() {
         // Bracketed IPv6 literals reach the IP check (host_str returns them
         // bracketed, which the old bare host.parse() never matched).
