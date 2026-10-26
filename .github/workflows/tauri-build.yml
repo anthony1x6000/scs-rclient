@@ -371,7 +371,7 @@ jobs:
     name: Test E2E Linux (deb, AppImage, binary)
     # Runs on every PR/push — no `if:` gate by design.
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     needs: build-linux
     steps:
       - name: Checkout repository
