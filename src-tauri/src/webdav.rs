@@ -686,11 +686,27 @@ pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Ve
     let cache = read_cache_map(&path);
     let key = cache_key(remote_url, auth_user);
     let entry = cache.get(&key).filter(|entry| {
-        // Key equality is necessary but not sufficient: the stored exact-case
-        // URL must match the requested collection as well, so no entry can
-        // ever be served for a different collection.
-        entry.remote_url.trim_end_matches('/') == remote_url.trim_end_matches('/')
+        // Key equality is necessary but not sufficient: the stored URL must
+        // match the requested collection as well — scheme and host
+        // case-insensitively (per URL grammar), the path exactly — so no
+        // entry can ever be served for a different collection.
+        url_same_collection(&entry.remote_url, remote_url)
     })?;
+
+/// Equality modulo the case-insensitive parts of the URL grammar: scheme and
+/// host compare case-insensitively; path (and query) compare exactly.
+fn url_same_collection(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            let host_a = a.host_str().unwrap_or_default().to_ascii_lowercase();
+            let host_b = b.host_str().unwrap_or_default().to_ascii_lowercase();
+            a.scheme() == b.scheme() && host_a == host_b && a.path() == b.path()
+        }
+        // Unparseable stored entries never match a parseable request.
+        (Err(_), Err(_)) => a.trim_end_matches('/') == b.trim_end_matches('/'),
+        _ => false,
+    }
+}
 
     let ttl = get_cache_ttl_secs();
     if ttl > 0 {
