@@ -1420,9 +1420,19 @@ pub(crate) fn insecure_webdav_allowed() -> bool {
 /// Popping happens inside `Url::parse`, i.e. after this guard, so a raw-string
 /// check is the only place the user-configured scope can be held to.
 fn has_url_dot_segment(raw: &str) -> bool {
-    let after_scheme = match raw.split_once("://") {
+    // Apply the WHATWG parser's input normalization first: it trims
+    // leading/trailing C0 control or space and removes all ASCII tab, LF,
+    // and CR anywhere in the input, so `https://h/base/..\n` reaches the
+    // parser as the segment `..`. The guard must examine that same
+    // normalized form, or the parent pop slips past the raw check.
+    let normalized: String = raw
+        .trim_matches(|c: char| (c as u32) <= 0x20)
+        .chars()
+        .filter(|&c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let after_scheme = match normalized.split_once("://") {
         Some((_, rest)) => rest,
-        None => raw,
+        None => &normalized,
     };
     // A backslash directly after the authority is the path start too: the
     // WHATWG parser accepts `\` as a path separator for special schemes, so
@@ -1438,6 +1448,11 @@ fn has_url_dot_segment(raw: &str) -> bool {
     path.split(['/', '\\']).any(|seg| {
         let s = seg.to_ascii_lowercase();
         matches!(s.as_str(), "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e")
+            // Encoded separators can decode back into path separators
+            // server-side (a raw-concatenated `..%2fsecret` subdir), so a
+            // configured scope never carries them.
+            || s.contains("%2f")
+            || s.contains("%5c")
     })
 }
 
@@ -1450,7 +1465,7 @@ pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Resu
     // shifting the effective remote scope above the configured base path.
     if has_url_dot_segment(url_str) {
         return Err(
-            "URL path contains a dot-segment ('.', '..' or percent-encoded form) that would resolve above the configured directory."
+            "URL path contains a dot-segment ('.', '..' or percent-encoded form) or an encoded path separator ('%2f'/'%5c') that would resolve above the configured directory."
                 .to_string(),
         );
     }
@@ -4322,6 +4337,49 @@ mod tests {
             let item = format!("/{}%C3%A9x", "a".repeat(n));
             let _ = relative_item_path(base, &item);
         }
+    }
+
+    #[test]
+    fn test_validate_webdav_url_rejects_parser_normalized_traversal() {
+        // Url::parse trims C0 control/space at both ends and drops ASCII
+        // tab/LF/CR anywhere, so these raw spellings reach the parser as a
+        // parent-pop `..` (or encoded `%2e%2e`) segment even though the raw
+        // string never contains one literally. The error message pins the
+        // rejection to the dot-segment guard.
+        for raw in [
+            "https://courselinkdav.desire2learn.com/base/..\n",
+            "https://courselinkdav.desire2learn.com/base/.. ",
+            "https://courselinkdav.desire2learn.com/base/.\t.",
+            "https://courselinkdav.desire2learn.com/base/\n..",
+            "https://courselinkdav.desire2learn.com/base/%2e%2e\n",
+        ] {
+            let err = validate_webdav_url_internal(raw, false).unwrap_err();
+            assert!(
+                err.contains("dot-segment"),
+                "{raw:?} must be rejected as a dot-segment, got: {err}"
+            );
+        }
+        // Encoded separators decode back into path separators server-side,
+        // so a configured scope never carries them.
+        for raw in [
+            "https://courselinkdav.desire2learn.com/dav/..%2fsecret",
+            "https://courselinkdav.desire2learn.com/dav/..%5csecret",
+        ] {
+            let err = validate_webdav_url_internal(raw, false).unwrap_err();
+            assert!(
+                err.contains("encoded path separator"),
+                "{raw} must be rejected as an encoded separator, got: {err}"
+            );
+        }
+        // Edge whitespace alone is normalized away and stays accepted.
+        assert!(validate_webdav_url_internal(
+            "  https://courselinkdav.desire2learn.com/dav/my%20course  ",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn test_validate_webdav_url_rejects_backslash_after_authority() {
         // The WHATWG parser treats a backslash as a path separator for
         // special schemes, so `https://host\..\x` parses with a path of

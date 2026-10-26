@@ -16,10 +16,11 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
 /**
  * Normalizes a subdirectory path by trimming whitespace, leading slashes, and trailing slashes.
- * Rejects `.` / `..` segments and backslash separators to prevent scope escape.
- * Encoded separators (`%2f`/`%5c`) cannot traverse: `resolveRemoteUrl` passes each
- * segment through `encodeURIComponent`, which re-encodes the `%` (so `%2f` is sent
- * as `%252f`) and the backend decodes it back to a literal, separator-free name.
+ * Rejects `.` / `..` segments, percent-encoded dot segments, control characters, and backslash
+ * separators to prevent scope escape. Encoded separators (`%2f`/`%5c`) cannot traverse here:
+ * `resolveRemoteUrl` passes each segment through `encodeURIComponent`, which re-encodes the `%`
+ * (so `%2f` is sent as `%252f`) and the backend decodes it back to a literal, separator-free
+ * name; the Rust-side guard additionally rejects them in the configured URL.
  */
 export function normalizeSubdir(subdir: string): string {
   const trimmed = subdir.trim().replace(/\\/g, "/");

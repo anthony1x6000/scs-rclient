@@ -44,4 +44,14 @@ describe("resolveLocalPath containment", () => {
   it("stays under the mount directory", () => {
     expect(resolveLocalPath("/home/u/m", "a/b")).toBe("/home/u/m/a/b");
   });
+
+  it("rejects subdirs that would escape the mount directory", () => {
+    expect(() => resolveLocalPath("/home/u/m", "../outside")).toThrow();
+    expect(() => resolveLocalPath("/home/u/m", "%2e%2e/outside")).toThrow();
+    expect(() => resolveLocalPath("/home/u/m", "a/../../outside")).toThrow();
+  });
+
+  it("normalizes an absolute-looking subdir to a relative one", () => {
+    expect(resolveLocalPath("/home/u/m", "/abs")).toBe("/home/u/m/abs");
+  });
 });
