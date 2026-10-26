@@ -1,4 +1,10 @@
 import { load, type Store } from "@tauri-apps/plugin-store";
+import {
+  normalizeExtensionList,
+  type ExtensionFilterMode,
+  type ExtensionFilterState,
+} from "./extensionFilter";
+import { normalizeSubdir } from "./utils/rclone";
 
 export const SETTINGS_FILE = "settings.json";
 
@@ -12,6 +18,10 @@ export const STORE_KEYS = {
   bulkSelectedSubdirs: "bulk_selected_subdirectories",
   scanConcurrency: "scan_concurrency",
   excludedFolders: "excluded_folders",
+  extensionWhitelist: "extension_whitelist",
+  extensionBlacklist: "extension_blacklist",
+  extensionWhitelistBySubdir: "extension_whitelist_by_subdir",
+  extensionBlacklistBySubdir: "extension_blacklist_by_subdir",
 } as const;
 
 export const DEFAULT_SCAN_CONCURRENCY = 6;
@@ -212,6 +222,68 @@ export async function setExcludedFolders(folders: readonly string[]): Promise<vo
   await setWrapped(STORE_KEYS.excludedFolders, normalizeExcludedFolders(folders));
 }
 
+/** Sanitizes a stored per-dir map: valid subdir keys, valid lists, empty entries dropped. */
+function sanitizeExtensionMap(raw: unknown): Record<string, string[]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const sanitized: Record<string, string[]> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    try {
+      const normalizedKey = normalizeSubdir(key);
+      const list = normalizeExtensionList(Array.isArray(value) ? value : []);
+      if (normalizedKey && list.length > 0) sanitized[normalizedKey] = list;
+    } catch {
+      // A key that is not a valid subdir (e.g. stored with "..") is unusable: drop it.
+    }
+  }
+  return sanitized;
+}
+
+/** Loads every persisted extension filter; each read is sanitized independently. */
+export async function getExtensionFilterState(): Promise<ExtensionFilterState> {
+  const [globalWhitelist, globalBlacklist, perDirWhitelist, perDirBlacklist] = await Promise.all([
+    getWrapped<unknown>(STORE_KEYS.extensionWhitelist),
+    getWrapped<unknown>(STORE_KEYS.extensionBlacklist),
+    getWrapped<unknown>(STORE_KEYS.extensionWhitelistBySubdir),
+    getWrapped<unknown>(STORE_KEYS.extensionBlacklistBySubdir),
+  ]);
+  return {
+    globalWhitelist: normalizeExtensionList(Array.isArray(globalWhitelist) ? globalWhitelist : []),
+    globalBlacklist: normalizeExtensionList(Array.isArray(globalBlacklist) ? globalBlacklist : []),
+    perDirWhitelist: sanitizeExtensionMap(perDirWhitelist),
+    perDirBlacklist: sanitizeExtensionMap(perDirBlacklist),
+  };
+}
+
+/** Saves (or clears, with an empty list) the global filter for one mode. */
+export async function setGlobalExtensionFilter(
+  mode: ExtensionFilterMode,
+  extensions: readonly string[],
+): Promise<void> {
+  const key =
+    mode === "whitelist" ? STORE_KEYS.extensionWhitelist : STORE_KEYS.extensionBlacklist;
+  await setWrapped(key, normalizeExtensionList(extensions));
+}
+
+/** Saves (or clears, with an empty list) the per-dir filter for one mode. */
+export async function setSubdirExtensionFilter(
+  mode: ExtensionFilterMode,
+  subdir: string,
+  extensions: readonly string[],
+): Promise<void> {
+  const storeKey =
+    mode === "whitelist"
+      ? STORE_KEYS.extensionWhitelistBySubdir
+      : STORE_KEYS.extensionBlacklistBySubdir;
+  const dirKey = normalizeSubdir(subdir);
+  if (!dirKey) throw new Error("Enter a subdirectory first.");
+  const state = await getExtensionFilterState();
+  const map = mode === "whitelist" ? state.perDirWhitelist : state.perDirBlacklist;
+  const list = normalizeExtensionList(extensions);
+  if (list.length > 0) map[dirKey] = list;
+  else delete map[dirKey];
+  await setWrapped(storeKey, map);
+}
+
 /** Load the independent settings reads in parallel (no sequential waterfall). */
 export async function loadAppSettings(): Promise<{
   baseUrl: string;
@@ -220,17 +292,34 @@ export async function loadAppSettings(): Promise<{
   username: string;
   scanConcurrency: number;
   excludedFolders: string[];
+  extensionFilterState: ExtensionFilterState;
 }> {
-  const [baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency, excludedFolders] =
-    await Promise.all([
-      getWebDAVBase(),
-      getSelectedSubdir(),
-      getTargetSubdir(),
-      getSavedUsername(),
-      getScanConcurrency(),
-      getExcludedFolders(),
-    ]);
-  return { baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency, excludedFolders };
+  const [
+    baseUrl,
+    selectedSubdir,
+    targetSubdir,
+    username,
+    scanConcurrency,
+    excludedFolders,
+    extensionFilterState,
+  ] = await Promise.all([
+    getWebDAVBase(),
+    getSelectedSubdir(),
+    getTargetSubdir(),
+    getSavedUsername(),
+    getScanConcurrency(),
+    getExcludedFolders(),
+    getExtensionFilterState(),
+  ]);
+  return {
+    baseUrl,
+    selectedSubdir,
+    targetSubdir,
+    username,
+    scanConcurrency,
+    excludedFolders,
+    extensionFilterState,
+  };
 }
 
 /**

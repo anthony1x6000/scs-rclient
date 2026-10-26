@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { loadAppSettings } from "../settings";
 import { BULK_MIN_FOLDERS, formatBulkSummary, runBulkSequential } from "../bulk";
+import { resolveExtensionFilter, type ExtensionFilterState } from "../extensionFilter";
 
 export interface RcloneSettings {
   baseUrl: string;
@@ -11,6 +12,7 @@ export interface RcloneSettings {
   targetSubdir: string;
   scanConcurrency: number;
   excludedFolders: string[];
+  extensionFilterState: ExtensionFilterState;
 }
 
 export type RcloneActionType = 'put' | 'get' | 'get-backup' | 'get-backup-dated' | 'put-dry' | 'get-dry' | 'put-checksum' | 'get-checksum' | 'ls' | 'lsd' | 'check' | 'sync';
@@ -42,6 +44,7 @@ export async function loadSettings(): Promise<RcloneSettings> {
     targetSubdir: s.targetSubdir,
     scanConcurrency: s.scanConcurrency,
     excludedFolders: s.excludedFolders,
+    extensionFilterState: s.extensionFilterState,
   };
 }
 
@@ -103,6 +106,9 @@ export function useRcloneExecution(
     // the dated variant nests one level deeper under today's date.
     const isDatedBackup = action === "get-backup-dated";
     const isBackup = action === "get-backup" || isDatedBackup;
+    // Each folder resolves its own extension filter, so a bulk run applies the
+    // per-dir list of every folder it visits.
+    const extensionFilter = resolveExtensionFilter(subdir, settings.extensionFilterState);
     await invoke("run_webdav_action", {
       action: isBackup ? "get" : action,
       baseUrl: settings.baseUrl,
@@ -113,6 +119,7 @@ export function useRcloneExecution(
       backup: isBackup || undefined,
       backupDated: isDatedBackup || undefined,
       excludeFolders: settings.excludedFolders,
+      extensionFilter: extensionFilter ?? undefined,
     });
   };
 

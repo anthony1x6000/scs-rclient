@@ -1494,6 +1494,7 @@ fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(put_res.is_ok(), "PUT with exclusions failed: {:?}", put_res);
@@ -1563,6 +1564,7 @@ fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(get_res.is_ok(), "GET with exclusions failed: {:?}", get_res);
@@ -1594,7 +1596,8 @@ fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
         !download_dir.join("build").join("cache").exists(),
         "build/cache must not be created locally"
     );
-    let mut downloaded: Vec<String> = collect_local_files_excluding(&download_dir, &exclusions)
+    let mut downloaded: Vec<String> =
+        collect_local_files_excluding(&download_dir, &exclusions, None)
         .into_iter()
         .map(|(_, rel, _)| rel)
         .collect();
@@ -1616,6 +1619,7 @@ fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(sync_res.is_ok(), "SYNC with exclusions failed: {:?}", sync_res);
@@ -1787,6 +1791,7 @@ fn test_live_copyparty_excluded_folders_nested_and_path_patterns() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(put_res.is_ok(), "PUT with exclusions failed: {:?}", put_res);
@@ -1870,6 +1875,7 @@ fn test_live_copyparty_excluded_folders_nested_and_path_patterns() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(get_res.is_ok(), "GET with exclusions failed: {:?}", get_res);
@@ -1923,6 +1929,7 @@ fn test_live_copyparty_excluded_folders_nested_and_path_patterns() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(sync_res.is_ok(), "SYNC with exclusions failed: {:?}", sync_res);
@@ -2055,6 +2062,7 @@ fn test_live_copyparty_excluded_folder_above_scan_root_is_untouched() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(put_res.is_ok(), "PUT above-root test failed: {:?}", put_res);
@@ -2117,6 +2125,7 @@ fn test_live_copyparty_excluded_folder_above_scan_root_is_untouched() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(get_res.is_ok(), "GET above-root test failed: {:?}", get_res);
@@ -2160,6 +2169,7 @@ fn test_live_copyparty_excluded_folder_above_scan_root_is_untouched() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(sync_res.is_ok(), "SYNC above-root test failed: {:?}", sync_res);
@@ -2417,6 +2427,7 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
         None,
         true,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     )
     .expect("scan with exclusions failed");

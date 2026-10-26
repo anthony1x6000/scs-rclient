@@ -1,18 +1,23 @@
 import { useEffect, useRef, useState, useLayoutEffect } from "react";
 import ExcludeFolders from "./ExcludeFolders";
+import ExtensionFilterPanel from "./ExtensionFilterPanel";
 
 interface RcloneConsoleProps {
   logs: string;
   onClear?: () => void;
   onOpenFolder?: () => void;
+  selectedSubdir: string;
 }
 
-export function RcloneConsole({ logs, onClear, onOpenFolder }: RcloneConsoleProps) {
+/** Which inline editor panel is open under the button row (one at a time). */
+type OpenPanel = "exclude" | "whitelist" | "blacklist" | null;
+
+export function RcloneConsole({ logs, onClear, onOpenFolder, selectedSubdir }: RcloneConsoleProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [follow, setFollow] = useState(true);
   const [copied, setCopied] = useState(false);
-  const [showExcludeFolders, setShowExcludeFolders] = useState(false);
+  const [openPanel, setOpenPanel] = useState<OpenPanel>(null);
   const [hasOverflow, setHasOverflow] = useState(false);
   const [atTop, setAtTop] = useState(true);
   const [atBottom, setAtBottom] = useState(true);
@@ -103,15 +108,33 @@ export function RcloneConsole({ logs, onClear, onOpenFolder }: RcloneConsoleProp
         )}
         <button
           type="button"
-          onClick={() => setShowExcludeFolders((open) => !open)}
-          aria-expanded={showExcludeFolders}
+          onClick={() => setOpenPanel((open) => (open === "exclude" ? null : "exclude"))}
+          aria-expanded={openPanel === "exclude"}
           aria-controls="scs-exclude-folders"
-          className={`px-2 py-1 border bg-transparent text-white cursor-pointer transition-all duration-150 ${showExcludeFolders ? "border-white/60" : "border-white/20 hover:border-white/50"}`}
+          className={`px-2 py-1 border bg-transparent text-white cursor-pointer transition-all duration-150 ${openPanel === "exclude" ? "border-white/60" : "border-white/20 hover:border-white/50"}`}
         >
           Exclude folder
         </button>
+        {(["whitelist", "blacklist"] as const).map((mode) => (
+          <button
+            key={mode}
+            type="button"
+            onClick={() => setOpenPanel((open) => (open === mode ? null : mode))}
+            aria-expanded={openPanel === mode}
+            aria-controls={`scs-extension-${mode}`}
+            className={`px-2 py-1 border bg-transparent text-white cursor-pointer transition-all duration-150 ${openPanel === mode ? "border-white/60" : "border-white/20 hover:border-white/50"}`}
+          >
+            {mode === "whitelist" ? "Whitelist extension" : "Blacklist extension"}
+          </button>
+        ))}
       </div>
-      {showExcludeFolders && <ExcludeFolders />}
+      {openPanel === "exclude" && <ExcludeFolders />}
+      {openPanel === "whitelist" && (
+        <ExtensionFilterPanel mode="whitelist" selectedSubdir={selectedSubdir} />
+      )}
+      {openPanel === "blacklist" && (
+        <ExtensionFilterPanel mode="blacklist" selectedSubdir={selectedSubdir} />
+      )}
       <label className="sr-only" htmlFor="scs-console">WebDAV console output</label>
       <div ref={wrapRef} className="relative flex-1 min-h-0 flex flex-col overflow-hidden px-2 pb-1">
         {/* top fade */}
