@@ -25,6 +25,10 @@ test("the committed fleet passes validation", () => {
   }
 });
 
+test("allows the go inference endpoint with the opencode go key", () => {
+  assert.equal(validateProvider({ ...fleetEntry, endpoint: "https://opencode.ai/inference/go/openai/v1/chat/completions" }), "");
+});
+
 test("rejects an endpoint outside the allowlist, so a poisoned fleet cannot ship the diff elsewhere", () => {
   assert.match(validateProvider({ ...fleetEntry, endpoint: "https://example.com/v1/chat/completions" }), /not in the review allowlist/);
 });
