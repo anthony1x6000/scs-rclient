@@ -31,7 +31,7 @@ describe("normalizeSubdir traversal scope", () => {
       "https://h.example/dav/a%252fb",
     );
     expect(resolveRemoteUrl("https://h.example/dav", "a%5Cb")).toBe(
-      "https://h.example/dav/a%255cb",
+      "https://h.example/dav/a%255Cb",
     );
   });
 
