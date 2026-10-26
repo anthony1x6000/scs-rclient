@@ -2631,7 +2631,17 @@ fn test_live_copyparty_extension_whitelist_only_listed_extensions_transfer() {
         remote
     );
 
-    // 2. Download into an empty directory: only whitelisted extensions come down.
+    // 2. Seed a disallowed remote file directly, so the download side must filter it
+    //    itself instead of merely receiving what the filtered upload left behind.
+    let seed_url = build_file_url(&test_url, "seeded/extra.bin");
+    let seed_res = client.put(b"seeded-bin".to_vec(), &seed_url).expect("seed PUT failed");
+    assert!(
+        seed_res.status().is_success(),
+        "seeding extra.bin failed with HTTP {}",
+        seed_res.status()
+    );
+
+    // 3. Download into an empty directory: only whitelisted extensions come down.
     fs::create_dir_all(&download_dir).unwrap();
     log_output.clear();
     let get_res = execute_webdav_action_with_exclusions(
@@ -2660,6 +2670,13 @@ fn test_live_copyparty_extension_whitelist_only_listed_extensions_transfer() {
         downloaded,
         vec!["docs/notes.TXT".to_string(), "index.html".to_string()],
         "only whitelisted extensions may download"
+    );
+    // The seeded disallowed file was filtered from the download, not deleted remotely.
+    let remote_after_get = remote_file_paths(&client, &test_url, &cancel_flag);
+    assert!(
+        remote_after_get.contains("seeded/extra.bin"),
+        "seeded extra.bin must stay remote after a filtered download: {:?}",
+        remote_after_get
     );
 
     // Cleanup: remove the dedicated remote collection and local temp tree.
@@ -2773,7 +2790,17 @@ fn test_live_copyparty_extension_blacklist_drops_listed_extensions() {
     assert!(remote.contains("LICENSE"), "remote must hold LICENSE: {:?}", remote);
     assert!(!remote.contains("blob.BIN"), "remote must not hold blob.BIN: {:?}", remote);
 
-    // 2. Download into an empty directory: the blacklisted extension stays remote.
+    // 2. Seed the blacklisted remote file directly, so the download side must filter
+    //    it itself instead of merely never having received it.
+    let seed_url = build_file_url(&test_url, "seeded/blob.BIN");
+    let seed_res = client.put(b"seeded-bin".to_vec(), &seed_url).expect("seed PUT failed");
+    assert!(
+        seed_res.status().is_success(),
+        "seeding blob.BIN failed with HTTP {}",
+        seed_res.status()
+    );
+
+    // 3. Download into an empty directory: the blacklisted extension stays remote.
     fs::create_dir_all(&download_dir).unwrap();
     log_output.clear();
     let get_res = execute_webdav_action_with_exclusions(
@@ -2806,6 +2833,13 @@ fn test_live_copyparty_extension_blacklist_drops_listed_extensions() {
             "src/main.rs".to_string(),
         ],
         "only non-blacklisted extensions may download"
+    );
+    // The seeded blacklisted file was filtered from the download, not deleted remotely.
+    let remote_after_get = remote_file_paths(&client, &test_url, &cancel_flag);
+    assert!(
+        remote_after_get.contains("seeded/blob.BIN"),
+        "seeded blob.BIN must stay remote after a filtered download: {:?}",
+        remote_after_get
     );
 
     // Cleanup: remove the dedicated remote collection and local temp tree.

@@ -35,6 +35,19 @@ const MODE_HINT: Record<ExtensionFilterMode, string> = {
  * CSV clears that scope. Resolution happens per folder at action time, so bulk runs
  * use each folder's own list.
  */
+/** This mode's effective list for the dir: the per-dir list, else the global one. */
+function ownModeList(
+  state: ExtensionFilterState,
+  mode: ExtensionFilterMode,
+  key: string | null,
+): string[] {
+  if (key) {
+    const perDir = mode === "whitelist" ? state.perDirWhitelist[key] : state.perDirBlacklist[key];
+    if (perDir) return perDir;
+  }
+  return mode === "whitelist" ? state.globalWhitelist : state.globalBlacklist;
+}
+
 export function ExtensionFilterPanel({ mode, selectedSubdir }: ExtensionFilterPanelProps) {
   const [snapshot, setSnapshot] = useState<ExtensionFilterState | null>(null);
   const [draft, setDraft] = useState("");
@@ -50,9 +63,10 @@ export function ExtensionFilterPanel({ mode, selectedSubdir }: ExtensionFilterPa
       .then((state) => {
         if (!activeRef.current) return;
         setSnapshot(state);
-        // Prefill with the list currently in effect for this dir (per-dir, else global).
-        const winner = resolveExtensionFilter(selectedSubdir, state);
-        setDraft(winner && winner.mode === mode ? formatExtensionCsv(winner.extensions) : "");
+        // Prefill with this mode's own list for this dir (per-dir, else global), so
+        // the box always shows what a confirm here would rewrite — even when the
+        // other mode currently wins resolution.
+        setDraft(formatExtensionCsv(ownModeList(state, mode, subdirKey(selectedSubdir))));
       })
       .catch((e) => {
         console.error("Failed to load extension filters:", e);

@@ -219,15 +219,18 @@ struct ExtensionFilterArgs {
 }
 
 impl ExtensionFilterArgs {
-    /// Normalizes into a backend filter. An unknown mode is an error rather than a
-    /// silently dropped filter, so a whitelist intent can never fail open into
-    /// transferring everything. A list with no valid entries yields `None`, since an
-    /// inert filter behaves like no filter at all.
-    fn into_filter(self) -> Result<Option<webdav::ExtensionFilter>, String> {
+    /// Normalizes into a backend filter, failing closed on anything malformed: an
+    /// unknown mode or a list with no valid entries is an error rather than a
+    /// silently dropped filter, so a whitelist intent can never degrade into
+    /// transferring everything.
+    fn into_filter(self) -> Result<webdav::ExtensionFilter, String> {
         let mode = webdav::ExtensionFilterMode::parse(&self.mode)
             .ok_or_else(|| format!("Invalid extension filter mode: \"{}\".", self.mode))?;
         let filter = webdav::ExtensionFilter::new(mode, &self.extensions);
-        Ok(filter.is_active().then_some(filter))
+        if !filter.is_active() {
+            return Err("Extension filter has no valid entries.".to_string());
+        }
+        Ok(filter)
     }
 }
 
@@ -245,8 +248,8 @@ impl ExtensionFilterArgs {
 /// - `exclude_folders`: Relative folder patterns (e.g. `.git/`) that scanning and transfers
 ///   must skip entirely — they are never traversed, uploaded, downloaded, or deleted by sync.
 /// - `extension_filter`: Optional [`ExtensionFilterArgs`] that gates files by extension on
-///   both sides of every scan. An unknown mode or a list with no valid entries is treated
-///   as no filter.
+///   both sides of every scan. An unknown mode or an entry list with no valid extensions
+///   fails the action instead of silently disabling the filter.
 #[tauri::command]
 async fn run_webdav_action(
     app: tauri::AppHandle,
@@ -267,7 +270,7 @@ async fn run_webdav_action(
     state.cancel_flag.store(false, Ordering::SeqCst);
     let cancel_flag = state.cancel_flag.clone();
     let exclude_folders = webdav::normalize_exclude_folders(&exclude_folders.unwrap_or_default());
-    let extension_filter = extension_filter.map_or(Ok(None), |args| args.into_filter())?;
+    let extension_filter = extension_filter.map(ExtensionFilterArgs::into_filter).transpose()?;
 
     let mount_dir_str = get_mount_dir(app.clone(), target_subdir)?;
     let base_mount = std::path::Path::new(&mount_dir_str);
