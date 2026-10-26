@@ -17,17 +17,30 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 /**
  * Normalizes a subdirectory path by trimming whitespace, leading slashes, and trailing slashes.
  * Rejects `.` / `..` segments, percent-encoded dot segments, control characters, and backslash
- * separators to prevent scope escape. Encoded separators (`%2f`/`%5c`) cannot traverse here:
- * `resolveRemoteUrl` passes each segment through `encodeURIComponent`, which re-encodes the `%`
- * (so `%2f` is sent as `%252f`) and the backend decodes it back to a literal, separator-free
- * name; the Rust-side guard additionally rejects them in the configured URL.
+ * separators to prevent scope escape. Segments are also checked after stripping trailing ASCII
+ * spaces, dots, and `%20` (the trim Windows/IIS-family servers apply per component), so
+ * spellings like `.. `, `...`, or `..%20` that alias onto a dot segment at resolve time are
+ * rejected. Encoded separators (`%2f`/`%5c`) cannot traverse here: `resolveRemoteUrl` passes
+ * each segment through `encodeURIComponent`, which re-encodes the `%` (so `%2f` is sent as
+ * `%252f`) and the backend decodes it back to a literal, separator-free name; the Rust-side
+ * guard additionally rejects them in the configured URL.
  */
 export function normalizeSubdir(subdir: string): string {
   const trimmed = subdir.trim().replace(/\\/g, "/");
   const parts = trimmed.split("/").filter((p) => p.length > 0);
   for (const part of parts) {
-    if (part === "." || part === ".." || DOT_SEGMENT.test(part) || CONTROL_CHARS.test(part)) {
-      throw new Error(`Invalid subdirectory "${subdir}": dot segments, encoded dot segments, and control characters are not allowed.`);
+    // What remains after the Windows-style per-segment trim: a part made
+    // entirely of dots/spaces collapses to "", and encoded-dot spellings
+    // are exposed to the DOT_SEGMENT check.
+    const core = part.replace(/(%20|[ .])+$/i, "");
+    if (
+      core === "" ||
+      core === "." ||
+      core === ".." ||
+      DOT_SEGMENT.test(core) ||
+      CONTROL_CHARS.test(part)
+    ) {
+      throw new Error(`Invalid subdirectory "${subdir}": dot segments, encoded dot segments, windows dot-alias spellings, and control characters are not allowed.`);
     }
   }
   return parts.join("/");

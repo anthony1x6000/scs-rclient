@@ -1417,8 +1417,8 @@ pub(crate) fn insecure_webdav_allowed() -> bool {
 /// Path-segment spellings the WHATWG URL parser collapses into dot segments
 /// (`.` removed, `..` pops the parent) even though they contain no literal
 /// `.` component: `%2e`, `.%2e`, `%2e.`, `%2e%2e` (ASCII case-insensitive).
-/// Popping happens inside `Url::parse`, i.e. after this guard, so a raw-string
-/// check is the only place the user-configured scope can be held to.
+/// The collapse happens inside `Url::parse`, so the raw string this guard
+/// inspects is the only form where the original spelling is still visible.
 fn has_url_dot_segment(raw: &str) -> bool {
     // Apply the WHATWG parser's input normalization first: it trims
     // leading/trailing C0 control or space and removes all ASCII tab, LF,
@@ -1447,13 +1447,36 @@ fn has_url_dot_segment(raw: &str) -> bool {
         .unwrap_or("");
     path.split(['/', '\\']).any(|seg| {
         let s = seg.to_ascii_lowercase();
-        matches!(s.as_str(), "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e")
+        // Windows/IIS-family servers trim trailing ASCII spaces and dots
+        // (including the %20 spelling of space) from each path component, so
+        // a spelling like `.. `, `...`, or `..%20` resolves to a dot segment
+        // at the server even though the exact matches below do not see one:
+        // strip those suffixes first and reject anything that collapses to
+        // a dot form (or to nothing but dots and spaces).
+        let trimmed = trim_windows_alias_suffixes(&s);
+        (!s.is_empty() && trimmed.is_empty())
+            || matches!(trimmed, "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e")
             // Encoded separators can decode back into path separators
             // server-side (a raw-concatenated `..%2fsecret` subdir), so a
             // configured scope never carries them.
             || s.contains("%2f")
             || s.contains("%5c")
     })
+}
+
+/// Strips any mix of trailing literal spaces, dots, and `%20` from a
+/// (lowercased) path segment: the per-component trim Windows-family servers
+/// apply before resolving the path.
+fn trim_windows_alias_suffixes(mut s: &str) -> &str {
+    loop {
+        if s.ends_with(' ') || s.ends_with('.') {
+            s = &s[..s.len() - 1];
+        } else if let Some(stripped) = s.strip_suffix("%20") {
+            s = stripped;
+        } else {
+            return s;
+        }
+    }
 }
 
 pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Result<(), String> {
