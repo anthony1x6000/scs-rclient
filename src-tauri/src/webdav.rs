@@ -4307,5 +4307,169 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_normalize_extension_entries() {
+        assert_eq!(normalize_extension(".HTML"), Some("html".to_string()));
+        assert_eq!(normalize_extension(" Docx "), Some("docx".to_string()));
+        assert_eq!(normalize_extension("txt"), Some("txt".to_string()));
+        assert_eq!(normalize_extension("7Z"), Some("7z".to_string()));
+        assert_eq!(normalize_extension(""), None);
+        assert_eq!(normalize_extension("   "), None);
+        assert_eq!(normalize_extension("a b"), None);
+        assert_eq!(normalize_extension("h/t/ml"), None);
+        assert_eq!(normalize_extension("h\\t"), None);
+        // Only leading dots are decoration; inner dots make it not an extension.
+        assert_eq!(normalize_extension("tar.gz"), None);
+        assert_eq!(
+            normalize_extension(&"x".repeat(MAX_EXTENSION_PATTERN_CHARS + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_normalize_extensions_dedupes_and_caps() {
+        let raw = vec![
+            ".html".to_string(),
+            "HTML".to_string(),
+            " txt ".to_string(),
+            "a b".to_string(),
+            "txt".to_string(),
+        ];
+        assert_eq!(
+            normalize_extensions(&raw),
+            vec!["html".to_string(), "txt".to_string()]
+        );
+        let many: Vec<String> = (0..(MAX_EXTENSION_PATTERNS + 10) as i32)
+            .map(|i| format!("e{i}"))
+            .collect();
+        assert_eq!(normalize_extensions(&many).len(), MAX_EXTENSION_PATTERNS);
+    }
+
+    #[test]
+    fn test_file_extension_std_path_semantics() {
+        assert_eq!(file_extension("docs/Report.HTML"), Some("html".to_string()));
+        assert_eq!(file_extension("archive.tar.gz"), Some("gz".to_string()));
+        assert_eq!(file_extension("LICENSE"), None);
+        // A leading dot alone marks a hidden file, not an extension.
+        assert_eq!(file_extension(".gitignore"), None);
+        assert_eq!(file_extension("dir/"), None);
+    }
+
+    #[test]
+    fn test_extension_filter_allows() {
+        let whitelist = ExtensionFilter::new(
+            ExtensionFilterMode::Whitelist,
+            &[".HTML".to_string(), "txt".to_string()],
+        );
+        assert!(whitelist.is_active());
+        assert!(whitelist.allows("page.HTML"));
+        assert!(whitelist.allows("notes.txt"));
+        assert!(whitelist.allows("docs/page.html"));
+        assert!(!whitelist.allows("data.bin"));
+        // Files without an extension never pass a whitelist.
+        assert!(!whitelist.allows("LICENSE"));
+        // Only the full extension counts: "gz" is listed, "tar.gz" is not.
+        assert!(!whitelist.allows("archive.tar.gz"));
+
+        let blacklist =
+            ExtensionFilter::new(ExtensionFilterMode::Blacklist, &["bin".to_string()]);
+        assert!(!blacklist.allows("blob.BIN"));
+        assert!(blacklist.allows("notes.txt"));
+        // Files without an extension never match a blacklist.
+        assert!(blacklist.allows("LICENSE"));
+
+        // A filter whose entries all normalize away is inactive and allows everything.
+        let inactive = ExtensionFilter::new(
+            ExtensionFilterMode::Whitelist,
+            &["".to_string(), "a b".to_string()],
+        );
+        assert!(!inactive.is_active());
+        assert!(inactive.allows("anything.bin"));
+
+        assert_eq!(
+            ExtensionFilterMode::parse("WHITELIST"),
+            Some(ExtensionFilterMode::Whitelist)
+        );
+        assert_eq!(
+            ExtensionFilterMode::parse("Blacklist"),
+            Some(ExtensionFilterMode::Blacklist)
+        );
+        assert_eq!(ExtensionFilterMode::parse("allowlist"), None);
+    }
+
+    #[test]
+    fn test_collect_local_files_filters_extensions() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "scs_extfilter_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let write = |rel: &str| {
+            let path = temp_dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"data").unwrap();
+        };
+        write("index.html");
+        write("notes.TXT");
+        write("data.bin");
+        write("LICENSE");
+        write("sub/page.html");
+        write("sub/keep.txt");
+
+        let rels = |filter: Option<&ExtensionFilter>| {
+            let mut collected: Vec<String> =
+                collect_local_files_excluding(&temp_dir, &[], filter)
+                    .into_iter()
+                    .map(|(_, rel, _)| rel)
+                    .collect();
+            collected.sort();
+            collected
+        };
+
+        let whitelist = ExtensionFilter::new(
+            ExtensionFilterMode::Whitelist,
+            &[".html".to_string(), "txt".to_string()],
+        );
+        assert_eq!(
+            rels(Some(&whitelist)),
+            vec![
+                "index.html".to_string(),
+                "notes.TXT".to_string(),
+                "sub/keep.txt".to_string(),
+                "sub/page.html".to_string(),
+            ]
+        );
+
+        let blacklist = ExtensionFilter::new(ExtensionFilterMode::Blacklist, &["bin".to_string()]);
+        assert_eq!(
+            rels(Some(&blacklist)),
+            vec![
+                "LICENSE".to_string(),
+                "index.html".to_string(),
+                "notes.TXT".to_string(),
+                "sub/keep.txt".to_string(),
+                "sub/page.html".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            rels(None),
+            vec![
+                "LICENSE".to_string(),
+                "data.bin".to_string(),
+                "index.html".to_string(),
+                "notes.TXT".to_string(),
+                "sub/keep.txt".to_string(),
+                "sub/page.html".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
 
