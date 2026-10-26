@@ -835,7 +835,7 @@ pub fn parse_webdav_date(date_str: &str) -> Option<u64> {
 }
 
 /// Parses the WebDAV PROPFIND XML response into WebdavItem records.
-pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
+pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
     let mut items = Vec::new();
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -963,13 +963,20 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                 }
             }
             Ok(quick_xml::events::Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => {
+                // A malformed document must fail the whole listing: callers
+                // treat the returned set as complete ground truth (sync
+                // upload/delete decisions, the listing cache). Silently
+                // returning the items parsed so far turns a broken response
+                // into a wrong-but-plausible listing.
+                return Err(format!("malformed PROPFIND XML: {e}"));
+            }
             _ => {}
         }
         buf.clear();
     }
 
-    items
+    Ok(items)
 }
 
 /// Simple percent decoder for URI path segments.
@@ -1646,8 +1653,19 @@ where
             let status = res.status();
             if status.is_success() || status.as_u16() == 207 {
                 let body = res.text().unwrap_or_default();
-                let items: Vec<WebdavItem> = parse_propfind_xml(&body)
-                    .into_iter()
+                let items: Vec<WebdavItem> = match parse_propfind_xml(&body) {
+                    Ok(items) => items,
+                    Err(reason) => {
+                        // A malformed listing must not be treated as a
+                        // complete result: fall back to the Depth:1 traversal
+                        // below instead of trusting a partial parse.
+                        log(&format!(
+                            "{reason}; falling back to Depth: 1 traversal...\n"
+                        ));
+                        Vec::new()
+                    }
+                }
+                .into_iter()
                     // A Depth: infinity response is expanded server-side, so drop excluded
                     // folders and everything under them before they can be cached or used.
                     .filter(|item| {
@@ -1943,7 +1961,14 @@ where
                     }
 
                     let body = res.text().unwrap_or_default();
-                    let items = parse_propfind_xml(&body);
+                    let items = match parse_propfind_xml(&body) {
+                        Ok(items) => items,
+                        Err(reason) => {
+                            state.error = Some(reason);
+                            state.stopped = true;
+                            return;
+                        }
+                    };
 
                     let mut children_in_dir = 0;
                     let mut new_dirs = 0;
@@ -2840,7 +2865,7 @@ where
                 return Err(format!("Server returned HTTP {}", res.status()));
             }
             let body = res.text().unwrap_or_default();
-            let items = parse_propfind_xml(&body);
+            let items = parse_propfind_xml(&body)?;
             let mut count = 0;
             for item in &items {
                 if !item.is_dir {
@@ -3607,7 +3632,7 @@ mod tests {
             </D:response>
         </D:multistatus>"#;
 
-        let items = parse_propfind_xml(sample);
+        let items = parse_propfind_xml(sample).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].href, "/files/myuser/docs/");
         assert!(items[0].is_dir);
@@ -3693,7 +3718,7 @@ mod tests {
             </D:Response>
         </D:multistatus>"#;
 
-        let items = parse_propfind_xml(xml);
+        let items = parse_propfind_xml(xml).unwrap();
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].href, "/content/enforced/1052175-dev_asteve18/");
         assert!(items[0].is_dir);
@@ -3811,7 +3836,7 @@ mod tests {
 </d:multistatus>"#;
 
         let base = "https://courselinkdav.desire2learn.com/content/enforced/1052175-dev_asteve18/";
-        let items = parse_propfind_xml(xml);
+        let items = parse_propfind_xml(xml).unwrap();
         assert_eq!(items.len(), 5);
 
         // Item 0: Root collection
