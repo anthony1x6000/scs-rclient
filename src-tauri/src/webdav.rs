@@ -4011,6 +4011,52 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_propfind_xml_requires_multistatus_root() {
+        // An empty body (e.g. a defaulted body read) or well-formed
+        // non-multistatus XML (proxied HTML error pages) must not parse as
+        // an empty-but-complete listing: callers treat Ok(vec![]) as ground
+        // truth and act on everything "missing" from it.
+        assert!(
+            parse_propfind_xml("").is_err(),
+            "empty body must be an error, not an empty listing"
+        );
+        assert!(
+            parse_propfind_xml("<html><body><h1>404 Not Found</h1></body></html>").is_err(),
+            "well-formed non-multistatus XML must be an error"
+        );
+        assert!(
+            parse_propfind_xml(
+                "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>\
+                 <D:resourcetype/></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+                 </D:propstat></D:response>"
+            )
+            .is_err(),
+            "response without a multistatus root must be an error"
+        );
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_rejects_truncation_after_complete_response() {
+        // quick_xml raises no syntax error for XML that simply stops after a
+        // complete </D:response>: unclosed ancestors are only detectable at
+        // EOF, so the parser must track element depth itself.
+        let body = concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?>",
+            "<D:multistatus xmlns:D=\"DAV:\">",
+            "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+        );
+        let parsed = parse_propfind_xml(body);
+        assert!(
+            parsed.is_err(),
+            "truncation after a complete response must be an error, not a 1-item listing"
+        );
+        let ok_body = format!("{body}</D:multistatus>");
+        assert_eq!(parse_propfind_xml(&ok_body).unwrap().len(), 1);
+    }
+
+    #[test]
     fn test_validate_webdav_url_ipv6_literals_and_mapped_ranges() {
         // Bracketed IPv6 literals reach the IP check (host_str returns them
         // bracketed, which the old bare host.parse() never matched).
