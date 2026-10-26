@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { loadAppSettings } from "../settings";
+import { loadAppSettings, excludedFoldersFor, type ExcludedFoldersByDir } from "../settings";
 import { BULK_MIN_FOLDERS, formatBulkSummary, runBulkSequential } from "../bulk";
 
 export interface RcloneSettings {
@@ -10,7 +10,8 @@ export interface RcloneSettings {
   selectedSubdir: string;
   targetSubdir: string;
   scanConcurrency: number;
-  excludedFolders: string[];
+  excludedFoldersByDir: ExcludedFoldersByDir;
+  excludedFoldersLegacy: string[];
 }
 
 export type RcloneActionType = 'put' | 'get' | 'get-backup' | 'get-backup-dated' | 'put-dry' | 'get-dry' | 'put-checksum' | 'get-checksum' | 'ls' | 'lsd' | 'check' | 'sync';
@@ -41,7 +42,8 @@ export async function loadSettings(): Promise<RcloneSettings> {
     selectedSubdir: s.selectedSubdir,
     targetSubdir: s.targetSubdir,
     scanConcurrency: s.scanConcurrency,
-    excludedFolders: s.excludedFolders,
+    excludedFoldersByDir: s.excludedFoldersByDir,
+    excludedFoldersLegacy: s.excludedFoldersLegacy,
   };
 }
 
@@ -103,6 +105,8 @@ export function useRcloneExecution(
     // the dated variant nests one level deeper under today's date.
     const isDatedBackup = action === "get-backup-dated";
     const isBackup = action === "get-backup" || isDatedBackup;
+    // Exclusions are scoped to the directory this operation runs on, so one
+    // folder's patterns never leak into another folder's bulk run.
     await invoke("run_webdav_action", {
       action: isBackup ? "get" : action,
       baseUrl: settings.baseUrl,
@@ -112,7 +116,7 @@ export function useRcloneExecution(
       concurrency: settings.scanConcurrency,
       backup: isBackup || undefined,
       backupDated: isDatedBackup || undefined,
-      excludeFolders: settings.excludedFolders,
+      excludeFolders: excludedFoldersFor(settings.excludedFoldersByDir, subdir, settings.excludedFoldersLegacy),
     });
   };
 
@@ -129,6 +133,8 @@ export function useRcloneExecution(
     log("Loading configuration...\n");
 
     try {
+      // Settings, including the exclusion lists, are loaded once per run;
+      // edits made mid-run apply on the next run.
       const settings = await loadSettings();
       if (!settings.baseUrl) {
         log("Error: WebDAV URL must be configured.\n");
