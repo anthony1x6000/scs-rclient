@@ -4102,6 +4102,30 @@ mod tests {
             .is_err(),
             "response without a multistatus root must be an error"
         );
+        // Elements BEFORE the root are not part of the document: a response
+        // ahead of a real multistatus root must fail the parse outright, not
+        // inject its items into the listing.
+        assert!(
+            parse_propfind_xml(
+                "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>\
+                 <D:resourcetype/></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+                 </D:propstat></D:response>\
+                 <D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/c/b.txt</D:href>\
+                 <D:propstat><D:prop><D:resourcetype/></D:prop>\
+                 <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+                 </D:multistatus>"
+            )
+            .is_err(),
+            "a response before the multistatus root must be an error"
+        );
+        // Nothing may follow the closed root either.
+        assert!(
+            parse_propfind_xml(
+                "<D:multistatus xmlns:D=\"DAV:\"></D:multistatus><D:multistatus xmlns:D=\"DAV:\"/>"
+            )
+            .is_err(),
+            "a second root after the closed multistatus must be an error"
+        );
     }
 
     #[test]
