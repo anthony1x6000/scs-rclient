@@ -13,6 +13,8 @@ export function normalizeUrl(url: string): string {
 const DOT_SEGMENT = /^(\.|\.\.|%2e|\.%2e|%2e\.|%2e%2e)$/i;
 /** Control characters never valid in a folder name handed to the backend. */
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+/** Encoded separators the Rust URL guard refuses in any configured path. */
+const ENCODED_SEPARATORS = /%2f|%5c/i;
 
 /**
  * Normalizes a subdirectory path by trimming whitespace, leading slashes, and trailing slashes.
@@ -23,7 +25,9 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
  * rejected. Encoded separators (`%2f`/`%5c`) cannot traverse here: `resolveRemoteUrl` passes
  * each segment through `encodeURIComponent`, which re-encodes the `%` (so `%2f` is sent as
  * `%252f`) and the backend decodes it back to a literal, separator-free name; the Rust-side
- * guard additionally rejects them in the configured URL.
+ * guard additionally rejects them in the configured URL, so they are refused
+ * here as well — a stored value the backend would refuse could otherwise
+ * pass frontend validation and fail every request at runtime.
  */
 export function normalizeSubdir(subdir: string): string {
   const trimmed = subdir.trim().replace(/\\/g, "/");
@@ -38,9 +42,10 @@ export function normalizeSubdir(subdir: string): string {
       core === "." ||
       core === ".." ||
       DOT_SEGMENT.test(core) ||
-      CONTROL_CHARS.test(part)
+      CONTROL_CHARS.test(part) ||
+      ENCODED_SEPARATORS.test(part)
     ) {
-      throw new Error(`Invalid subdirectory "${subdir}": dot segments, encoded dot segments, windows dot-alias spellings, and control characters are not allowed.`);
+      throw new Error(`Invalid subdirectory "${subdir}": dot segments, encoded dot segments, windows dot-alias spellings, encoded separators, and control characters are not allowed.`);
     }
   }
   return parts.join("/");
