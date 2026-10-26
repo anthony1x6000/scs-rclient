@@ -34,14 +34,20 @@ describe("groupFoldersByParent", () => {
     expect(groups.get("")).toEqual([f("a")]);
   });
 
-  it("sorts each group by display name", () => {
-    const groups = groupFoldersByParent([f("zeta"), f("alpha"), f("mid/z")]);
-    expect(groups.get("")).toEqual([f("alpha"), f("mid/z"), f("zeta")]);
+  it("sorts each group by path", () => {
+    const groups = groupFoldersByParent([f("zeta"), f("alpha"), f("beta")]);
+    expect(groups.get("")).toEqual([f("alpha"), f("beta"), f("zeta")]);
   });
 
-  it("sorts siblings with nested names after their shared prefix naturally", () => {
-    const groups = groupFoldersByParent([f("a"), f("a-b"), f("a/b")]);
-    expect(groups.get("")).toEqual([f("a"), f("a-b"), f("a/b")]);
+  it("keeps deeper folders grouped under their own parent, not the root", () => {
+    const groups = groupFoldersByParent([f("alpha"), f("mid/z"), f("zeta")]);
+    expect(groups.get("")).toEqual([f("alpha"), f("zeta")]);
+    expect(groups.get("mid")).toEqual([f("mid/z")]);
+  });
+
+  it("sorts sibling names with punctuation predictably", () => {
+    const groups = groupFoldersByParent([f("a0"), f("a"), f("a-b")]);
+    expect(groups.get("")).toEqual([f("a"), f("a-b"), f("a0")]);
   });
 
   it("returns an empty map for an empty listing", () => {
