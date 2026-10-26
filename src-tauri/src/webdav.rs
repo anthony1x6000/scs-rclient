@@ -1076,13 +1076,16 @@ pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
         return String::new();
     }
 
-    // 2. Direct prefix match (case-insensitive)
+    // 2. Direct prefix match (case-insensitive). `split_at_checked` keeps the
+    // slice panic-free when a percent-decoded multi-byte character in the
+    // item path straddles the byte length of the base path.
     if trimmed_item.len() > trimmed_base.len() {
-        let (prefix, suffix) = trimmed_item.split_at(trimmed_base.len());
-        if prefix.eq_ignore_ascii_case(trimmed_base)
-            && (suffix.starts_with('/') || trimmed_base.is_empty())
-        {
-            return sanitize_relative_path(suffix);
+        if let Some((prefix, suffix)) = trimmed_item.split_at_checked(trimmed_base.len()) {
+            if prefix.eq_ignore_ascii_case(trimmed_base)
+                && (suffix.starts_with('/') || trimmed_base.is_empty())
+            {
+                return sanitize_relative_path(suffix);
+            }
         }
     }
 
