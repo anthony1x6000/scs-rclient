@@ -1025,10 +1025,20 @@ fn reserve_inflight_listing() -> Result<InflightListingGuard, String> {
     }
 }
 
-pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<String, String> {
-    // Hold the worst-case reservation for the whole read so concurrent
-    // workers cannot each buffer a full body past the shared ceiling.
-    let _inflight = reserve_inflight_listing()?;
+/// The body String and the in-flight reservation that covers it: the guard
+/// MUST outlive the parse (the buffered body and the parser both work on it
+/// inside the reserved budget), so callers keep both bindings until the
+/// parsed items exist, then drop the guard.
+pub(crate) struct ListingBody {
+    pub(crate) body: String,
+    _inflight: InflightListingGuard,
+}
+
+pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<ListingBody, String> {
+    // Hold the worst-case reservation for the whole read AND the parse that
+    // follows it, so concurrent workers cannot each buffer a full body past
+    // the shared ceiling.
+    let inflight = reserve_inflight_listing()?;
     let mut limited = body.take(MAX_LISTING_BODY_BYTES + 1);
     let mut buf = String::new();
     limited
@@ -1039,7 +1049,7 @@ pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<String
             "listing body exceeds the {MAX_LISTING_BODY_BYTES} byte limit"
         ));
     }
-    Ok(buf)
+    Ok(ListingBody { body: buf, _inflight: inflight })
 }
 
 /// Parses a WebDAV date string into a UNIX timestamp (seconds since epoch).
@@ -1234,12 +1244,15 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                             size: current_size,
                             mtime: current_mtime,
                         });
-                        // Stop collecting once the cap is exceeded: callers
-                        // treat an over-cap listing as hostile, and parsing
-                        // halts instead of materializing unbounded item state
-                        // from one byte-bounded body.
+                        // An over-cap listing is refused outright: a
+                        // truncated Ok would let duplicate-padded responses
+                        // pass as complete (uniqueness is a caller concern
+                        // the parser cannot see), so overflow is an error
+                        // and every caller rejects the listing.
                         if items.len() > MAX_REMOTE_ITEMS {
-                            break;
+                            return Err(format!(
+                                "listing exceeded the {MAX_REMOTE_ITEMS} item limit"
+                            ));
                         }
                     }
                 } else if name.eq_ignore_ascii_case(b"href") {
@@ -2261,8 +2274,14 @@ where
                 // A failed body read must not degrade into an empty listing:
                 // it flows through the same fallback as a malformed body, and
                 // the body itself is read through the bounded reader.
-                let parsed: Result<Vec<WebdavItem>, String> =
-                    read_listing_body(&mut res).and_then(|body| parse_propfind_xml(&body));
+                let parsed: Result<Vec<WebdavItem>, String> = read_listing_body(&mut res)
+                    .and_then(|listing| {
+                        // Parse inside the reservation: the body and its
+                        // parse both belong to the in-flight budget.
+                        let parsed = parse_propfind_xml(&listing.body);
+                        drop(listing);
+                        parsed
+                    });
                 let items: Vec<WebdavItem> = match parsed {
                     Ok(items) => items,
                     Err(reason) => {
@@ -2286,15 +2305,8 @@ where
                         )
                     })
                     .collect();
-                // The item cap must bind this path too: a hostile server
-                // can pack more than MAX_REMOTE_ITEMS entries into a
-                // sub-cap body. Fail loudly instead of caching or using a
-                // listing the scan-state aggregate cap never sees.
-                if items.len() > MAX_REMOTE_ITEMS {
-                    return Err(format!(
-                        "Depth: infinity listing exceeded the {MAX_REMOTE_ITEMS} item limit. Aborting for security."
-                    ));
-                }
+                // Per-listing item caps are enforced by the parser itself:
+                // an over-cap listing is a parse error on every path.
                 // Depth: infinity is only accepted if it returned child items (not just the root collection itself)
                 let child_count = items
                     .iter()
@@ -2579,24 +2591,27 @@ where
                     }
 
                     let mut res = res;
-                    let body = match read_listing_body(&mut res) {
-                        Ok(body) => body,
+                    let listing = match read_listing_body(&mut res) {
+                        Ok(listing) => listing,
                         Err(reason) => {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                            state.error = Some(reason);
+                            state.error = Some(format!("PROPFIND {current_url}: {reason}"));
                             state.stopped = true;
                             return;
                         }
                     };
-                    let items = match parse_propfind_xml(&body) {
+                    let items = match parse_propfind_xml(&listing.body) {
                         Ok(items) => items,
                         Err(reason) => {
                             let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
-                            state.error = Some(reason);
+                            state.error = Some(format!("PROPFIND {current_url}: {reason}"));
                             state.stopped = true;
                             return;
                         }
                     };
+                    // The body and its parse are done; release the in-flight
+                    // reservation before the item-processing work below.
+                    drop(listing);
                     if items.is_empty() {
                         // A Depth: 1 listing always contains at least the
                         // collection itself; zero responses means the body
@@ -3593,13 +3608,10 @@ where
                 return Err(format!("Server returned HTTP {}", res.status()));
             }
             let mut res = res;
-            let body = read_listing_body(&mut res)?;
-            let items = parse_propfind_xml(&body)?;
-            if items.len() > MAX_REMOTE_ITEMS {
-                return Err(format!(
-                    "Listing exceeded the {MAX_REMOTE_ITEMS} item limit. Aborting for security."
-                ));
-            }
+            let listing = read_listing_body(&mut res)?;
+            let items = parse_propfind_xml(&listing.body)?;
+            drop(listing);
+            // Per-listing item caps are enforced by the parser itself.
             if items.is_empty() {
                 return Err(
                     "PROPFIND returned an empty multistatus (no resources, not even the collection)"
@@ -4799,8 +4811,13 @@ mod tests {
         }
     }
 
+    /// Serializes the tests that touch the shared in-flight budget or the
+    /// bounded reader, so a parallel `cargo test` cannot interleave them.
+    static LISTING_BUDGET_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_listing_body_is_byte_bounded() {
+        let _guard = LISTING_BUDGET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // Server-controlled listing bodies must never be buffered without a
         // bound: a response larger than the cap is an error, not a String.
         let over: String = "x".repeat(MAX_LISTING_BODY_BYTES as usize + 1);
@@ -4809,7 +4826,7 @@ mod tests {
 
         let under: String = "x".repeat(1024);
         let mut cursor = std::io::Cursor::new(under.clone().into_bytes());
-        assert_eq!(read_listing_body(&mut cursor).unwrap(), under);
+        assert_eq!(read_listing_body(&mut cursor).unwrap().body, under);
 
         // Invalid UTF-8 is a read error (fail closed), not lossy acceptance.
         let mut cursor = std::io::Cursor::new(vec![0xff, 0xfe, 0x00]);
@@ -5096,6 +5113,7 @@ mod tests {
 
     #[test]
     fn test_inflight_listing_budget_bounds_concurrent_bodies() {
+        let _guard = LISTING_BUDGET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // The per-body cap alone would let MAX_SCAN_CONCURRENCY workers each
         // buffer a full MAX_LISTING_BODY_BYTES body (~4 GiB aggregate) before
         // any aggregate check runs: every listing read reserves its worst
