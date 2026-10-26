@@ -477,7 +477,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Deploy to gh-pages Branch
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./_site
@@ -583,7 +583,7 @@ jobs:
       contents: write
     steps:
       - name: Scan Release Assets via VirusTotal
-        uses: crazy-max/ghaction-virustotal@v5.0.0
+        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
         continue-on-error: true
         with:
           vt_api_key: ${{ secrets.VT_KEY }}
