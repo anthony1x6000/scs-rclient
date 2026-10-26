@@ -300,16 +300,18 @@ jobs:
         if: success() && steps.diff.outputs.has_diff == 'true'
         run: node scripts/ai-code-review.mjs prepare-payload
 
-      # One reviewer audits the same skill over the same diff:
-      # deepseek-v4.1-flash on the opencode go plan. The list, the endpoints,
-      # the secret each model needs, any per-model completion budget, and the
-      # reasoning level every reviewer runs at live in
-      # .github/ai-review-models.json; that level is high, the step under the
-      # endpoint's own ceiling, so a reviewer reasons harder than its default
-      # without spending its whole completion budget on the trace. A model that
-      # returns no review text abstains; with a single reviewer that leaves no
-      # explicit approval, so the job fails closed rather than merging a diff
-      # nothing reviewed. Each review is posted the moment its reviewer answers.
+      # Two reviewers audit the same skill over the same diff, one call per
+      # model, all concurrent: beam-free on the go inference endpoint and
+      # deepseek-v4.1-flash on the opencode go gateway, both on the opencode go
+      # plan. The list, the endpoints, the secret each model needs, any
+      # per-model completion budget, and the reasoning level every reviewer runs
+      # at live in .github/ai-review-models.json; that level is high, the step
+      # under the endpoint's own ceiling, so a reviewer reasons harder than its
+      # default without spending its whole completion budget on the trace. A
+      # model that returns no review text abstains, so an unavailable endpoint
+      # cannot block a merge on its own. Each review is posted the moment that
+      # reviewer answers, so the one that stalls on its endpoint no longer keeps
+      # the other's review off the pull request for the rest of its timeout.
       - name: Call AI Code Review Models
         if: success() && steps.diff.outputs.has_diff == 'true'
         env:
