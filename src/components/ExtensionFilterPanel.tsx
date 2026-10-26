@@ -61,8 +61,9 @@ export function ExtensionFilterPanel({ mode, selectedSubdir }: ExtensionFilterPa
     return () => {
       activeRef.current = false;
     };
-    // The panel remounts on every open, so loading once per mount is enough;
-    // the status lines below read the live `selectedSubdir` prop instead.
+    // The panel remounts on every open and on every selected-dir change (keyed in
+    // RcloneConsole), so loading once per mount is enough and the draft can never
+    // belong to a different dir than the one "Confirm for this dir" will save.
   }, []);
 
   const dirKey = subdirKey(selectedSubdir);
@@ -97,8 +98,9 @@ export function ExtensionFilterPanel({ mode, selectedSubdir }: ExtensionFilterPa
       }
       const next = await getExtensionFilterState();
       setSnapshot(next);
-      const winner = resolveExtensionFilter(selectedSubdir, next);
-      setDraft(winner && winner.mode === mode ? formatExtensionCsv(winner.extensions) : "");
+      // Show the list exactly as saved for this scope, even when the other mode
+      // wins resolution, so a second Confirm cannot accidentally clear it.
+      setDraft(formatExtensionCsv(extensions));
       setError(null);
     } catch (e) {
       console.error("Failed to save extension filter:", e);

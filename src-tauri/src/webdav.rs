@@ -2246,8 +2246,6 @@ pub fn collect_local_files_with_mtime(dir: &Path) -> Vec<(PathBuf, String, u64, 
     collect_local_files_with_mtime_excluding(dir, &[], None)
 }
 
-/// Walks a local directory recursively, pruning excluded folders before descending.
-///
 /// Walks a local directory recursively, pruning excluded folders and files the
 /// extension filter rejects.
 ///

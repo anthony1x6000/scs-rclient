@@ -95,6 +95,10 @@ export function subdirKey(subdir: string | null | undefined): string | null {
  * Resolves the filter that governs `subdir`: a per-dir filter (either kind)
  * replaces the global one entirely, and a whitelist beats a blacklist within
  * the same scope. Null when nothing is set.
+ *
+ * Per-dir lists match exactly one folder — a list saved for `course/a` does not
+ * apply to `course/a/b`; the nested folder resolves its own list or the global
+ * one. Bulk runs call this per folder, so each ticked folder gets its own answer.
  */
 export function resolveExtensionFilter(
   subdir: string | null | undefined,

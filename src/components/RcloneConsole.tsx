@@ -130,10 +130,10 @@ export function RcloneConsole({ logs, onClear, onOpenFolder, selectedSubdir }: R
       </div>
       {openPanel === "exclude" && <ExcludeFolders />}
       {openPanel === "whitelist" && (
-        <ExtensionFilterPanel mode="whitelist" selectedSubdir={selectedSubdir} />
+        <ExtensionFilterPanel key={selectedSubdir} mode="whitelist" selectedSubdir={selectedSubdir} />
       )}
       {openPanel === "blacklist" && (
-        <ExtensionFilterPanel mode="blacklist" selectedSubdir={selectedSubdir} />
+        <ExtensionFilterPanel key={selectedSubdir} mode="blacklist" selectedSubdir={selectedSubdir} />
       )}
       <label className="sr-only" htmlFor="scs-console">WebDAV console output</label>
       <div ref={wrapRef} className="relative flex-1 min-h-0 flex flex-col overflow-hidden px-2 pb-1">

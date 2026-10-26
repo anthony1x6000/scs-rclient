@@ -219,12 +219,15 @@ struct ExtensionFilterArgs {
 }
 
 impl ExtensionFilterArgs {
-    /// Normalizes into a backend filter; `None` when the mode is unknown or no entry
-    /// survives normalization, since an inert filter behaves like no filter at all.
-    fn into_filter(self) -> Option<webdav::ExtensionFilter> {
-        let mode = webdav::ExtensionFilterMode::parse(&self.mode)?;
+    /// Normalizes into a backend filter. An unknown mode is an error rather than a
+    /// silently dropped filter, so a whitelist intent can never fail open into
+    /// transferring everything. A list with no valid entries yields `None`, since an
+    /// inert filter behaves like no filter at all.
+    fn into_filter(self) -> Result<Option<webdav::ExtensionFilter>, String> {
+        let mode = webdav::ExtensionFilterMode::parse(&self.mode)
+            .ok_or_else(|| format!("Invalid extension filter mode: \"{}\".", self.mode))?;
         let filter = webdav::ExtensionFilter::new(mode, &self.extensions);
-        filter.is_active().then_some(filter)
+        Ok(filter.is_active().then_some(filter))
     }
 }
 
@@ -264,7 +267,7 @@ async fn run_webdav_action(
     state.cancel_flag.store(false, Ordering::SeqCst);
     let cancel_flag = state.cancel_flag.clone();
     let exclude_folders = webdav::normalize_exclude_folders(&exclude_folders.unwrap_or_default());
-    let extension_filter = extension_filter.and_then(|args| args.into_filter());
+    let extension_filter = extension_filter.map_or(Ok(None), |args| args.into_filter())?;
 
     let mount_dir_str = get_mount_dir(app.clone(), target_subdir)?;
     let base_mount = std::path::Path::new(&mount_dir_str);
