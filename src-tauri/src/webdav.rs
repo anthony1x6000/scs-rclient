@@ -987,7 +987,8 @@ impl Drop for InflightListingGuard {
             .unwrap_or_else(|p| p.into_inner());
         *current = current.saturating_sub(self.reserved);
         drop(current);
-        INFLIGHT_LISTING_ROOM.notify_all();
+        // One release frees exactly one worst-case body slot.
+        INFLIGHT_LISTING_ROOM.notify_one();
     }
 }
 
@@ -1040,15 +1041,20 @@ pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<Listin
     // the shared ceiling.
     let inflight = reserve_inflight_listing()?;
     let mut limited = body.take(MAX_LISTING_BODY_BYTES + 1);
-    let mut buf = String::new();
+    // Read bytes, then convert in place: read_to_string would double-buffer
+    // (a temporary String copy next to the internal Vec), briefly allocating
+    // ~2x the body while the reservation covers only 1x.
+    let mut bytes = Vec::new();
     limited
-        .read_to_string(&mut buf)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("listing body read failed: {e}"))?;
-    if buf.len() as u64 > MAX_LISTING_BODY_BYTES {
+    if bytes.len() as u64 > MAX_LISTING_BODY_BYTES {
         return Err(format!(
             "listing body exceeds the {MAX_LISTING_BODY_BYTES} byte limit"
         ));
     }
+    let buf = String::from_utf8(bytes)
+        .map_err(|e| format!("listing body is not valid UTF-8: {e}"))?;
     Ok(ListingBody { body: buf, _inflight: inflight })
 }
 
