@@ -852,11 +852,28 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
     let mut current_size: u64 = 0;
     let mut current_mtime: Option<u64> = None;
 
+    // A PROPFIND response is a single multistatus document. quick_xml only
+    // raises syntax errors; a body that never opens a multistatus root or
+    // one truncated after a complete child element still parses "fine", so
+    // the document shape is tracked here and enforced at EOF.
+    let mut depth: i64 = 0;
+    let mut saw_multistatus_root = false;
+
     let mut buf = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(ref e)) => {
+                if depth == 0 {
+                    if saw_multistatus_root {
+                        return Err(
+                            "malformed PROPFIND XML: content after the multistatus root"
+                                .to_string(),
+                        );
+                    }
+                    saw_multistatus_root = e.local_name().as_ref().eq_ignore_ascii_case(b"multistatus");
+                }
+                depth += 1;
                 let local = e.local_name();
                 let name = local.as_ref();
                 if name.eq_ignore_ascii_case(b"response") {
@@ -883,6 +900,9 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                 }
             }
             Ok(quick_xml::events::Event::Empty(ref e)) => {
+                if depth == 0 && !saw_multistatus_root {
+                    saw_multistatus_root = e.local_name().as_ref().eq_ignore_ascii_case(b"multistatus");
+                }
                 let local = e.local_name();
                 let name = local.as_ref();
                 if in_resourcetype && name.eq_ignore_ascii_case(b"collection") {
@@ -934,6 +954,7 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                 }
             }
             Ok(quick_xml::events::Event::End(ref e)) => {
+                depth = depth.saturating_sub(1);
                 let local = e.local_name();
                 let name = local.as_ref();
                 if name.eq_ignore_ascii_case(b"response") {
@@ -962,7 +983,20 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                     in_iscollection = false;
                 }
             }
-            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(quick_xml::events::Event::Eof) => {
+                if !saw_multistatus_root {
+                    return Err(
+                        "malformed PROPFIND XML: no multistatus root element (empty or non-WebDAV body)"
+                            .to_string(),
+                    );
+                }
+                if depth != 0 {
+                    return Err(format!(
+                        "malformed PROPFIND XML: truncated body with {depth} unclosed element(s)"
+                    ));
+                }
+                break;
+            }
             Err(e) => {
                 // A malformed document must fail the whole listing: callers
                 // treat the returned set as complete ground truth (sync
@@ -1652,8 +1686,13 @@ where
         Ok(res) => {
             let status = res.status();
             if status.is_success() || status.as_u16() == 207 {
-                let body = res.text().unwrap_or_default();
-                let items: Vec<WebdavItem> = match parse_propfind_xml(&body) {
+                // A failed body read must not degrade into an empty listing:
+                // it flows through the same fallback as a malformed body.
+                let parsed: Result<Vec<WebdavItem>, String> = res
+                    .text()
+                    .map_err(|e| format!("failed to read PROPFIND response body: {e}"))
+                    .and_then(|body| parse_propfind_xml(&body));
+                let items: Vec<WebdavItem> = match parsed {
                     Ok(items) => items,
                     Err(reason) => {
                         // A malformed listing must not be treated as a
@@ -1960,7 +1999,17 @@ where
                         return;
                     }
 
-                    let body = res.text().unwrap_or_default();
+                    let body = match res.text() {
+                        Ok(body) => body,
+                        Err(e) => {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.error = Some(format!(
+                                "Failed to read PROPFIND response body for {current_url}: {e}"
+                            ));
+                            state.stopped = true;
+                            return;
+                        }
+                    };
                     let items = match parse_propfind_xml(&body) {
                         Ok(items) => items,
                         Err(reason) => {
@@ -1970,6 +2019,18 @@ where
                             return;
                         }
                     };
+                    if items.is_empty() {
+                        // A Depth: 1 listing always contains at least the
+                        // collection itself; zero responses means the body
+                        // was never a real listing and must not be trusted as
+                        // "directory is empty" ground truth for deletes.
+                        let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                        state.error = Some(format!(
+                            "PROPFIND returned an empty multistatus for {current_url}"
+                        ));
+                        state.stopped = true;
+                        return;
+                    }
 
                     let mut children_in_dir = 0;
                     let mut new_dirs = 0;
@@ -2865,8 +2926,16 @@ where
             if !res.status().is_success() && res.status().as_u16() != 207 {
                 return Err(format!("Server returned HTTP {}", res.status()));
             }
-            let body = res.text().unwrap_or_default();
+            let body = res
+                .text()
+                .map_err(|e| format!("failed to read PROPFIND response body: {e}"))?;
             let items = parse_propfind_xml(&body)?;
+            if items.is_empty() {
+                return Err(
+                    "PROPFIND returned an empty multistatus (no resources, not even the collection)"
+                        .to_string(),
+                );
+            }
             let mut count = 0;
             for item in &items {
                 if !item.is_dir {
