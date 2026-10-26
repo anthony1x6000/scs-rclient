@@ -2609,9 +2609,10 @@ where
                             return;
                         }
                     };
-                    // The body and its parse are done; release the in-flight
-                    // reservation before the item-processing work below.
-                    drop(listing);
+                    // The in-flight reservation lives until end of scope:
+                    // the 0-children preview below still reads the body, and
+                    // releasing a moment later only delays, never exceeds,
+                    // the shared budget.
                     if items.is_empty() {
                         // A Depth: 1 listing always contains at least the
                         // collection itself; zero responses means the body
@@ -2676,7 +2677,7 @@ where
                         // Char-based truncation: a fixed byte index can split a
                         // multi-byte UTF-8 code point in a server-controlled body,
                         // which panics and aborts the whole scan.
-                        let preview: String = body.chars().take(400).collect();
+                        let preview: String = listing.body.chars().take(400).collect();
                         let _ = worker_log_tx.send(format!(
                             "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
                             preview
