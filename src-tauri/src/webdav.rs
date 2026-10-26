@@ -4460,15 +4460,28 @@ mod tests {
         // Windows/IIS-family servers strip trailing ASCII spaces and dots
         // (including their %20 spelling) from each path component, so these
         // alias onto "." / ".." at resolve time even though an exact-match
-        // dot check passes them.
-        for path in ["/dav/.. /", "/dav/.../", "/dav/..%20/", "/dav/. /", "/dav/notes/..%20/x"] {
+        // dot check passes them. The trailing trim must also strip %2e:
+        // `..%20%2e` decodes to `.. .` and trims to `..`.
+        for path in [
+            "/dav/.. /",
+            "/dav/.../",
+            "/dav/..%20/",
+            "/dav/. /",
+            "/dav/notes/..%20/x",
+            "/dav/..%20%2e/",
+            "/dav/..%2e/",
+            "/dav/notes/..%2E/x",
+            "/dav/%2e%2e%2e/",
+        ] {
             assert!(
                 validate_webdav_url_internal(&format!("https://courselinkdav.desire2learn.com{path}"), false).is_err(),
                 "windows-trim dot alias must be rejected: {path}"
             );
         }
-        // A name that merely ends in a dot is not a dot segment.
+        // A name that merely ends in a dot — literal or encoded — is not a
+        // dot segment.
         assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/report./", false).is_ok());
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/report%2e/", false).is_ok());
     }
 
     #[test]

@@ -20,9 +20,12 @@ describe("normalizeSubdir traversal scope", () => {
 
   it("rejects trailing-space/dot aliases of dot segments (Windows-style trimming)", () => {
     // Windows/IIS-family servers strip trailing ASCII spaces and dots from
-    // each path component, so these spellings resolve to "." / ".." despite
-    // passing an exact-match dot check.
-    for (const bad of [".. ", ".. /secret", "notes/.. /x", "...", ". ", "notes/...", "..%20", "notes/..%20/x"]) {
+    // each path component — including their %20/%2e spellings — so these
+    // resolve to "." / ".." despite passing an exact-match dot check.
+    for (const bad of [
+      ".. ", ".. /secret", "notes/.. /x", "...", ". ", "notes/...", "..%20", "notes/..%20/x",
+      "..%20%2e", "..%2e", "notes/..%2E/x", "%2e%2e%2e",
+    ]) {
       expect(() => normalizeSubdir(bad), `subdir ${bad} must be rejected`).toThrow();
     }
   });
@@ -30,8 +33,10 @@ describe("normalizeSubdir traversal scope", () => {
   it("accepts ordinary folder names", () => {
     expect(normalizeSubdir("notes")).toBe("notes");
     expect(normalizeSubdir(" My Folder ")).toBe("My Folder");
-    // A name that merely ends in a dot is not a dot-segment alias.
+    // A name that merely ends in a dot — literal or encoded — is not a
+    // dot-segment alias.
     expect(normalizeSubdir("report.")).toBe("report.");
+    expect(normalizeSubdir("report%2e")).toBe("report%2e");
     expect(normalizeSubdir("v1.2/notes")).toBe("v1.2/notes");
   });
 
