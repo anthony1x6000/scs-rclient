@@ -482,8 +482,9 @@ pub fn has_traversal_sequence(s: &str) -> bool {
 /// Computes a normalized cache key partitioned by authenticated credential context.
 ///
 /// Multi-Account Isolation:
-/// Cache keys include the authenticated username when available (`username@clean_url`) to prevent
-/// cache collisions across different user credentials accessing the same WebDAV host (CWE-287 / CWE-384).
+/// Cache keys include the authenticated username when available (`u1:username@clean_url`, username
+/// at its exact case) to prevent cache collisions across different user credentials accessing the
+/// same WebDAV host (CWE-287 / CWE-384).
 pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
     // Fold case only where the URL grammar is case-insensitive (scheme,
     // host); the path selects the collection and is case-sensitive
@@ -499,7 +500,13 @@ pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
     };
     match auth_user {
         Some(user) if !user.trim().is_empty() => {
-            format!("{}@{}", user.trim().to_ascii_lowercase(), clean_url)
+            // Usernames are opaque, case-sensitive tokens: "Alice" and
+            // "alice" are distinct credentials, so the key keeps the exact
+            // case. The `u1:` marker versions the user-scoped key format:
+            // entries written when usernames were folded lowercase are
+            // unreachable under it, so a folded-credential entry can never
+            // be served to a case-variant account.
+            format!("u1:{}@{}", user.trim(), clean_url)
         }
         _ => clean_url,
     }
@@ -688,9 +695,12 @@ pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Ve
     let entry = cache.get(&key).filter(|entry| {
         // Key equality is necessary but not sufficient: the stored URL must
         // match the requested collection as well — scheme and host
-        // case-insensitively (per URL grammar), the path exactly — so no
-        // entry can ever be served for a different collection.
+        // case-insensitively (per URL grammar), the path exactly — and the
+        // stored credential must equal the requested username exactly, so
+        // no entry can ever be served for a different collection or a
+        // case-variant credential.
         url_same_collection(&entry.remote_url, remote_url)
+            && same_auth_user(&entry.auth_user, auth_user)
     })?;
 
 /// Equality modulo the case-insensitive parts of the URL grammar: scheme and
@@ -704,6 +714,20 @@ fn url_same_collection(a: &str, b: &str) -> bool {
         }
         // Unparseable stored entries never match a parseable request.
         (Err(_), Err(_)) => a.trim_end_matches('/') == b.trim_end_matches('/'),
+        _ => false,
+    }
+}
+
+/// Equality for the cached credential: usernames are opaque tokens whose
+/// case distinguishes accounts on case-sensitive WebDAV servers, so the
+/// stored username must equal the requested one exactly. Empty and absent
+/// both mean "no credential".
+fn same_auth_user(stored: &Option<String>, requested: Option<&str>) -> bool {
+    let stored = stored.as_deref().map(str::trim).filter(|u| !u.is_empty());
+    let requested = requested.map(str::trim).filter(|u| !u.is_empty());
+    match (stored, requested) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => true,
         _ => false,
     }
 }
@@ -767,7 +791,7 @@ pub fn save_remote_cache(remote_url: &str, auth_user: Option<&str>, items: &[Web
         key,
         CachedRemoteListing {
             remote_url: remote_url.to_string(),
-            auth_user: auth_user.map(|u| u.trim().to_ascii_lowercase()),
+            auth_user: auth_user.map(|u| u.trim().to_string()),
             timestamp: now,
             items: safe_items,
         },
@@ -5278,6 +5302,21 @@ mod tests {
         // Multi-credential isolation: Bob querying the same URL should find NO cached items
         let loaded_bob = load_remote_cache(test_url, bob_user);
         assert!(loaded_bob.is_none(), "Bob should not see Alice's cached items");
+
+        // Case-variant usernames are distinct credentials: WebDAV usernames
+        // are opaque, case-sensitive tokens, so "Alice" is not "alice" and
+        // must neither read her listing nor share her key; an anonymous
+        // request must not read it either.
+        let case_variant_alice = Some("Alice");
+        assert_ne!(cache_key(test_url, alice_user), cache_key(test_url, case_variant_alice));
+        assert!(
+            load_remote_cache(test_url, case_variant_alice).is_none(),
+            "Alice (case variant) should not see alice's cached items"
+        );
+        assert!(
+            load_remote_cache(test_url, None).is_none(),
+            "an anonymous request should not see alice's cached items"
+        );
 
         // Update item in alice's cache
         update_remote_cache_item(test_url, alice_user, "doc.pdf", 8192, Some(12345678));
