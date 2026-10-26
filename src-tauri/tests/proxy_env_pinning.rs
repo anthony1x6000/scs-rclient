@@ -33,6 +33,11 @@ fn start_listener(
             }
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // The accepted stream can inherit the listener's
+                    // non-blocking mode on BSD/macOS; a WouldBlock read
+                    // would break out as if the request ended, so put the
+                    // stream back in blocking mode before reading.
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
