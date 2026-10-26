@@ -1258,7 +1258,21 @@ fn is_within_collection(remote_url: &str, target_url: &str) -> bool {
         // never a valid item target.
         return !target_segs.is_empty();
     }
-    target_segs.len() > base_segs.len() && target_segs[..base_segs.len()] == base_segs[..]
+    // The decoded segments above only VALIDATE the path (no encoded
+    // separators, dot aliases, or duplicate slashes). The prefix comparison
+    // itself is byte-exact on the RAW spellings: a target like
+    // `COURSE12%33` decodes onto the configured `COURSE123`, but a server
+    // that treats the escape literally routes it to a sibling collection.
+    let base_raw = raw_path_segments(base.path());
+    let target_raw = raw_path_segments(target.path());
+    target_raw.len() > base_raw.len() && target_raw[..base_raw.len()] == base_raw[..]
+}
+
+/// Raw `/`-split non-empty segments with no decoding, aligned with
+/// `collection_path_segments` (which is still the validity gate: paths it
+/// rejects never reach this comparison).
+fn raw_path_segments(path: &str) -> Vec<&str> {
+    path.split('/').filter(|seg| !seg.is_empty()).collect()
 }
 
 /// Non-empty path segments, or `None` when the path is ambiguous. Segments
@@ -1269,13 +1283,25 @@ fn is_within_collection(remote_url: &str, target_url: &str) -> bool {
 /// wholesale — servers may resolve any of those differently from this
 /// client, so they can never be proven inside the collection. The URL
 /// parser has already resolved literal dot segments, so anything dot-like
-/// that appears after decoding came from encoded or aliased forms.
+/// that appears after decoding came from encoded or aliased forms, and
+/// decoding runs to a fixed point so double-encoded spellings (`%252e`) are
+/// caught in the same net as single-encoded ones.
 fn collection_path_segments(path: &str) -> Option<Vec<String>> {
     let raw_segs: Vec<&str> = path.split('/').collect();
     let last_idx = raw_segs.len() - 1;
     let mut segs = Vec::with_capacity(raw_segs.len());
     for (idx, raw) in raw_segs.iter().enumerate() {
-        let decoded = decode_percent(raw);
+        let mut decoded = decode_percent(raw);
+        // Decode to a fixed point: a double-decoding server would resolve
+        // `%252e` one step further each pass, so every reachable spelling
+        // must be checked, not just the first decoding.
+        for _ in 0..8 {
+            let next = decode_percent(&decoded);
+            if next == decoded {
+                break;
+            }
+            decoded = next;
+        }
         if decoded.contains('/') || decoded.contains('\\') || decoded.contains('\0') {
             return None;
         }
