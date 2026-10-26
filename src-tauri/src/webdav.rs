@@ -4348,6 +4348,20 @@ mod tests {
             guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/note%20file.txt").is_ok(),
             "in-segment spaces are ordinary characters"
         );
+        // Encoded spellings that DECODE onto the collection name must not
+        // match it: a server that treats `%33` literally routes the request
+        // to a sibling collection, so the prefix comparison is byte-exact on
+        // the raw segments.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE12%33/file.txt").is_err(),
+            "an encoded alias of the collection name must not match the collection"
+        );
+        // Double-encoded dot segments decode to `..` on a double-decoding
+        // server and must be rejected before that can happen.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/%252e%252e/othercourse/file.txt").is_err(),
+            "double-encoded dot segments must be refused"
+        );
         // Origin-root collection: any unambiguous non-root path is a strict
         // descendant, but the origin root itself is never an item target.
         assert!(guard_server_derived_url("https://h.example/", "https://h.example/any/path.txt").is_ok());
