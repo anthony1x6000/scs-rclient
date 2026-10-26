@@ -4823,6 +4823,32 @@ mod tests {
     }
 
     #[test]
+    fn test_create_unique_part_file_name_is_short_and_hidden() {
+        // The temp sibling's name must not embed the target filename: a
+        // long (valid) target name would push the temp past the filesystem
+        // component limit (ENAMETOOLONG). Fixed prefix + fixed-width noise
+        // only, hidden, and unique per call.
+        let dir = std::env::temp_dir();
+        let long_name = "x".repeat(200);
+        let target = dir.join(&long_name);
+        let (_f1, t1) = create_unique_part_file(&target).expect("temp creation must succeed");
+        let (_f2, t2) = create_unique_part_file(&target).expect("second temp creation must succeed");
+        let name1 = t1.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(name1.starts_with('.'), "temp must be hidden: {name1}");
+        assert!(
+            name1.starts_with(".scs-part-"),
+            "temp name is fixed-form, target-independent: {name1}"
+        );
+        assert!(
+            name1.len() <= ".scs-part-".len() + 16,
+            "temp name must be bounded by the noise width, got {name1}"
+        );
+        assert_ne!(t1, t2, "consecutive temps must not collide");
+        let _ = std::fs::remove_file(&t1);
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    #[test]
     fn test_validate_webdav_url_ipv6_literals_and_mapped_ranges() {
         // Bracketed IPv6 literals reach the IP check (host_str returns them
         // bracketed, which the old bare host.parse() never matched).
