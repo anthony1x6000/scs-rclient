@@ -134,6 +134,12 @@ impl Client {
         let http: reqwest::blocking::Client = ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(host, &addrs)
+            // Never honor ambient proxy configuration: the socket must dial
+            // the addresses validated above, not a proxy's address the
+            // blocklist never evaluated, and host resolution must stay local
+            // so the pin cannot be bypassed (reqwest enables system proxies
+            // by default; HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/OS settings).
+            .no_proxy()
             .build()
             .map_err(|e| format!("Failed to build WebDAV HTTP client: {e}"))?;
 
