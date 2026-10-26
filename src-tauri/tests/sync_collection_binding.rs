@@ -1,11 +1,12 @@
 //! A server-advertised href outside the configured collection must never
-//! become an authenticated DELETE target during sync.
+//! become an authenticated request target during sync — no method, not just
+//! DELETE.
 //!
 //! Mirrors the credential_leak.rs recording-server harness: the configured
 //! WebDAV server (loopback) returns a PROPFIND listing that embeds an
 //! out-of-collection href (`/othercourse/file.txt`). With an empty local
-//! folder, sync's delete set must NOT contain that file: the only guard is
-//! origin equality today, so the delete loop would issue
+//! folder, sync's delete set would contain that file, and without the
+//! collection guard the delete loop would issue
 //! `DELETE /othercourse/file.txt` with the user's Basic credentials.
 
 use scs_rclient_lib::webdav::execute_webdav_action_with_exclusions;
@@ -113,14 +114,19 @@ fn test_sync_never_deletes_out_of_collection_hrefs() {
 
     assert!(result.is_ok(), "sync itself should complete: {:?}", result.err());
     let recorded = requests.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    let stray_deletes: Vec<String> = recorded
+    assert!(
+        recorded.iter().any(|r| r.starts_with("PROPFIND")),
+        "the scan must actually list the collection for this test to mean anything; recorded: {:?}",
+        recorded
+    );
+    let stray_requests: Vec<String> = recorded
         .iter()
-        .filter(|r| r.starts_with("DELETE") && r.contains("/othercourse/"))
+        .filter(|r| r.contains("/othercourse/"))
         .cloned()
         .collect();
     assert!(
-        stray_deletes.is_empty(),
-        "sync must not DELETE out-of-collection targets; recorded: {:?} (logs: {:?})",
+        stray_requests.is_empty(),
+        "no authenticated request of any method may target the out-of-collection path; recorded: {:?} (logs: {:?})",
         recorded,
         logs
     );

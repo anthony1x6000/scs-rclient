@@ -1235,39 +1235,61 @@ fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
     )
 }
 
-/// Gate for any URL taken from a server response before it becomes a request:
-/// it must stay on the configured remote's origin and still pass the SSRF
-/// guard. Returns the user-facing reason when the URL must not be used.
-///
-/// Redirect targets never reach the transport: the in-repo `dav_client`
-/// builds its reqwest client with `redirect::Policy::none()`, so a 3xx sent
-/// by the remote is returned as a plain non-success response instead of
-/// being followed with the Basic-auth header attached.
-/// True when `target_url`'s decoded path equals or lies under the configured
-/// collection path of `remote_url` (case-insensitive to absorb D2L/IIS case
-/// variance; explicit default ports are absorbed by origin equality).
+/// True when `target_url`'s decoded path lies strictly below the configured
+/// collection path of `remote_url` (exact-case; explicit default ports are
+/// absorbed by origin equality). Paths that can shift segment boundaries on
+/// the server — decoded backslashes, percent-encoded separators, or dot
+/// segments — never qualify, and the collection itself is not an item
+/// target: only strict descendants pass.
 fn is_within_collection(remote_url: &str, target_url: &str) -> bool {
     let (Ok(base), Ok(target)) = (reqwest::Url::parse(remote_url), reqwest::Url::parse(target_url))
     else {
         return false;
     };
-    let base_path = decode_percent(base.path());
-    let target_path = decode_percent(target.path());
-    let trimmed_base = base_path.trim_end_matches('/');
-    if trimmed_base.is_empty() {
-        // Origin-root collection: every same-origin path is inside it.
+    let (Some(base_segs), Some(target_segs)) = (
+        collection_path_segments(base.path()),
+        collection_path_segments(target.path()),
+    ) else {
+        return false;
+    };
+    if base_segs.is_empty() {
+        // Origin-root collection: every traversal-free same-origin path is inside it.
         return true;
     }
-    let trimmed_target = target_path.trim_end_matches('/');
-    if trimmed_target.eq_ignore_ascii_case(trimmed_base) {
-        return true;
-    }
-    match trimmed_target.split_at_checked(trimmed_base.len()) {
-        Some((prefix, rest)) => prefix.eq_ignore_ascii_case(trimmed_base) && rest.starts_with('/'),
-        None => false,
-    }
+    target_segs.len() > base_segs.len() && target_segs[..base_segs.len()] == base_segs[..]
 }
 
+/// Non-empty percent-decoded path segments, or `None` when the path carries a
+/// traversal vector the URL parser could not normalize away. Literal dot
+/// segments are resolved during URL parsing, so any "." or ".." that appears
+/// after decoding came from percent-encoded forms (`%2e%2e`, or `%2f`-encoded
+/// separators splitting segments open again) — reject the whole path, and
+/// likewise any backslash, which decoders on Windows-flavored servers treat
+/// as a segment separator.
+fn collection_path_segments(path: &str) -> Option<Vec<String>> {
+    let decoded = decode_percent(path);
+    if decoded.contains('\\') {
+        return None;
+    }
+    decoded
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| match seg {
+            "." | ".." => None,
+            other => Some(other.to_string()),
+        })
+        .collect()
+}
+
+/// Gate for any URL taken from a server response before it becomes a request:
+/// it must stay on the configured remote's origin, inside the configured
+/// collection, and still pass the SSRF guard. Returns the user-facing reason
+/// when the URL must not be used.
+///
+/// Redirect targets never reach the transport: the in-repo `dav_client`
+/// builds its reqwest client with `redirect::Policy::none()`, so a 3xx sent
+/// by the remote is returned as a plain non-success response instead of
+/// being followed with the Basic-auth header attached.
 fn guard_server_derived_url(remote_url: &str, target_url: &str) -> Result<(), String> {
     if !same_remote_origin(remote_url, target_url) {
         return Err("href resolves outside the configured remote origin".to_string());
@@ -4226,15 +4248,46 @@ mod tests {
             guard_server_derived_url(base, "/othercourse/file.txt").is_err(),
             "relative out-of-collection href must be refused"
         );
-        // In-collection targets still pass: exact, deeper, case-variant,
-        // explicit default port, and percent-encoded forms.
-        assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/").is_ok());
+        // Strict descendants only: the collection itself is never a valid
+        // item-level request target, and case-folded spellings name a
+        // different collection on case-sensitive servers.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/").is_err(),
+            "the collection root itself must not pass as an item target"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/Content/Enforced/course123/notes/a.txt").is_err(),
+            "case-folded hrefs must not match the configured collection"
+        );
+        // Encoded separators and dot segments must not decode into traversal
+        // after the prefix check.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123%2F..%2Fothercourse/file.txt").is_err(),
+            "percent-encoded separators decoding into traversal must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%2f..%2fothercourse/file.txt").is_err(),
+            "encoded dot segments must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/sub%5C..%5Cothercourse/file.txt").is_err(),
+            "encoded backslash traversal must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/%2e%2e/othercourse/file.txt").is_err(),
+            "encoded dot-dot segments must be refused"
+        );
+        // In-collection targets still pass: deeper exact-case paths, explicit
+        // default port, and percent-encoded ordinary characters.
         assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/notes/a.txt").is_ok());
-        assert!(guard_server_derived_url(base, "https://h.example/Content/Enforced/course123/notes/a.txt").is_ok());
         assert!(guard_server_derived_url(base, "https://h.example:443/content/enforced/COURSE123/a.txt").is_ok());
         assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/my%20file.txt").is_ok());
-        // Origin-root collection contains everything on the origin.
+        // Origin-root collection contains every traversal-free path on the origin.
         assert!(guard_server_derived_url("https://h.example/", "https://h.example/any/path.txt").is_ok());
+        assert!(
+            guard_server_derived_url("https://h.example/", "https://h.example/any/%2e%2e/other.txt").is_err(),
+            "traversal is refused even for origin-root collections"
+        );
     }
 
     #[test]
