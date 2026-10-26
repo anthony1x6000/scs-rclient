@@ -133,6 +133,8 @@ export function useRcloneExecution(
     log("Loading configuration...\n");
 
     try {
+      // Settings, including the exclusion lists, are loaded once per run;
+      // edits made mid-run apply on the next run.
       const settings = await loadSettings();
       if (!settings.baseUrl) {
         log("Error: WebDAV URL must be configured.\n");

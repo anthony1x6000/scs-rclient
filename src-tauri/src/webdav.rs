@@ -417,6 +417,23 @@ impl Default for WebdavItem {
     }
 }
 
+/// True when `subdir` contains traversal segments or separators, checking the
+/// raw text and its percent-decoded form: `..` segments and backslashes count
+/// in both forms, because [`build_remote_url`] is a plain join and servers
+/// decode `%2F`/`%5C` into separators.
+pub fn has_traversal_segments(subdir: &str) -> bool {
+    let decoded = decode_percent(subdir);
+    for text in [subdir, &decoded] {
+        if text.contains('\\') {
+            return true;
+        }
+        if text.split('/').any(|segment| segment.trim() == "..") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Returns true if a path or href contains directory traversal sequences or forbidden characters.
 /// Allows legitimate hidden files (e.g. `.gitignore`, `.env`, `.github`) while strictly blocking
 /// directory traversal attacks (`..`, `../`, `..\`, `/..`, `\..`, `%2e%2e`).
@@ -4480,6 +4497,48 @@ mod tests {
                 ("y".to_string(), 7),
             ]
         );
+    }
+
+    #[test]
+    fn test_has_traversal_segments_rejects_literal_and_encoded_escapes() {
+        for subdir in [
+            "..",
+            "a/../b",
+            "..%2f",
+            "..%2F",
+            "%2e%2e",
+            "%2E%2E",
+            "..%2f..%2f",
+            "a%2F..%2F..",
+            "%2e%2e%2fetc",
+            "a/..",
+            "..\\..",
+            "a%5Cb", // encoded backslash
+            "a\\b",
+        ] {
+            assert!(
+                has_traversal_segments(subdir),
+                "subdir {subdir:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_has_traversal_segments_accepts_plain_paths() {
+        for subdir in [
+            "",
+            "content/enforced/1052175-dev_asteve18",
+            "my%20dir/sub",
+            "a/b/c",
+            "a..b",
+            "..hidden",
+            "x/..y/z",
+        ] {
+            assert!(
+                !has_traversal_segments(subdir),
+                "subdir {subdir:?} must be accepted"
+            );
+        }
     }
 }
 

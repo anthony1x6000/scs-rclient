@@ -247,10 +247,11 @@ async function getExcludedFoldersMap(subdir: string): Promise<ExcludedFoldersByD
       return parseExcludedFoldersMap(stored);
     }
     const byDir = migrateLegacyList(stored, subdir);
-    await Promise.all([
-      setWrapped(STORE_KEYS.excludedFolders, byDir),
-      setWrapped(STORE_KEYS.excludedFoldersLegacy, stored),
-    ]);
+    // Legacy copy first: if the map write then fails, the still-present legacy
+    // array lets the next attempt converge; the reverse order could leave the
+    // fallback lost forever.
+    await setWrapped(STORE_KEYS.excludedFoldersLegacy, stored);
+    await setWrapped(STORE_KEYS.excludedFolders, byDir);
     return byDir;
   });
 }
@@ -259,6 +260,30 @@ async function getExcludedFoldersMap(subdir: string): Promise<ExcludedFoldersByD
 async function getLegacyExcludedFolders(): Promise<string[]> {
   const stored = await getWrapped<unknown>(STORE_KEYS.excludedFoldersLegacy);
   return legacyFallbackList(stored);
+}
+
+/**
+ * Reads the stored state inside the write queue and returns the parsed map
+ * plus the legacy copy to persist when this access performs the migration.
+ */
+async function readExcludedFoldersState(
+  subdir: string,
+): Promise<{ byDir: ExcludedFoldersByDir; legacyToPersist: unknown[] | null }> {
+  const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
+  if (!isLegacyExcludedFoldersList(stored)) {
+    return { byDir: parseExcludedFoldersMap(stored), legacyToPersist: null };
+  }
+  // A delta write can be the first exclusion access after an upgrade; keep
+  // the raw copy so every unconfigured scope keeps its fallback.
+  return { byDir: migrateLegacyList(stored, subdir), legacyToPersist: stored };
+}
+
+async function effectiveExcludedFolders(
+  byDir: ExcludedFoldersByDir,
+  subdir: string,
+): Promise<string[]> {
+  const legacy = legacyFallbackList(await getWrapped<unknown>(STORE_KEYS.excludedFoldersLegacy));
+  return excludedFoldersFor(byDir, subdir, legacy);
 }
 
 /**
@@ -281,14 +306,11 @@ export async function getExcludedFolders(subdir: string): Promise<string[]> {
  */
 export async function addExcludedFolder(subdir: string, folder: string): Promise<void> {
   await enqueueExcludedFoldersWrite(async () => {
-    const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
-    const legacy = legacyFallbackList(await getWrapped<unknown>(STORE_KEYS.excludedFoldersLegacy));
-    const byDir = isLegacyExcludedFoldersList(stored)
-      ? migrateLegacyList(stored, subdir)
-      : parseExcludedFoldersMap(stored);
-    const current = excludedFoldersFor(byDir, subdir, legacy);
+    const { byDir, legacyToPersist } = await readExcludedFoldersState(subdir);
+    const current = await effectiveExcludedFolders(byDir, subdir);
     if (current.includes(folder) || current.length >= MAX_EXCLUDED_FOLDERS) return;
     byDir[exclusionScopeKey(subdir)] = [...current, folder];
+    if (legacyToPersist) await setWrapped(STORE_KEYS.excludedFoldersLegacy, legacyToPersist);
     await setWrapped(STORE_KEYS.excludedFolders, byDir);
   });
 }
@@ -296,13 +318,10 @@ export async function addExcludedFolder(subdir: string, folder: string): Promise
 /** Removes one exclusion pattern from `subdir`'s scope (see addExcludedFolder). */
 export async function removeExcludedFolder(subdir: string, folder: string): Promise<void> {
   await enqueueExcludedFoldersWrite(async () => {
-    const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
-    const legacy = legacyFallbackList(await getWrapped<unknown>(STORE_KEYS.excludedFoldersLegacy));
-    const byDir = isLegacyExcludedFoldersList(stored)
-      ? migrateLegacyList(stored, subdir)
-      : parseExcludedFoldersMap(stored);
-    const current = excludedFoldersFor(byDir, subdir, legacy);
+    const { byDir, legacyToPersist } = await readExcludedFoldersState(subdir);
+    const current = await effectiveExcludedFolders(byDir, subdir);
     byDir[exclusionScopeKey(subdir)] = current.filter((item) => item !== folder);
+    if (legacyToPersist) await setWrapped(STORE_KEYS.excludedFoldersLegacy, legacyToPersist);
     await setWrapped(STORE_KEYS.excludedFolders, byDir);
   });
 }

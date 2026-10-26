@@ -27,6 +27,9 @@ interface ExcludeFolderSelectProps {
  */
 const inflightListings = new Map<string, Promise<RemoteFolder[]>>();
 
+/** A listing slower than this releases its shared in-flight entry for retry. */
+const LISTING_TIMEOUT_MS = 300_000;
+
 /**
  * Remote folder picker for exclusions: expands the selected remote directory as
  * a lazy tree (the first expansion is the only WebDAV request — deeper levels
@@ -69,21 +72,33 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
 
   // One recursive listing covers the whole tree; every deeper expansion is
   // derived from it, so this is the only WebDAV request the picker ever makes.
-  // The shared in-flight map dedupes concurrent listings across remounts.
+  // The shared in-flight map dedupes concurrent listings across remounts, and
+  // a timeout releases a stalled entry so "toggle the root to retry" works.
   const fetchTree = async () => {
     if (!ready || loadingRef.current) return;
     loadingRef.current = true;
     setLoading(true);
     setListError(null);
-    const running = inflightListings.get(subdir) ??
+    const existing = inflightListings.get(subdir);
+    const request = existing ??
       invoke<RemoteFolder[]>("list_remote_folders", { subdir }).finally(() =>
         inflightListings.delete(subdir),
       );
-    inflightListings.set(subdir, running);
+    if (!existing) {
+      inflightListings.set(subdir, request);
+      // Keep the shared promise's rejection observed even when this caller
+      // abandons it on timeout; awaiters still see the rejection.
+      request.catch(() => {});
+    }
+    const timeout = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("Timed out.")), LISTING_TIMEOUT_MS);
+    });
     try {
-      const result = await running;
+      const result = await Promise.race([request, timeout]);
       if (activeRef.current) setFolders(result);
     } catch (e: any) {
+      // A timed-out caller releases the shared entry so a retry starts fresh.
+      if (inflightListings.get(subdir) === request) inflightListings.delete(subdir);
       console.error("Failed to list remote folders:", e);
       if (activeRef.current) setListError(`Could not list remote folders: ${e?.message || e}`);
     } finally {
@@ -93,11 +108,7 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
   };
 
   const toggleExpand = (path: string) => {
-    if (folders === null) {
-      if (!loadingRef.current) void fetchTree();
-      setExpanded((prev) => new Set(prev).add(path));
-      return;
-    }
+    if (folders === null && !expanded.has(path) && !loadingRef.current) void fetchTree();
     setExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
@@ -106,8 +117,9 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
     });
   };
 
-  // Toggles persist as deltas against the freshest stored list, so another
-  // open editor's patterns can never be clobbered by this panel's stale state.
+  // Toggles persist as deltas against the freshest stored list, and the UI
+  // reconciles with the store afterwards — silent no-ops (cap, duplicates)
+  // and other writers' deltas are reflected instead of stale optimistic state.
   const apply = async (
     folder: string,
     op: (dir: string, entry: string) => Promise<void>,
@@ -118,10 +130,15 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
     try {
       await op(subdir, folder);
       setSaveError(null);
+      setExcluded(await getExcludedFolders(subdir));
     } catch (e) {
       console.error("Failed to save excluded folders:", e);
-      setExcluded(previous);
       setSaveError("Could not save excluded folders.");
+      try {
+        setExcluded(await getExcludedFolders(subdir));
+      } catch {
+        setExcluded(previous);
+      }
     }
   };
 

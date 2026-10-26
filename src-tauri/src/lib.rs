@@ -329,7 +329,10 @@ async fn list_remote_folders(
 ) -> Result<Vec<webdav::RemoteFolder>, String> {
     const STORE_FILE: &str = "settings.json";
     let stored_setting = |key: &str| -> Option<String> {
-        tauri_plugin_store::StoreExt::get_store(&app, STORE_FILE)
+        // `store()` loads-or-creates, so the command does not depend on the
+        // renderer having registered the store first.
+        tauri_plugin_store::StoreExt::store(&app, STORE_FILE)
+            .ok()
             .and_then(|store| store.get(key))
             .and_then(|value| value.get("value").and_then(|v| v.as_str()).map(str::to_string))
             .filter(|v| !v.trim().is_empty())
@@ -341,11 +344,7 @@ async fn list_remote_folders(
         .ok_or("No saved username. Save your credentials first.")?;
     let concurrency = concurrency.map(|c| c.clamp(1, webdav::MAX_SCAN_CONCURRENCY));
 
-    if subdir.contains('\\')
-        || subdir.split('/').any(|segment| {
-            segment.trim() == ".." || webdav::decode_percent(segment).trim() == ".."
-        })
-    {
+    if webdav::has_traversal_segments(&subdir) {
         return Err("Invalid subdirectory: \"..\" segments are not allowed.".to_string());
     }
 

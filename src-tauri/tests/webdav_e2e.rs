@@ -2533,7 +2533,7 @@ fn test_live_list_remote_folders_aggregates_sizes() {
             .unwrap()
             .as_nanos()
     );
-    let root_url = format!("{base_url}{unique}/");
+    let root_url = format!("{}/{}/", base_url.trim_end_matches('/'), unique);
 
     // Layout (sizes in bytes):
     //   a/b/f1.bin 10   -> a = 15, a/b = 10

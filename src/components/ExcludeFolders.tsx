@@ -47,7 +47,9 @@ export function ExcludeFolders({ subdir }: ExcludeFoldersProps) {
   }, [subdir]);
 
   // Deltas (not full-list replacements) are persisted against the freshest
-  // stored list, so another open editor can never be clobbered by this one.
+  // stored list, and afterwards the UI reconciles with the store — so silent
+  // no-ops (cap, duplicates) and other writers' deltas are reflected instead
+  // of trusting stale optimistic state.
   const apply = async (
     folder: string,
     op: (dir: string, entry: string) => Promise<void>,
@@ -59,10 +61,15 @@ export function ExcludeFolders({ subdir }: ExcludeFoldersProps) {
     try {
       await op(subdirRef.current, folder);
       setError(null);
+      setFolders(await getExcludedFolders(subdirRef.current));
     } catch (e) {
       console.error("Failed to save excluded folders:", e);
-      setFolders(previous);
       setError("Could not save excluded folders.");
+      try {
+        setFolders(await getExcludedFolders(subdirRef.current));
+      } catch {
+        setFolders(previous);
+      }
     } finally {
       setSaving(false);
     }
