@@ -30,9 +30,9 @@ export function normalizeSubdir(subdir: string): string {
   const parts = trimmed.split("/").filter((p) => p.length > 0);
   for (const part of parts) {
     // What remains after the Windows-style per-segment trim: a part made
-    // entirely of dots/spaces collapses to "", and encoded-dot spellings
-    // are exposed to the DOT_SEGMENT check.
-    const core = part.replace(/(%20|[ .])+$/i, "");
+    // entirely of dots/spaces (or their %20/%2e spellings) collapses to "",
+    // and encoded-dot spellings are exposed to the DOT_SEGMENT check.
+    const core = part.replace(/(%20|%2e|[ .])+$/i, "");
     if (
       core === "" ||
       core === "." ||

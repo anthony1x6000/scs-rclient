@@ -1468,10 +1468,11 @@ fn has_url_dot_segment(raw: &str) -> bool {
 /// (lowercased) path segment: the per-component trim Windows-family servers
 /// apply before resolving the path.
 fn trim_windows_alias_suffixes(mut s: &str) -> &str {
+    // `s` arrives lowercased, so the encoded spellings need no case handling.
     loop {
         if s.ends_with(' ') || s.ends_with('.') {
             s = &s[..s.len() - 1];
-        } else if let Some(stripped) = s.strip_suffix("%20") {
+        } else if let Some(stripped) = s.strip_suffix("%20").or_else(|| s.strip_suffix("%2e")) {
             s = stripped;
         } else {
             return s;
