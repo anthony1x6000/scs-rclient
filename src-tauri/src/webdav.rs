@@ -434,6 +434,29 @@ impl Default for WebdavItem {
     }
 }
 
+/// True when `subdir` contains traversal segments or other path-hostile
+/// bytes, checking the raw text and each percent-decoding of it until the
+/// text stabilizes: `..` segments, backslashes, and control characters count
+/// in every form, because [`build_remote_url`] is a plain join and servers
+/// decode `%2F`/`%5C` into separators (possibly more than once, and may
+/// truncate at NUL).
+pub fn has_traversal_segments(subdir: &str) -> bool {
+    let mut text = subdir.to_string();
+    loop {
+        if text.contains('\\')
+            || text.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || text.split('/').any(|segment| segment.trim() == "..")
+        {
+            return true;
+        }
+        let decoded = decode_percent(&text);
+        if decoded == text {
+            return false;
+        }
+        text = decoded;
+    }
+}
+
 /// Returns true if a path or href contains directory traversal sequences or forbidden characters.
 /// Allows legitimate hidden files (e.g. `.gitignore`, `.env`, `.github`) while strictly blocking
 /// directory traversal attacks (`..`, `../`, `..\`, `/..`, `\..`, `%2e%2e`).
@@ -1047,7 +1070,7 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
 }
 
 /// Simple percent decoder for URI path segments.
-fn decode_percent(s: &str) -> String {
+pub fn decode_percent(s: &str) -> String {
     let mut result = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -2347,6 +2370,89 @@ where
     ));
 
     Ok(std::mem::take(&mut state.all_items))
+}
+
+/// A remote folder paired with the total byte size of every file beneath it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RemoteFolder {
+    /// Slash-separated path relative to the listed collection; "" is the collection itself.
+    pub path: String,
+    /// Sum of file sizes anywhere beneath this folder (0 when it holds no files).
+    pub size: u64,
+}
+
+/// Aggregates a recursive listing of `remote_url` into one [`RemoteFolder`] per
+/// folder, sorted by path with the root first.
+///
+/// Each file's size is credited to the root and to every folder it is nested in;
+/// empty folders still appear with size 0; files themselves never appear.
+pub fn aggregate_remote_folders(remote_url: &str, items: &[WebdavItem]) -> Vec<RemoteFolder> {
+    // BTreeMap keeps output sorted by path, with "" (the root) first.
+    let mut sizes: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    sizes.entry(String::new()).or_insert(0);
+    for item in items {
+        let rel = relative_item_path(remote_url, &item.href);
+        let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            continue;
+        }
+        if item.is_dir {
+            // Register the folder (and, defensively, every ancestor).
+            let mut acc = String::new();
+            for segment in &segments {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(segment);
+                sizes.entry(acc.clone()).or_insert(0);
+            }
+        } else {
+            // Credit the root and every ancestor folder; never the file itself.
+            *sizes.entry(String::new()).or_insert(0) += item.size;
+            let mut acc = String::new();
+            for segment in &segments[..segments.len() - 1] {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(segment);
+                *sizes.entry(acc.clone()).or_insert(0) += item.size;
+            }
+        }
+    }
+    sizes
+        .into_iter()
+        .map(|(path, size)| RemoteFolder { path, size })
+        .collect()
+}
+
+/// Lists every folder beneath `remote_url` with its aggregated size, using the
+/// shared recursive listing machinery (retries, worker pool, listing cache).
+///
+/// Exclusions are deliberately not applied so already-excluded folders stay
+/// visible and selectable in the picker this feeds. Only PROPFIND metadata is
+/// requested — no file contents are ever downloaded.
+pub fn list_remote_folders<F>(
+    client: &Client,
+    remote_url: &str,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
+    auth_user: Option<&str>,
+    log: F,
+) -> Result<Vec<RemoteFolder>, String>
+where
+    F: FnMut(&str),
+{
+    let items = list_remote_recursive_with_exclusions_and_log(
+        client,
+        remote_url,
+        cancel_flag,
+        concurrency,
+        auth_user,
+        true,
+        &[],
+        log,
+    )?;
+    Ok(aggregate_remote_folders(remote_url, &items))
 }
 
 /// Extracts modification time from std::fs::Metadata as UNIX timestamp (seconds).
@@ -4842,6 +4948,126 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_aggregate_remote_folders_credits_ancestors_and_includes_empty_dirs() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let items = vec![
+            WebdavItem::new("/docs/", true, 0),
+            WebdavItem::new("/docs/root.txt", false, 5),
+            WebdavItem::new("/docs/a/", true, 0),
+            WebdavItem::new("/docs/a/b/", true, 0),
+            WebdavItem::new("/docs/a/b/file.bin", false, 100),
+            WebdavItem::new("/docs/a/empty/", true, 0),
+        ];
+
+        let folders = aggregate_remote_folders(base, &items);
+        let by_path: Vec<(String, u64)> = folders
+            .into_iter()
+            .map(|f| (f.path, f.size))
+            .collect();
+        assert_eq!(
+            by_path,
+            vec![
+                (String::new(), 105),
+                ("a".to_string(), 100),
+                ("a/b".to_string(), 100),
+                ("a/empty".to_string(), 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_aggregate_remote_folders_decodes_percent_encoded_paths() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let items = vec![
+            WebdavItem::new("/docs/my%20dir/", true, 0),
+            WebdavItem::new("/docs/my%20dir/file%20one.txt", false, 7),
+        ];
+
+        let folders = aggregate_remote_folders(base, &items);
+        let by_path: Vec<(String, u64)> = folders
+            .into_iter()
+            .map(|f| (f.path, f.size))
+            .collect();
+        assert_eq!(
+            by_path,
+            vec![(String::new(), 7), ("my dir".to_string(), 7)]
+        );
+    }
+
+    #[test]
+    fn test_aggregate_remote_folders_sums_files_across_siblings() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let items = vec![
+            WebdavItem::new("/docs/x/", true, 0),
+            WebdavItem::new("/docs/x/one.bin", false, 10),
+            WebdavItem::new("/docs/y/", true, 0),
+            WebdavItem::new("/docs/y/two.bin", false, 5),
+            WebdavItem::new("/docs/y/three.bin", false, 2),
+        ];
+
+        let folders = aggregate_remote_folders(base, &items);
+        let by_path: Vec<(String, u64)> = folders
+            .into_iter()
+            .map(|f| (f.path, f.size))
+            .collect();
+        assert_eq!(
+            by_path,
+            vec![
+                (String::new(), 17),
+                ("x".to_string(), 10),
+                ("y".to_string(), 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_has_traversal_segments_rejects_literal_and_encoded_escapes() {
+        for subdir in [
+            "..",
+            "a/../b",
+            "..%2f",
+            "..%2F",
+            "%2e%2e",
+            "%2E%2E",
+            "..%2f..%2f",
+            "a%2F..%2F..",
+            "%2e%2e%2fetc",
+            "a/..",
+            "..\\..",
+            "a%5Cb", // encoded backslash
+            "a\\b",
+            "..%00",           // NUL-truncated dot-dot
+            "%252e%252e",      // double-encoded dot-dot
+            "%252e%252e%252f", // double-encoded traversal
+            "a%00b",           // raw NUL
+            "a%01b",           // other control byte
+        ] {
+            assert!(
+                has_traversal_segments(subdir),
+                "subdir {subdir:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_has_traversal_segments_accepts_plain_paths() {
+        for subdir in [
+            "",
+            "content/enforced/1052175-dev_asteve18",
+            "my%20dir/sub",
+            "a/b/c",
+            "a..b",
+            "..hidden",
+            "x/..y/z",
+        ] {
+            assert!(
+                !has_traversal_segments(subdir),
+                "subdir {subdir:?} must be accepted"
+            );
+        }
     }
 
     #[test]

@@ -1,28 +1,36 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  addExcludedFolder,
   getExcludedFolders,
-  setExcludedFolders,
+  removeExcludedFolder,
   normalizeExcludedFolder,
   MAX_EXCLUDED_FOLDERS,
 } from "../settings";
 import TextInput from "./TextInput";
 
+interface ExcludeFoldersProps {
+  /** Remote directory whose exclusions are edited; the parent remounts on change. */
+  subdir: string;
+}
+
 /**
  * Editor for the persisted list of folders that scan/transfer actions must skip.
- * Patterns are stored relative to the selected remote subdirectory and applied by
- * the Rust backend to both local walks and remote listings.
+ * Patterns are stored per selected remote subdirectory — relative to it — and
+ * applied by the Rust backend to both local walks and remote listings.
  */
-export function ExcludeFolders() {
+export function ExcludeFolders({ subdir }: ExcludeFoldersProps) {
   const [folders, setFolders] = useState<string[]>([]);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const activeRef = useRef(true);
+  const subdirRef = useRef(subdir);
+  subdirRef.current = subdir;
 
   useEffect(() => {
     activeRef.current = true;
-    getExcludedFolders()
+    getExcludedFolders(subdir)
       .then((stored) => {
         if (activeRef.current) setFolders(stored);
       })
@@ -36,19 +44,32 @@ export function ExcludeFolders() {
     return () => {
       activeRef.current = false;
     };
-  }, []);
+  }, [subdir]);
 
-  const persist = async (next: string[]) => {
+  // Deltas (not full-list replacements) are persisted against the freshest
+  // stored list, and afterwards the UI reconciles with the store — so silent
+  // no-ops (cap, duplicates) and other writers' deltas are reflected instead
+  // of trusting stale optimistic state.
+  const apply = async (
+    folder: string,
+    op: (dir: string, entry: string) => Promise<void>,
+    optimistic: string[],
+  ) => {
     const previous = folders;
-    setFolders(next);
+    setFolders(optimistic);
     setSaving(true);
     try {
-      await setExcludedFolders(next);
+      await op(subdirRef.current, folder);
       setError(null);
+      setFolders(await getExcludedFolders(subdirRef.current));
     } catch (e) {
       console.error("Failed to save excluded folders:", e);
-      setFolders(previous);
       setError("Could not save excluded folders.");
+      try {
+        setFolders(await getExcludedFolders(subdirRef.current));
+      } catch {
+        setFolders(previous);
+      }
     } finally {
       setSaving(false);
     }
@@ -69,11 +90,11 @@ export function ExcludeFolders() {
       return;
     }
     setDraft("");
-    void persist([...folders, folder]);
+    void apply(folder, addExcludedFolder, [...folders, folder]);
   };
 
   const remove = (folder: string) => {
-    void persist(folders.filter((item) => item !== folder));
+    void apply(folder, removeExcludedFolder, folders.filter((item) => item !== folder));
   };
 
   return (
@@ -119,7 +140,8 @@ export function ExcludeFolders() {
       >
         Excluded folders are not scanned, uploaded, downloaded, or deleted by sync.
         A name like <code>.git/</code> matches at any depth; a path like{" "}
-        <code>assets/cache</code> matches that relative folder.
+        <code>assets/cache</code> matches that relative folder. Saved for the
+        selected remote directory.
       </p>
       {error && (
         <p role="alert" className="mt-1 text-red-300">
