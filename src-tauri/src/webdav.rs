@@ -865,13 +865,27 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(ref e)) => {
                 if depth == 0 {
+                    // Fail closed on document shape: the first element must
+                    // be the multistatus root, and nothing may follow the
+                    // closed root — a response before or after the root is
+                    // not part of the document and must not inject items.
                     if saw_multistatus_root {
                         return Err(
                             "malformed PROPFIND XML: content after the multistatus root"
                                 .to_string(),
                         );
                     }
-                    saw_multistatus_root = e.local_name().as_ref().eq_ignore_ascii_case(b"multistatus");
+                    if !e
+                        .local_name()
+                        .as_ref()
+                        .eq_ignore_ascii_case(b"multistatus")
+                    {
+                        return Err(
+                            "malformed PROPFIND XML: root element is not multistatus"
+                                .to_string(),
+                        );
+                    }
+                    saw_multistatus_root = true;
                 }
                 depth += 1;
                 let local = e.local_name();
@@ -900,8 +914,27 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                 }
             }
             Ok(quick_xml::events::Event::Empty(ref e)) => {
-                if depth == 0 && !saw_multistatus_root {
-                    saw_multistatus_root = e.local_name().as_ref().eq_ignore_ascii_case(b"multistatus");
+                if depth == 0 {
+                    // Same root-shape rules as Start: a self-closing element
+                    // at document level is either the multistatus root or an
+                    // error, never silent content before/after it.
+                    if saw_multistatus_root {
+                        return Err(
+                            "malformed PROPFIND XML: content after the multistatus root"
+                                .to_string(),
+                        );
+                    }
+                    if !e
+                        .local_name()
+                        .as_ref()
+                        .eq_ignore_ascii_case(b"multistatus")
+                    {
+                        return Err(
+                            "malformed PROPFIND XML: root element is not multistatus"
+                                .to_string(),
+                        );
+                    }
+                    saw_multistatus_root = true;
                 }
                 let local = e.local_name();
                 let name = local.as_ref();
