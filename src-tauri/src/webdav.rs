@@ -1190,9 +1190,7 @@ pub fn validate_webdav_url(url_str: &str) -> Result<(), String> {
 /// permitted in this process: unit tests, an explicit development override,
 /// or a configured live test server.
 pub(crate) fn insecure_webdav_allowed() -> bool {
-    cfg!(test)
-        || std::env::var("ALLOW_INSECURE_WEBDAV").as_deref() == Ok("1")
-        || std::env::var("TEST_WEBDAV_URL").is_ok()
+    cfg!(test) || std::env::var("ALLOW_INSECURE_WEBDAV").as_deref() == Ok("1")
 }
 
 pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Result<(), String> {
