@@ -10,10 +10,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Restores a process-wide env var to its previous value when dropped, so
+/// this test's environment changes cannot leak into tests running after it.
+struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+
+impl EnvRestore {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, value);
+        EnvRestore(key, prev)
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match &self.1 {
+            Some(v) => std::env::set_var(self.0, v),
+            None => std::env::remove_var(self.0),
+        }
+    }
+}
+
 #[test]
 fn test_listing_item_count_is_bounded() {
-    std::env::set_var("ALLOW_INSECURE_WEBDAV", "1");
-    std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
+    let _allow_insecure = EnvRestore::set("ALLOW_INSECURE_WEBDAV", "1");
+    let _cache_disabled = EnvRestore::set("WEBDAV_CACHE_DISABLED", "1");
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -72,7 +93,6 @@ fn test_listing_item_count_is_bounded() {
         |m: &str| logs.push(m.to_string()),
     );
     let _ = std::fs::remove_dir_all(&local_dir);
-    std::env::remove_var("ALLOW_INSECURE_WEBDAV");
 
     assert!(
         result.is_err(),

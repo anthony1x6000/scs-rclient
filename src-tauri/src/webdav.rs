@@ -21,7 +21,9 @@ pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
 /// bodies must be bounded the same way or one response can exhaust memory.
 pub const MAX_LISTING_BODY_BYTES: u64 = 64 * 1024 * 1024;
 /// Aggregate item cap across one scan: bounds memory, the cache file, and the
-/// number of local files a hostile listing can materialize via `get`.
+/// number of local files a hostile listing can materialize via `get`. The
+/// same bound is enforced per listing during XML item collection, so no
+/// single PROPFIND response can materialize unbounded item state either.
 pub const MAX_REMOTE_ITEMS: usize = 100_000;
 /// Maximum number of excluded folder patterns applied to a single action.
 pub const MAX_EXCLUDE_PATTERNS: usize = 64;
@@ -1159,6 +1161,13 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                             size: current_size,
                             mtime: current_mtime,
                         });
+                        // Stop collecting once the cap is exceeded: callers
+                        // treat an over-cap listing as hostile, and parsing
+                        // halts instead of materializing unbounded item state
+                        // from one byte-bounded body.
+                        if items.len() > MAX_REMOTE_ITEMS {
+                            break;
+                        }
                     }
                 } else if name.eq_ignore_ascii_case(b"href") {
                     in_href = false;
@@ -2204,6 +2213,15 @@ where
                         )
                     })
                     .collect();
+                // The item cap must bind this path too: a hostile server
+                // can pack more than MAX_REMOTE_ITEMS entries into a
+                // sub-cap body. Fail loudly instead of caching or using a
+                // listing the scan-state aggregate cap never sees.
+                if items.len() > MAX_REMOTE_ITEMS {
+                    return Err(format!(
+                        "Depth: infinity listing exceeded the {MAX_REMOTE_ITEMS} item limit. Aborting for security."
+                    ));
+                }
                 // Depth: infinity is only accepted if it returned child items (not just the root collection itself)
                 let child_count = items
                     .iter()
@@ -3504,6 +3522,11 @@ where
             let mut res = res;
             let body = read_listing_body(&mut res)?;
             let items = parse_propfind_xml(&body)?;
+            if items.len() > MAX_REMOTE_ITEMS {
+                return Err(format!(
+                    "Listing exceeded the {MAX_REMOTE_ITEMS} item limit. Aborting for security."
+                ));
+            }
             if items.is_empty() {
                 return Err(
                     "PROPFIND returned an empty multistatus (no resources, not even the collection)"
@@ -5161,6 +5184,30 @@ mod tests {
         assert_ne!(t1, t2, "consecutive temps must not collide");
         let _ = std::fs::remove_file(&t1);
         let _ = std::fs::remove_file(&t2);
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_stops_at_item_cap() {
+        // Collection halts at cap+1 items so a hostile multistatus cannot
+        // materialize unbounded item state, and callers can detect the
+        // overflow by length and refuse the listing.
+        let mut xml =
+            String::from("<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\">");
+        for i in 0..(MAX_REMOTE_ITEMS + 500) {
+            xml.push_str(&format!(
+                "<D:response><D:href>/course/f{i}.txt</D:href>\
+                 <D:propstat><D:prop><D:resourcetype/>\
+                 <D:getcontentlength>1</D:getcontentlength></D:prop>\
+                 <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+            ));
+        }
+        xml.push_str("</D:multistatus>");
+        let items = parse_propfind_xml(&xml).expect("well-formed bounded multistatus");
+        assert_eq!(
+            items.len(),
+            MAX_REMOTE_ITEMS + 1,
+            "parser must stop collecting right past the item cap"
+        );
     }
 
     #[test]
