@@ -1235,9 +1235,110 @@ fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
     )
 }
 
+/// True when `target_url`'s path lies strictly below the configured
+/// collection path of `remote_url` (exact-case; explicit default ports are
+/// absorbed by origin equality). Paths that could resolve to a different
+/// segment structure on the server — percent-encoded separators, dot
+/// segments, duplicate slashes — never qualify, and the collection itself is
+/// not an item target: only strict descendants pass.
+fn is_within_collection(remote_url: &str, target_url: &str) -> bool {
+    let (Ok(base), Ok(target)) = (reqwest::Url::parse(remote_url), reqwest::Url::parse(target_url))
+    else {
+        return false;
+    };
+    let (Some(base_segs), Some(target_segs)) = (
+        collection_path_segments(base.path()),
+        collection_path_segments(target.path()),
+    ) else {
+        return false;
+    };
+    if base_segs.is_empty() {
+        // Origin-root collection: any non-root, unambiguous same-origin
+        // path is a strict descendant — but the origin root itself ("/") is
+        // never a valid item target.
+        return !target_segs.is_empty();
+    }
+    // The decoded segments above only VALIDATE the path (no encoded
+    // separators, dot aliases, or duplicate slashes). The prefix comparison
+    // itself is byte-exact on the RAW spellings: a target like
+    // `COURSE12%33` decodes onto the configured `COURSE123`, but a server
+    // that treats the escape literally routes it to a sibling collection.
+    let base_raw = raw_path_segments(base.path());
+    let target_raw = raw_path_segments(target.path());
+    target_raw.len() > base_raw.len() && target_raw[..base_raw.len()] == base_raw[..]
+}
+
+/// Raw `/`-split non-empty segments with no decoding, aligned with
+/// `collection_path_segments` (which is still the validity gate: paths it
+/// rejects never reach this comparison).
+fn raw_path_segments(path: &str) -> Vec<&str> {
+    path.split('/').filter(|seg| !seg.is_empty()).collect()
+}
+
+/// Non-empty path segments, or `None` when the path is ambiguous. Segments
+/// are split on RAW '/' separators before decoding, so a percent-encoded
+/// separator can never shift a segment boundary: a segment that decodes to
+/// contain '/' or '\', an internal empty segment (duplicate slash), or any
+/// spelling that a server could normalize into a dot segment is rejected
+/// wholesale — servers may resolve any of those differently from this
+/// client, so they can never be proven inside the collection. The URL
+/// parser has already resolved literal dot segments, so anything dot-like
+/// that appears after decoding came from encoded or aliased forms, and
+/// decoding runs to a fixed point so double-encoded spellings (`%252e`) are
+/// caught in the same net as single-encoded ones.
+fn collection_path_segments(path: &str) -> Option<Vec<String>> {
+    let raw_segs: Vec<&str> = path.split('/').collect();
+    let last_idx = raw_segs.len() - 1;
+    let mut segs = Vec::with_capacity(raw_segs.len());
+    for (idx, raw) in raw_segs.iter().enumerate() {
+        let mut decoded = decode_percent(raw);
+        // Decode to a fixed point: a double-decoding server would resolve
+        // `%252e` one step further each pass, so every reachable spelling
+        // must be checked, not just the first decoding.
+        for _ in 0..8 {
+            let next = decode_percent(&decoded);
+            if next == decoded {
+                break;
+            }
+            decoded = next;
+        }
+        if decoded.contains('/') || decoded.contains('\\') || decoded.contains('\0') {
+            return None;
+        }
+        if decoded.is_empty() {
+            // The leading empty from an absolute path and the trailing
+            // empty from a collection's slash are fine; anything else is a
+            // duplicate slash, which servers may treat as distinct.
+            if idx != 0 && idx != last_idx {
+                return None;
+            }
+            continue;
+        }
+        if normalizes_to_dot_segment(&decoded) {
+            return None;
+        }
+        segs.push(decoded);
+    }
+    Some(segs)
+}
+
+/// True for segments a server could resolve to "." or "..": the literal dot
+/// segments themselves, and spellings whose trailing ASCII spaces/dots/NULs
+/// (which Windows/IIS-family servers trim, so "..%20" and "..." re-alias to
+/// dot segments) or path-parameter suffixes (servlet containers strip ";..."
+/// suffixes, so "..;" names the parent directory) collapse to a dot segment.
+fn normalizes_to_dot_segment(seg: &str) -> bool {
+    fn dot_ish(s: &str) -> bool {
+        let trimmed = s.trim_end_matches(&[' ', '.', '\0'][..]);
+        trimmed.is_empty() || trimmed == "." || trimmed == ".."
+    }
+    dot_ish(seg) || dot_ish(seg.split(';').next().unwrap_or(""))
+}
+
 /// Gate for any URL taken from a server response before it becomes a request:
-/// it must stay on the configured remote's origin and still pass the SSRF
-/// guard. Returns the user-facing reason when the URL must not be used.
+/// it must stay on the configured remote's origin, inside the configured
+/// collection, and still pass the SSRF guard. Returns the user-facing reason
+/// when the URL must not be used.
 ///
 /// Redirect targets never reach the transport: the in-repo `dav_client`
 /// builds its reqwest client with `redirect::Policy::none()`, so a 3xx sent
@@ -1246,6 +1347,9 @@ fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
 fn guard_server_derived_url(remote_url: &str, target_url: &str) -> Result<(), String> {
     if !same_remote_origin(remote_url, target_url) {
         return Err("href resolves outside the configured remote origin".to_string());
+    }
+    if !is_within_collection(remote_url, target_url) {
+        return Err("href resolves outside the configured collection directory".to_string());
     }
     validate_webdav_url(target_url)
 }
@@ -1789,8 +1893,9 @@ where
     if let Some(requested) = concurrency {
         set_scan_concurrency(requested);
     }
-    let remote_parsed = reqwest::Url::parse(remote_url)
-        .map_err(|e| format!("Invalid remote URL: {}", e))?;
+    // Kept for its validation side effect: an unparsable remote must fail the
+    // scan before any worker is spawned.
+    let _ = reqwest::Url::parse(remote_url).map_err(|e| format!("Invalid remote URL: {e}"))?;
 
     let root_visited_key = remote_url.trim_end_matches('/').to_ascii_lowercase();
     let mut initial_visited = HashSet::new();
@@ -1923,7 +2028,6 @@ where
         scope: &'scope std::thread::Scope<'scope, 'env>,
         client: &'env Client,
         remote_url: &'env str,
-        remote_origin: reqwest::Url,
         cancel_flag: &'env AtomicBool,
         state_ref: &'env Mutex<ScanState>,
         cvar_ref: &'env Condvar,
@@ -1931,7 +2035,6 @@ where
         log_tx: mpsc::Sender<String>,
     ) {
         let worker_log_tx = log_tx;
-        let worker_remote_origin = remote_origin.origin();
         scope.spawn(move || {
             let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 loop {
@@ -2097,14 +2200,13 @@ where
                         children_in_dir += 1;
                         if item.is_dir {
                             new_dirs += 1;
-                            if let Ok(parsed_sub) = reqwest::Url::parse(&item_url) {
-                                if parsed_sub.origin() == worker_remote_origin
-                                    && !rel_from_root.is_empty()
-                                    && is_safe_relative_path(&rel_from_root)
-                                    && validate_webdav_url(&item_url).is_ok()
-                                {
-                                    discovered_sub_urls.push(item_url);
-                                }
+                            if same_remote_origin(remote_url, &item_url)
+                                && !rel_from_root.is_empty()
+                                && is_safe_relative_path(&rel_from_root)
+                                && validate_webdav_url(&item_url).is_ok()
+                                && is_within_collection(remote_url, &item_url)
+                            {
+                                discovered_sub_urls.push(item_url);
                             }
                             discovered_items.push(item);
                         } else {
@@ -2193,7 +2295,6 @@ where
                         s,
                         client,
                         remote_url,
-                        remote_parsed.clone(),
                         cancel_flag,
                         state_ref,
                         cvar_ref,
@@ -4180,6 +4281,124 @@ mod tests {
         );
         let ok_body = format!("{body}</D:multistatus>");
         assert_eq!(parse_propfind_xml(&ok_body).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_guard_server_derived_url_bounds_targets_to_the_collection() {
+        // The user confirms an action for ONE collection (base_url + subdir).
+        // A server-advertised href may point anywhere on the same origin; the
+        // guard must refuse to let it steer authenticated DELETE/GET outside
+        // the configured collection.
+        let base = "https://h.example/content/enforced/COURSE123/";
+        assert!(
+            guard_server_derived_url(base, "https://h.example/othercourse/file.txt").is_err(),
+            "same-origin out-of-collection href must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "/othercourse/file.txt").is_err(),
+            "relative out-of-collection href must be refused"
+        );
+        // Strict descendants only: the collection itself is never a valid
+        // item-level request target, and case-folded spellings name a
+        // different collection on case-sensitive servers.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/").is_err(),
+            "the collection root itself must not pass as an item target"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/Content/Enforced/course123/notes/a.txt").is_err(),
+            "case-folded hrefs must not match the configured collection"
+        );
+        // Encoded separators and dot segments must not create segment
+        // boundaries the guard would trust.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123%2F..%2Fothercourse/file.txt").is_err(),
+            "percent-encoded separators decoding into traversal must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%2f..%2fothercourse/file.txt").is_err(),
+            "encoded dot segments must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/sub%5C..%5Cothercourse/file.txt").is_err(),
+            "encoded backslash traversal must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/%2e%2e/othercourse/file.txt").is_err(),
+            "encoded dot-dot segments must be refused"
+        );
+        // Even a non-dot encoded separator stays inside one raw segment and
+        // is rejected: a server that does not decode %2F would route it to a
+        // different path than the one compared here.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/notes%2Fextra.txt").is_err(),
+            "encoded separators must never be treated as segment boundaries"
+        );
+        // Duplicate slashes may name a different path on the server.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123//file.txt").is_err(),
+            "duplicate slashes must be refused as ambiguous"
+        );
+        // Dot-segment aliases that normalizing servers collapse: servlet
+        // path parameters (";..."), Windows-style trailing space/dot
+        // trimming, and embedded NULs.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%20/othercourse/file.txt").is_err(),
+            "trailing-space dot segments must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%3B/othercourse/file.txt").is_err(),
+            "path-parameter dot aliases must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%00/othercourse/file.txt").is_err(),
+            "NUL-terminated dot segments must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/.../othercourse/file.txt").is_err(),
+            "trailing-dot aliases of dot segments must be refused"
+        );
+        // In-collection targets still pass: deeper exact-case paths, explicit
+        // default port, and percent-encoded ordinary characters.
+        assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/notes/a.txt").is_ok());
+        assert!(guard_server_derived_url(base, "https://h.example:443/content/enforced/COURSE123/a.txt").is_ok());
+        assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/my%20file.txt").is_ok());
+        // A legitimate name that merely ENDS in a dot or space is not a dot
+        // segment: only spellings whose trailing-trimmed remainder collapses
+        // to "", ".", or ".." can re-alias onto a dot segment.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/report./a.txt").is_ok(),
+            "trailing-dot file names must not be rejected as dot aliases"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/note%20file.txt").is_ok(),
+            "in-segment spaces are ordinary characters"
+        );
+        // Encoded spellings that DECODE onto the collection name must not
+        // match it: a server that treats `%33` literally routes the request
+        // to a sibling collection, so the prefix comparison is byte-exact on
+        // the raw segments.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE12%33/file.txt").is_err(),
+            "an encoded alias of the collection name must not match the collection"
+        );
+        // Double-encoded dot segments decode to `..` on a double-decoding
+        // server and must be rejected before that can happen.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/%252e%252e/othercourse/file.txt").is_err(),
+            "double-encoded dot segments must be refused"
+        );
+        // Origin-root collection: any unambiguous non-root path is a strict
+        // descendant, but the origin root itself is never an item target.
+        assert!(guard_server_derived_url("https://h.example/", "https://h.example/any/path.txt").is_ok());
+        assert!(
+            guard_server_derived_url("https://h.example/", "https://h.example/").is_err(),
+            "the origin root itself must not pass as an item target"
+        );
+        assert!(
+            guard_server_derived_url("https://h.example/", "https://h.example/any/course%2F..%2Fother.txt").is_err(),
+            "encoded-separator traversal is refused even for origin-root collections"
+        );
     }
 
     #[test]
