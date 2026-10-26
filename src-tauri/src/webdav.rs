@@ -417,21 +417,27 @@ impl Default for WebdavItem {
     }
 }
 
-/// True when `subdir` contains traversal segments or separators, checking the
-/// raw text and its percent-decoded form: `..` segments and backslashes count
-/// in both forms, because [`build_remote_url`] is a plain join and servers
-/// decode `%2F`/`%5C` into separators.
+/// True when `subdir` contains traversal segments or other path-hostile
+/// bytes, checking the raw text and each percent-decoding of it until the
+/// text stabilizes: `..` segments, backslashes, and control characters count
+/// in every form, because [`build_remote_url`] is a plain join and servers
+/// decode `%2F`/`%5C` into separators (possibly more than once, and may
+/// truncate at NUL).
 pub fn has_traversal_segments(subdir: &str) -> bool {
-    let decoded = decode_percent(subdir);
-    for text in [subdir, &decoded] {
-        if text.contains('\\') {
+    let mut text = subdir.to_string();
+    loop {
+        if text.contains('\\')
+            || text.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || text.split('/').any(|segment| segment.trim() == "..")
+        {
             return true;
         }
-        if text.split('/').any(|segment| segment.trim() == "..") {
-            return true;
+        let decoded = decode_percent(&text);
+        if decoded == text {
+            return false;
         }
+        text = decoded;
     }
-    false
 }
 
 /// Returns true if a path or href contains directory traversal sequences or forbidden characters.
@@ -4515,6 +4521,11 @@ mod tests {
             "..\\..",
             "a%5Cb", // encoded backslash
             "a\\b",
+            "..%00",           // NUL-truncated dot-dot
+            "%252e%252e",      // double-encoded dot-dot
+            "%252e%252e%252f", // double-encoded traversal
+            "a%00b",           // raw NUL
+            "a%01b",           // other control byte
         ] {
             assert!(
                 has_traversal_segments(subdir),

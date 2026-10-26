@@ -31,6 +31,22 @@ const inflightListings = new Map<string, Promise<RemoteFolder[]>>();
 const LISTING_TIMEOUT_MS = 300_000;
 
 /**
+ * Starts a listing and registers it in the shared in-flight map. On settle it
+ * evicts only its own entry, so a stale request's cleanup can never evict a
+ * newer listing that a timeout-retry already registered.
+ */
+function startTrackedListing(subdir: string): Promise<RemoteFolder[]> {
+  const tracked = invoke<RemoteFolder[]>("list_remote_folders", { subdir }).finally(() => {
+    if (inflightListings.get(subdir) === tracked) inflightListings.delete(subdir);
+  });
+  inflightListings.set(subdir, tracked);
+  // Keep the shared promise's rejection observed when a caller abandons it on
+  // timeout; awaiters still see the rejection.
+  tracked.catch(() => {});
+  return tracked;
+}
+
+/**
  * Remote folder picker for exclusions: expands the selected remote directory as
  * a lazy tree (the first expansion is the only WebDAV request — deeper levels
  * derive from that listing) with each folder's total size. Ticking a checkbox
@@ -79,17 +95,7 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
     loadingRef.current = true;
     setLoading(true);
     setListError(null);
-    const existing = inflightListings.get(subdir);
-    const request = existing ??
-      invoke<RemoteFolder[]>("list_remote_folders", { subdir }).finally(() =>
-        inflightListings.delete(subdir),
-      );
-    if (!existing) {
-      inflightListings.set(subdir, request);
-      // Keep the shared promise's rejection observed even when this caller
-      // abandons it on timeout; awaiters still see the rejection.
-      request.catch(() => {});
-    }
+    const request = inflightListings.get(subdir) ?? startTrackedListing(subdir);
     const timeout = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error("Timed out.")), LISTING_TIMEOUT_MS);
     });

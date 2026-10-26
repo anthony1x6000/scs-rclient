@@ -234,56 +234,38 @@ function enqueueExcludedFoldersWrite<T>(op: () => Promise<T>): Promise<T> {
 }
 
 /**
- * The per-directory exclusion map for `subdir`. The first access after
- * upgrading a legacy flat list imports it under `subdir`'s scope and keeps a
- * raw copy under the legacy key, which every other scope falls back to until
- * the user configures it explicitly — so an upgrade never silently drops the
- * user's exclusions anywhere.
- */
-async function getExcludedFoldersMap(subdir: string): Promise<ExcludedFoldersByDir> {
-  return enqueueExcludedFoldersWrite(async () => {
-    const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
-    if (!isLegacyExcludedFoldersList(stored)) {
-      return parseExcludedFoldersMap(stored);
-    }
-    const byDir = migrateLegacyList(stored, subdir);
-    // Legacy copy first: if the map write then fails, the still-present legacy
-    // array lets the next attempt converge; the reverse order could leave the
-    // fallback lost forever.
-    await setWrapped(STORE_KEYS.excludedFoldersLegacy, stored);
-    await setWrapped(STORE_KEYS.excludedFolders, byDir);
-    return byDir;
-  });
-}
-
-/** The raw pre-scope exclusion list kept as a fallback for unconfigured scopes. */
-async function getLegacyExcludedFolders(): Promise<string[]> {
-  const stored = await getWrapped<unknown>(STORE_KEYS.excludedFoldersLegacy);
-  return legacyFallbackList(stored);
-}
-
-/**
- * Reads the stored state inside the write queue and returns the parsed map
- * plus the legacy copy to persist when this access performs the migration.
+ * Raw exclusion-state read (caller must already hold the write queue):
+ * the per-directory map plus the legacy fallback list, migrating a legacy
+ * flat list on first access after an upgrade — inside the same operation, so
+ * the fallback can never be read before the migration that persists it.
  */
 async function readExcludedFoldersState(
   subdir: string,
-): Promise<{ byDir: ExcludedFoldersByDir; legacyToPersist: unknown[] | null }> {
+): Promise<{ byDir: ExcludedFoldersByDir; legacy: string[] }> {
   const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
   if (!isLegacyExcludedFoldersList(stored)) {
-    return { byDir: parseExcludedFoldersMap(stored), legacyToPersist: null };
+    const legacyStored = await getWrapped<unknown>(STORE_KEYS.excludedFoldersLegacy);
+    return { byDir: parseExcludedFoldersMap(stored), legacy: legacyFallbackList(legacyStored) };
   }
-  // A delta write can be the first exclusion access after an upgrade; keep
-  // the raw copy so every unconfigured scope keeps its fallback.
-  return { byDir: migrateLegacyList(stored, subdir), legacyToPersist: stored };
+  // First access after an upgrade: import the flat list under `subdir`'s
+  // scope and keep the raw copy as every other scope's fallback, so no
+  // directory silently loses its exclusions. Legacy copy first: if the map
+  // write then fails, the still-present legacy array lets the next attempt
+  // converge; the reverse order could lose the fallback forever.
+  await setWrapped(STORE_KEYS.excludedFoldersLegacy, stored);
+  const byDir = migrateLegacyList(stored, subdir);
+  await setWrapped(STORE_KEYS.excludedFolders, byDir);
+  return { byDir, legacy: legacyFallbackList(stored) };
 }
 
-async function effectiveExcludedFolders(
-  byDir: ExcludedFoldersByDir,
+/**
+ * The exclusion state for `subdir` (see [`readExcludedFoldersState`]),
+ * serialized behind every other exclusion access.
+ */
+async function getExcludedFoldersState(
   subdir: string,
-): Promise<string[]> {
-  const legacy = legacyFallbackList(await getWrapped<unknown>(STORE_KEYS.excludedFoldersLegacy));
-  return excludedFoldersFor(byDir, subdir, legacy);
+): Promise<{ byDir: ExcludedFoldersByDir; legacy: string[] }> {
+  return enqueueExcludedFoldersWrite(() => readExcludedFoldersState(subdir));
 }
 
 /**
@@ -292,10 +274,7 @@ async function effectiveExcludedFolders(
  * has not configured yet.
  */
 export async function getExcludedFolders(subdir: string): Promise<string[]> {
-  const [byDir, legacy] = await Promise.all([
-    getExcludedFoldersMap(subdir),
-    getLegacyExcludedFolders(),
-  ]);
+  const { byDir, legacy } = await getExcludedFoldersState(subdir);
   return excludedFoldersFor(byDir, subdir, legacy);
 }
 
@@ -306,11 +285,10 @@ export async function getExcludedFolders(subdir: string): Promise<string[]> {
  */
 export async function addExcludedFolder(subdir: string, folder: string): Promise<void> {
   await enqueueExcludedFoldersWrite(async () => {
-    const { byDir, legacyToPersist } = await readExcludedFoldersState(subdir);
-    const current = await effectiveExcludedFolders(byDir, subdir);
+    const { byDir, legacy } = await readExcludedFoldersState(subdir);
+    const current = excludedFoldersFor(byDir, subdir, legacy);
     if (current.includes(folder) || current.length >= MAX_EXCLUDED_FOLDERS) return;
     byDir[exclusionScopeKey(subdir)] = [...current, folder];
-    if (legacyToPersist) await setWrapped(STORE_KEYS.excludedFoldersLegacy, legacyToPersist);
     await setWrapped(STORE_KEYS.excludedFolders, byDir);
   });
 }
@@ -318,10 +296,9 @@ export async function addExcludedFolder(subdir: string, folder: string): Promise
 /** Removes one exclusion pattern from `subdir`'s scope (see addExcludedFolder). */
 export async function removeExcludedFolder(subdir: string, folder: string): Promise<void> {
   await enqueueExcludedFoldersWrite(async () => {
-    const { byDir, legacyToPersist } = await readExcludedFoldersState(subdir);
-    const current = await effectiveExcludedFolders(byDir, subdir);
+    const { byDir, legacy } = await readExcludedFoldersState(subdir);
+    const current = excludedFoldersFor(byDir, subdir, legacy);
     byDir[exclusionScopeKey(subdir)] = current.filter((item) => item !== folder);
-    if (legacyToPersist) await setWrapped(STORE_KEYS.excludedFoldersLegacy, legacyToPersist);
     await setWrapped(STORE_KEYS.excludedFolders, byDir);
   });
 }
@@ -343,11 +320,9 @@ export async function loadAppSettings(): Promise<{
     getSavedUsername(),
     getScanConcurrency(),
   ]);
-  // The exclusion map read depends on the selected dir (legacy migration target).
-  const [excludedFoldersByDir, excludedFoldersLegacy] = await Promise.all([
-    getExcludedFoldersMap(selectedSubdir),
-    getLegacyExcludedFolders(),
-  ]);
+  // The exclusion state read depends on the selected dir (legacy migration target).
+  const { byDir: excludedFoldersByDir, legacy: excludedFoldersLegacy } =
+    await getExcludedFoldersState(selectedSubdir);
   return {
     baseUrl,
     selectedSubdir,

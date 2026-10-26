@@ -350,6 +350,19 @@ async fn list_remote_folders(
 
     let remote_url = webdav::build_remote_url(&base_url, &subdir);
     webdav::validate_webdav_url(&remote_url)?;
+    // Belt-and-braces origin pinning: the built URL must stay on the stored
+    // base's scheme/host/port before credentials are attached, whatever
+    // build_remote_url does to the path.
+    let (base_origin, remote_origin) = (
+        reqwest::Url::parse(&base_url).map_err(|e| format!("Invalid stored WebDAV URL: {e}"))?,
+        reqwest::Url::parse(&remote_url).map_err(|e| format!("Invalid remote URL: {e}"))?,
+    );
+    if base_origin.scheme() != remote_origin.scheme()
+        || base_origin.host_str() != remote_origin.host_str()
+        || base_origin.port() != remote_origin.port()
+    {
+        return Err("Resolved remote URL leaves the configured WebDAV origin.".to_string());
+    }
 
     // A username with no keyring entry must fail loudly instead of
     // authenticating with an empty password.
