@@ -9,6 +9,8 @@ interface RcloneActionsProps {
   setIsRunning: (running: boolean) => void;
   /** Ticked subfolders; 2+ turns every action into a sequential bulk run. */
   bulkFolders?: string[];
+  /** Fired when an action actually runs on a bulk selection (2+ folders). */
+  onBulkRun?: (folders: string[]) => void;
 }
 
 interface ActionDef {
@@ -29,7 +31,13 @@ const ACTIONS: ActionDef[] = [
 const ACTION_BUTTON_CLASS =
   "w-full bg-gray-800/25 border border-white/30 hover:border-white/70 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white";
 
-export function RcloneActions({ onLog, isRunning, setIsRunning, bulkFolders = [] }: RcloneActionsProps) {
+export function RcloneActions({
+  onLog,
+  isRunning,
+  setIsRunning,
+  bulkFolders = [],
+  onBulkRun,
+}: RcloneActionsProps) {
   const { runRclone, cancelCommand } = useRcloneExecution(onLog, isRunning, setIsRunning);
   const [overwriteArmed, setOverwriteArmed] = useState(false);
   const uploadButtonRef = useRef<HTMLButtonElement>(null);
@@ -114,6 +122,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning, bulkFolders = []
   const runAction = (action: RcloneActionType) => {
     if (isRunning) return;
     setOverwriteArmed(false);
+    if (isBulk) onBulkRun?.(bulkFolders);
     runRclone(action, runFolders);
   };
 
@@ -124,6 +133,7 @@ export function RcloneActions({ onLog, isRunning, setIsRunning, bulkFolders = []
       return;
     }
     setOverwriteArmed(false);
+    if (isBulk) onBulkRun?.(bulkFolders);
     runRclone("sync", runFolders);
   };
 
