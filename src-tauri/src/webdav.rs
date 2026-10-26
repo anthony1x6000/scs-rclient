@@ -1964,6 +1964,7 @@ where
                     let items = match parse_propfind_xml(&body) {
                         Ok(items) => items,
                         Err(reason) => {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
                             state.error = Some(reason);
                             state.stopped = true;
                             return;
