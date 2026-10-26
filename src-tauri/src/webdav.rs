@@ -5297,9 +5297,11 @@ mod tests {
 
     #[test]
     fn test_parse_propfind_xml_stops_at_item_cap() {
-        // Collection halts at cap+1 items so a hostile multistatus cannot
-        // materialize unbounded item state, and callers can detect the
-        // overflow by length and refuse the listing.
+        // An over-cap listing is hostile, and truncated acceptance is a
+        // silent partial listing: the parser itself must refuse it, so no
+        // caller can be talked into treating the first cap+1 items as a
+        // complete result (duplicates included — uniqueness is a caller
+        // concern the parser cannot see).
         let mut xml =
             String::from("<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\">");
         for i in 0..(MAX_REMOTE_ITEMS + 500) {
@@ -5311,11 +5313,11 @@ mod tests {
             ));
         }
         xml.push_str("</D:multistatus>");
-        let items = parse_propfind_xml(&xml).expect("well-formed bounded multistatus");
-        assert_eq!(
-            items.len(),
-            MAX_REMOTE_ITEMS + 1,
-            "parser must stop collecting right past the item cap"
+        let err = parse_propfind_xml(&xml)
+            .expect_err("an over-cap listing must be an outright parse error");
+        assert!(
+            err.to_ascii_lowercase().contains("item limit"),
+            "error must name the item limit, got: {err}"
         );
     }
 
