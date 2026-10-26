@@ -1297,13 +1297,14 @@ fn collection_path_segments(path: &str) -> Option<Vec<String>> {
 }
 
 /// True for segments a server could resolve to "." or "..": the literal dot
-/// segments themselves, spellings with trailing ASCII spaces or dots (which
-/// Windows/IIS-family servers trim, so "..%20" and "..." re-alias to dot
-/// segments), and path-parameter aliases (servlet containers strip ";..."
-/// suffixes, so "..;" names the parent directory).
+/// segments themselves, and spellings whose trailing ASCII spaces/dots/NULs
+/// (which Windows/IIS-family servers trim, so "..%20" and "..." re-alias to
+/// dot segments) or path-parameter suffixes (servlet containers strip ";..."
+/// suffixes, so "..;" names the parent directory) collapse to a dot segment.
 fn normalizes_to_dot_segment(seg: &str) -> bool {
     fn dot_ish(s: &str) -> bool {
-        s == "." || s == ".." || s.ends_with(' ') || s.ends_with('.') || s.ends_with('\0')
+        let trimmed = s.trim_end_matches([' ', '.', '\0']);
+        trimmed.is_empty() || trimmed == "." || trimmed == ".."
     }
     dot_ish(seg) || dot_ish(seg.split(';').next().unwrap_or(""))
 }
@@ -1866,8 +1867,9 @@ where
     if let Some(requested) = concurrency {
         set_scan_concurrency(requested);
     }
-    let remote_parsed = reqwest::Url::parse(remote_url)
-        .map_err(|e| format!("Invalid remote URL: {}", e))?;
+    // Kept for its validation side effect: an unparsable remote must fail the
+    // scan before any worker is spawned.
+    let _ = reqwest::Url::parse(remote_url).map_err(|e| format!("Invalid remote URL: {e}"))?;
 
     let root_visited_key = remote_url.trim_end_matches('/').to_ascii_lowercase();
     let mut initial_visited = HashSet::new();
@@ -2000,7 +2002,6 @@ where
         scope: &'scope std::thread::Scope<'scope, 'env>,
         client: &'env Client,
         remote_url: &'env str,
-        remote_origin: reqwest::Url,
         cancel_flag: &'env AtomicBool,
         state_ref: &'env Mutex<ScanState>,
         cvar_ref: &'env Condvar,
@@ -2008,7 +2009,6 @@ where
         log_tx: mpsc::Sender<String>,
     ) {
         let worker_log_tx = log_tx;
-        let worker_remote_origin = remote_origin.origin();
         scope.spawn(move || {
             let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 loop {
@@ -2174,15 +2174,13 @@ where
                         children_in_dir += 1;
                         if item.is_dir {
                             new_dirs += 1;
-                            if let Ok(parsed_sub) = reqwest::Url::parse(&item_url) {
-                                if parsed_sub.origin() == worker_remote_origin
-                                    && !rel_from_root.is_empty()
-                                    && is_safe_relative_path(&rel_from_root)
-                                    && validate_webdav_url(&item_url).is_ok()
-                                    && is_within_collection(remote_url, &item_url)
-                                {
-                                    discovered_sub_urls.push(item_url);
-                                }
+                            if same_remote_origin(remote_url, &item_url)
+                                && !rel_from_root.is_empty()
+                                && is_safe_relative_path(&rel_from_root)
+                                && validate_webdav_url(&item_url).is_ok()
+                                && is_within_collection(remote_url, &item_url)
+                            {
+                                discovered_sub_urls.push(item_url);
                             }
                             discovered_items.push(item);
                         } else {
@@ -2271,7 +2269,6 @@ where
                         s,
                         client,
                         remote_url,
-                        remote_parsed.clone(),
                         cancel_flag,
                         state_ref,
                         cvar_ref,
