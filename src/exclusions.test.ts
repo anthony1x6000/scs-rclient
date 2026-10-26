@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   excludedFoldersFor,
   exclusionScopeKey,
+  legacyFallbackList,
   migrateLegacyList,
   parseExcludedFoldersMap,
   normalizeExcludedFolder,
@@ -39,24 +40,22 @@ describe("parseExcludedFoldersMap", () => {
     expect(parseExcludedFoldersMap(map)).toEqual(map);
   });
 
-  it("treats the legacy flat array as a clean slate", () => {
-    expect(parseExcludedFoldersMap([".git", "node_modules"])).toEqual({});
+  it("skips individually invalid scope entries instead of dropping the whole map", () => {
+    const parsed = parseExcludedFoldersMap({ css: [".git"], bad: "nope", js: 3, ok: [] });
+    expect(Object.keys(parsed).sort()).toEqual(["css", "ok"]);
+    expect(parsed["css"]).toEqual([".git"]);
+    expect(parsed["ok"]).toEqual([]);
   });
 
-  it("rejects non-object garbage", () => {
-    expect(parseExcludedFoldersMap("nope")).toEqual({});
-    expect(parseExcludedFoldersMap(7)).toEqual({});
-    expect(parseExcludedFoldersMap(null)).toEqual({});
-    expect(parseExcludedFoldersMap(undefined)).toEqual({});
+  it("treats the legacy flat array as no map at all", () => {
+    expect(Object.keys(parseExcludedFoldersMap([".git", "node_modules"]))).toEqual([]);
   });
 
-  it("rejects maps with non-list values", () => {
-    expect(parseExcludedFoldersMap({ css: ".git" })).toEqual({});
-    expect(parseExcludedFoldersMap({ css: [".git"], js: 3 })).toEqual({});
-  });
-
-  it("returns a prototype-less map so scope keys cannot pollute Object.prototype", () => {
+  it("returns a prototype-less map on every path", () => {
     expect(Object.getPrototypeOf(parseExcludedFoldersMap({}))).toBeNull();
+    expect(Object.getPrototypeOf(parseExcludedFoldersMap([".git"]))).toBeNull();
+    expect(Object.getPrototypeOf(parseExcludedFoldersMap("nope"))).toBeNull();
+    expect(Object.getPrototypeOf(parseExcludedFoldersMap(null))).toBeNull();
   });
 
   it("keeps a __proto__ scope key as plain data", () => {
@@ -67,6 +66,24 @@ describe("parseExcludedFoldersMap", () => {
     expect(Object.keys(parsed)).toEqual(["__proto__"]);
     expect(parsed["__proto__"]).toEqual([".git"]);
     expect(Object.getPrototypeOf(parsed)).toBeNull();
+  });
+});
+
+describe("legacyFallbackList", () => {
+  it("normalizes the stored legacy array", () => {
+    expect(legacyFallbackList(["/.git/", ".git", "node_modules"])).toEqual([
+      ".git",
+      "node_modules",
+    ]);
+  });
+
+  it("drops invalid legacy entries", () => {
+    expect(legacyFallbackList(["..", "ok"])).toEqual(["ok"]);
+  });
+
+  it("is empty for non-array legacy values", () => {
+    expect(legacyFallbackList(undefined)).toEqual([]);
+    expect(legacyFallbackList("css")).toEqual([]);
   });
 });
 
@@ -116,6 +133,24 @@ describe("excludedFoldersFor", () => {
   it("drops invalid stored entries", () => {
     const byDir = { css: ["..", "\u0007bad", "ok"] };
     expect(excludedFoldersFor(byDir, "css")).toEqual(["ok"]);
+  });
+
+  it("falls back to the legacy list only for scopes without an explicit entry", () => {
+    const byDir = { css: [".git"] };
+    expect(excludedFoldersFor(byDir, "css", [".git", "node_modules"])).toEqual([".git"]);
+    expect(excludedFoldersFor(byDir, "js", [".git", "node_modules"])).toEqual([
+      ".git",
+      "node_modules",
+    ]);
+  });
+
+  it("treats an explicit empty list as an override of the legacy fallback", () => {
+    const byDir = { css: [] };
+    expect(excludedFoldersFor(byDir, "css", [".git"])).toEqual([]);
+  });
+
+  it("returns nothing for unknown scopes when there is no fallback", () => {
+    expect(excludedFoldersFor({ css: [".git"] }, "js", [])).toEqual([]);
   });
 });
 

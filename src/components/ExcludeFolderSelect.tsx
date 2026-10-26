@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  addExcludedFolder,
+  ensureWebDAVBasePersisted,
   getExcludedFolders,
-  setExcludedFolders,
-  getSavedUsername,
-  getWebDAVBase,
+  removeExcludedFolder,
 } from "../settings";
 import { MAX_EXCLUDED_FOLDERS, normalizeExcludedFolder } from "../exclusions";
 import {
@@ -15,15 +15,17 @@ import {
   type RemoteFolder,
 } from "../folderTree";
 
-interface PickerConfig {
-  baseUrl: string;
-  username: string;
-}
-
 interface ExcludeFolderSelectProps {
   /** Remote directory the tree is rooted at; the parent remounts on change. */
   subdir: string;
 }
+
+/**
+ * In-flight folder listings keyed by remote path, shared across panel mounts:
+ * closing and reopening the picker reuses the running request instead of
+ * spawning a second recursive scan against the server.
+ */
+const inflightListings = new Map<string, Promise<RemoteFolder[]>>();
 
 /**
  * Remote folder picker for exclusions: expands the selected remote directory as
@@ -32,7 +34,7 @@ interface ExcludeFolderSelectProps {
  * persists that folder on the selected directory's exclusion list immediately.
  */
 export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
-  const [config, setConfig] = useState<PickerConfig | null>(null);
+  const [ready, setReady] = useState(false);
   const [excluded, setExcluded] = useState<string[]>([]);
   const [folders, setFolders] = useState<RemoteFolder[] | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -44,14 +46,15 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
 
   useEffect(() => {
     activeRef.current = true;
-    Promise.all([getWebDAVBase(), getSavedUsername()])
-      .then(async ([baseUrl, username]) => {
-        const stored = await getExcludedFolders(subdir);
+    // Persist the env-derived base (dev builds) so the backend can treat the
+    // settings store as the sole source of truth for the remote origin.
+    Promise.all([ensureWebDAVBasePersisted(), getExcludedFolders(subdir)])
+      .then(([, stored]) => {
         if (!activeRef.current) return;
-        setConfig({ baseUrl, username });
         setExcluded(stored);
         setFolders(null);
         setExpanded(new Set());
+        setReady(true);
       })
       .catch((e) => {
         console.error("Failed to load folder picker settings:", e);
@@ -66,17 +69,19 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
 
   // One recursive listing covers the whole tree; every deeper expansion is
   // derived from it, so this is the only WebDAV request the picker ever makes.
+  // The shared in-flight map dedupes concurrent listings across remounts.
   const fetchTree = async () => {
-    if (!config || loadingRef.current) return;
+    if (!ready || loadingRef.current) return;
     loadingRef.current = true;
     setLoading(true);
     setListError(null);
+    const running = inflightListings.get(subdir) ??
+      invoke<RemoteFolder[]>("list_remote_folders", { subdir }).finally(() =>
+        inflightListings.delete(subdir),
+      );
+    inflightListings.set(subdir, running);
     try {
-      const result = await invoke<RemoteFolder[]>("list_remote_folders", {
-        baseUrl: config.baseUrl,
-        subdir,
-        username: config.username || undefined,
-      });
+      const result = await running;
       if (activeRef.current) setFolders(result);
     } catch (e: any) {
       console.error("Failed to list remote folders:", e);
@@ -101,12 +106,17 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
     });
   };
 
-  const persist = async (next: string[]) => {
-    if (!config) return;
+  // Toggles persist as deltas against the freshest stored list, so another
+  // open editor's patterns can never be clobbered by this panel's stale state.
+  const apply = async (
+    folder: string,
+    op: (dir: string, entry: string) => Promise<void>,
+    optimistic: string[],
+  ) => {
     const previous = excluded;
-    setExcluded(next);
+    setExcluded(optimistic);
     try {
-      await setExcludedFolders(subdir, next);
+      await op(subdir, folder);
       setSaveError(null);
     } catch (e) {
       console.error("Failed to save excluded folders:", e);
@@ -117,7 +127,7 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
 
   const toggleExclude = (folder: string) => {
     if (excluded.includes(folder)) {
-      void persist(excluded.filter((item) => item !== folder));
+      void apply(folder, removeExcludedFolder, excluded.filter((item) => item !== folder));
       return;
     }
     if (!normalizeExcludedFolder(folder)) return;
@@ -125,7 +135,7 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
       setSaveError(`At most ${MAX_EXCLUDED_FOLDERS} folders can be excluded.`);
       return;
     }
-    void persist([...excluded, folder]);
+    void apply(folder, addExcludedFolder, [...excluded, folder]);
   };
 
   const renderRow = (folder: RemoteFolder, depth: number) => {
@@ -186,13 +196,13 @@ export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
     <div id="scs-exclude-folder-select" className="px-2 pb-1 text-xs text-white">
       <p className="mt-1 text-[10px] text-gray-400 font-light">
         Tick remote folders to exclude for{" "}
-        <span className="font-mono">{config ? subdir || "…" : "…"}</span>. Sizes
+        <span className="font-mono">{ready ? subdir || "…" : "…"}</span>. Sizes
         total every file beneath a folder.
       </p>
-      {config && !subdir && (
+      {ready && !subdir && (
         <p className="mt-1 text-gray-400 font-light">Select a subdirectory first.</p>
       )}
-      {config && subdir && (
+      {ready && subdir && (
         <div
           role="tree"
           aria-label={`Remote folders under ${subdir}`}

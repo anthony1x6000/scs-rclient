@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  addExcludedFolder,
   getExcludedFolders,
-  setExcludedFolders,
+  removeExcludedFolder,
   normalizeExcludedFolder,
   MAX_EXCLUDED_FOLDERS,
 } from "../settings";
@@ -45,12 +46,18 @@ export function ExcludeFolders({ subdir }: ExcludeFoldersProps) {
     };
   }, [subdir]);
 
-  const persist = async (next: string[]) => {
+  // Deltas (not full-list replacements) are persisted against the freshest
+  // stored list, so another open editor can never be clobbered by this one.
+  const apply = async (
+    folder: string,
+    op: (dir: string, entry: string) => Promise<void>,
+    optimistic: string[],
+  ) => {
     const previous = folders;
-    setFolders(next);
+    setFolders(optimistic);
     setSaving(true);
     try {
-      await setExcludedFolders(subdirRef.current, next);
+      await op(subdirRef.current, folder);
       setError(null);
     } catch (e) {
       console.error("Failed to save excluded folders:", e);
@@ -76,11 +83,11 @@ export function ExcludeFolders({ subdir }: ExcludeFoldersProps) {
       return;
     }
     setDraft("");
-    void persist([...folders, folder]);
+    void apply(folder, addExcludedFolder, [...folders, folder]);
   };
 
   const remove = (folder: string) => {
-    void persist(folders.filter((item) => item !== folder));
+    void apply(folder, removeExcludedFolder, folders.filter((item) => item !== folder));
   };
 
   return (

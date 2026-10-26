@@ -316,18 +316,15 @@ fn clear_webdav_cache() -> Result<(), String> {
 /// Powers the "Exclude folder select" picker. Uses its own cancel flag so
 /// opening the picker never resets cancellation of a running action.
 ///
-/// Hardening: the authenticated origin and identity come from the saved
-/// settings store, never from renderer input — a compromised renderer cannot
-/// point this command at an attacker origin and have it attach the keyring
-/// password. Renderer-supplied values are honored only when nothing is stored
-/// (dev builds with a baked-in env URL). Traversal segments in `subdir` are
+/// Hardening: the authenticated origin and identity are backend-owned — both
+/// come from the saved settings store, renderer input is never accepted for
+/// them, and missing or malformed stored auth state is an error rather than a
+/// fallback. Traversal segments in `subdir` (literal or percent-encoded) are
 /// rejected because `build_remote_url` is a plain join.
 #[tauri::command]
 async fn list_remote_folders(
     app: tauri::AppHandle,
-    base_url: String,
     subdir: String,
-    username: Option<String>,
     concurrency: Option<usize>,
 ) -> Result<Vec<webdav::RemoteFolder>, String> {
     const STORE_FILE: &str = "settings.json";
@@ -335,14 +332,19 @@ async fn list_remote_folders(
         tauri_plugin_store::StoreExt::get_store(&app, STORE_FILE)
             .and_then(|store| store.get(key))
             .and_then(|value| value.get("value").and_then(|v| v.as_str()).map(str::to_string))
+            .filter(|v| !v.trim().is_empty())
     };
 
-    let base_url = stored_setting("webdav_url").unwrap_or(base_url);
-    let username = stored_setting("saved_username").or_else(|| username.filter(|u| !u.trim().is_empty()));
+    let base_url = stored_setting("webdav_url")
+        .ok_or("WebDAV URL is not configured. Set it in Settings first.")?;
+    let username = stored_setting("saved_username")
+        .ok_or("No saved username. Save your credentials first.")?;
     let concurrency = concurrency.map(|c| c.clamp(1, webdav::MAX_SCAN_CONCURRENCY));
 
     if subdir.contains('\\')
-        || subdir.split('/').any(|segment| segment.trim() == "..")
+        || subdir.split('/').any(|segment| {
+            segment.trim() == ".." || webdav::decode_percent(segment).trim() == ".."
+        })
     {
         return Err("Invalid subdirectory: \"..\" segments are not allowed.".to_string());
     }
@@ -350,15 +352,10 @@ async fn list_remote_folders(
     let remote_url = webdav::build_remote_url(&base_url, &subdir);
     webdav::validate_webdav_url(&remote_url)?;
 
-    let (user, pass) = if let Some(u) = username.filter(|u| !u.trim().is_empty()) {
-        let p = get_credentials(u.clone()).unwrap_or_default();
-        (u, p)
-    } else {
-        (String::new(), String::new())
-    };
-    let auth_user = if user.is_empty() { None } else { Some(user.clone()) };
-
-    let client = dav_client::Client::init(&user, &pass, &remote_url)?;
+    // A username with no keyring entry must fail loudly instead of
+    // authenticating with an empty password.
+    let pass = get_credentials(username.clone())?;
+    let client = dav_client::Client::init(&username, &pass, &remote_url)?;
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -367,7 +364,7 @@ async fn list_remote_folders(
             &remote_url,
             &cancel_flag,
             concurrency,
-            auth_user.as_deref(),
+            Some(username.as_str()),
             |_| {},
         )
     })

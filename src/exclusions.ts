@@ -45,15 +45,17 @@ export function normalizeExcludedFolders(raw: readonly string[]): string[] {
 }
 
 /**
- * Reads a raw stored value as a per-directory map. The result is
- * prototype-less so a hand-edited `__proto__` scope key stays plain data.
- * Legacy flat arrays are not handled here — see [`migrateLegacyList`].
+ * Reads a raw stored value as a per-directory map, skipping individually
+ * invalid scope entries so one corrupt entry cannot strip every other
+ * directory's exclusions. The result is prototype-less on every path, so a
+ * hand-edited `__proto__` scope key stays plain data. Legacy flat arrays are
+ * not handled here — see [`migrateLegacyList`] and [`legacyFallbackList`].
  */
 export function parseExcludedFoldersMap(value: unknown): ExcludedFoldersByDir {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
   const map = Object.create(null) as ExcludedFoldersByDir;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return map;
   for (const [key, list] of Object.entries(value)) {
-    if (!Array.isArray(list)) return {};
+    if (!Array.isArray(list)) continue;
     map[key] = list;
   }
   return map;
@@ -62,6 +64,12 @@ export function parseExcludedFoldersMap(value: unknown): ExcludedFoldersByDir {
 /** True for the pre-scope storage shape: one flat pattern list. */
 export function isLegacyExcludedFoldersList(value: unknown): value is unknown[] {
   return Array.isArray(value);
+}
+
+/** The legacy flat list normalized for read-time fallback; non-arrays mean none. */
+export function legacyFallbackList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return normalizeExcludedFolders(raw.filter((entry): entry is string => typeof entry === "string"));
 }
 
 /**
@@ -89,9 +97,17 @@ export function exclusionScopeKey(subdir: string): string {
     .join("/");
 }
 
-/** The exclusion list stored for `subdir`, normalized; unknown dirs have none. */
-export function excludedFoldersFor(byDir: ExcludedFoldersByDir, subdir: string): string[] {
+/**
+ * The exclusion list for `subdir`: the explicit scope entry when present
+ * (an explicitly empty list counts — it overrides the fallback), else the
+ * legacy fallback for scopes the user has not configured yet.
+ */
+export function excludedFoldersFor(
+  byDir: ExcludedFoldersByDir,
+  subdir: string,
+  legacyFallback: readonly string[] = [],
+): string[] {
   const stored = byDir[exclusionScopeKey(subdir)];
-  if (!Array.isArray(stored)) return [];
+  if (!Array.isArray(stored)) return normalizeExcludedFolders(legacyFallback);
   return normalizeExcludedFolders(stored.filter((entry): entry is string => typeof entry === "string"));
 }

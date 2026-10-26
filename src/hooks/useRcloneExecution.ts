@@ -11,6 +11,7 @@ export interface RcloneSettings {
   targetSubdir: string;
   scanConcurrency: number;
   excludedFoldersByDir: ExcludedFoldersByDir;
+  excludedFoldersLegacy: string[];
 }
 
 export type RcloneActionType = 'put' | 'get' | 'get-backup' | 'get-backup-dated' | 'put-dry' | 'get-dry' | 'put-checksum' | 'get-checksum' | 'ls' | 'lsd' | 'check' | 'sync';
@@ -42,6 +43,7 @@ export async function loadSettings(): Promise<RcloneSettings> {
     targetSubdir: s.targetSubdir,
     scanConcurrency: s.scanConcurrency,
     excludedFoldersByDir: s.excludedFoldersByDir,
+    excludedFoldersLegacy: s.excludedFoldersLegacy,
   };
 }
 
@@ -114,7 +116,7 @@ export function useRcloneExecution(
       concurrency: settings.scanConcurrency,
       backup: isBackup || undefined,
       backupDated: isDatedBackup || undefined,
-      excludeFolders: excludedFoldersFor(settings.excludedFoldersByDir, subdir),
+      excludeFolders: excludedFoldersFor(settings.excludedFoldersByDir, subdir, settings.excludedFoldersLegacy),
     });
   };
 

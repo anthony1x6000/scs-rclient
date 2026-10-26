@@ -956,7 +956,7 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
 }
 
 /// Simple percent decoder for URI path segments.
-fn decode_percent(s: &str) -> String {
+pub fn decode_percent(s: &str) -> String {
     let mut result = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;

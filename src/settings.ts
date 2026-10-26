@@ -4,9 +4,10 @@ import {
   excludedFoldersFor,
   exclusionScopeKey,
   isLegacyExcludedFoldersList,
+  legacyFallbackList,
   migrateLegacyList,
-  normalizeExcludedFolders,
   parseExcludedFoldersMap,
+  MAX_EXCLUDED_FOLDERS,
   type ExcludedFoldersByDir,
 } from "./exclusions";
 
@@ -34,6 +35,7 @@ export const STORE_KEYS = {
   bulkPresets: "bulk_presets",
   scanConcurrency: "scan_concurrency",
   excludedFolders: "excluded_folders",
+  excludedFoldersLegacy: "excluded_folders_legacy",
 } as const;
 
 export const DEFAULT_SCAN_CONCURRENCY = 6;
@@ -90,6 +92,19 @@ export async function getWebDAVBase(): Promise<string> {
 export async function setWebDAVBase(url: string): Promise<void> {
   if (url === "VITE_WEBDAV_BASE_URL_PLACEHOLDER") return;
   await setWrapped(STORE_KEYS.webdavUrl, url);
+}
+
+/**
+ * Returns the effective WebDAV base, persisting the env-derived default the
+ * first time it applies, so backend commands can treat the settings store as
+ * the single source of truth for the configured origin.
+ */
+export async function ensureWebDAVBasePersisted(): Promise<string> {
+  const stored = await getWrapped<string>(STORE_KEYS.webdavUrl);
+  if (stored && stored !== "VITE_WEBDAV_BASE_URL_PLACEHOLDER") return stored;
+  const effective = envBaseUrl();
+  if (effective) await setWrapped(STORE_KEYS.webdavUrl, effective);
+  return effective;
 }
 
 /** Per-run remote subdirectory chosen in the Dropdown. No legacy fallback. */
@@ -218,42 +233,76 @@ function enqueueExcludedFoldersWrite<T>(op: () => Promise<T>): Promise<T> {
   return run;
 }
 
-/** Reads (or migrates) the stored value into the per-directory map shape. */
-function resolveExcludedFoldersMap(
-  stored: unknown,
-  subdir: string,
-): ExcludedFoldersByDir {
-  return isLegacyExcludedFoldersList(stored)
-    ? migrateLegacyList(stored, subdir)
-    : parseExcludedFoldersMap(stored);
-}
-
 /**
  * The per-directory exclusion map for `subdir`. The first access after
- * upgrading a legacy flat list imports it under `subdir`'s scope (persisted
- * once), so an upgrade never silently drops the user's exclusions.
+ * upgrading a legacy flat list imports it under `subdir`'s scope and keeps a
+ * raw copy under the legacy key, which every other scope falls back to until
+ * the user configures it explicitly — so an upgrade never silently drops the
+ * user's exclusions anywhere.
  */
 async function getExcludedFoldersMap(subdir: string): Promise<ExcludedFoldersByDir> {
   return enqueueExcludedFoldersWrite(async () => {
     const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
-    const byDir = resolveExcludedFoldersMap(stored, subdir);
-    if (isLegacyExcludedFoldersList(stored)) {
-      await setWrapped(STORE_KEYS.excludedFolders, byDir);
+    if (!isLegacyExcludedFoldersList(stored)) {
+      return parseExcludedFoldersMap(stored);
     }
+    const byDir = migrateLegacyList(stored, subdir);
+    await Promise.all([
+      setWrapped(STORE_KEYS.excludedFolders, byDir),
+      setWrapped(STORE_KEYS.excludedFoldersLegacy, stored),
+    ]);
     return byDir;
   });
 }
 
-/** Folders skipped by local and remote scanning of `subdir` (patterns relative to it). */
-export async function getExcludedFolders(subdir: string): Promise<string[]> {
-  return excludedFoldersFor(await getExcludedFoldersMap(subdir), subdir);
+/** The raw pre-scope exclusion list kept as a fallback for unconfigured scopes. */
+async function getLegacyExcludedFolders(): Promise<string[]> {
+  const stored = await getWrapped<unknown>(STORE_KEYS.excludedFoldersLegacy);
+  return legacyFallbackList(stored);
 }
 
-export async function setExcludedFolders(subdir: string, folders: readonly string[]): Promise<void> {
+/**
+ * Folders skipped by local and remote scanning of `subdir` (patterns relative
+ * to it): the explicit scope entry, or the legacy list for scopes the user
+ * has not configured yet.
+ */
+export async function getExcludedFolders(subdir: string): Promise<string[]> {
+  const [byDir, legacy] = await Promise.all([
+    getExcludedFoldersMap(subdir),
+    getLegacyExcludedFolders(),
+  ]);
+  return excludedFoldersFor(byDir, subdir, legacy);
+}
+
+/**
+ * Adds one exclusion pattern to `subdir`'s scope. Deltas are applied to the
+ * freshest stored list inside the write queue, so panels holding stale state
+ * can never overwrite another writer's patterns.
+ */
+export async function addExcludedFolder(subdir: string, folder: string): Promise<void> {
   await enqueueExcludedFoldersWrite(async () => {
     const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
-    const byDir = resolveExcludedFoldersMap(stored, subdir);
-    byDir[exclusionScopeKey(subdir)] = normalizeExcludedFolders(folders);
+    const legacy = legacyFallbackList(await getWrapped<unknown>(STORE_KEYS.excludedFoldersLegacy));
+    const byDir = isLegacyExcludedFoldersList(stored)
+      ? migrateLegacyList(stored, subdir)
+      : parseExcludedFoldersMap(stored);
+    const current = excludedFoldersFor(byDir, subdir, legacy);
+    if (current.includes(folder) || current.length >= MAX_EXCLUDED_FOLDERS) return;
+    byDir[exclusionScopeKey(subdir)] = [...current, folder];
+    await setWrapped(STORE_KEYS.excludedFolders, byDir);
+  });
+}
+
+/** Removes one exclusion pattern from `subdir`'s scope (see addExcludedFolder). */
+export async function removeExcludedFolder(subdir: string, folder: string): Promise<void> {
+  await enqueueExcludedFoldersWrite(async () => {
+    const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
+    const legacy = legacyFallbackList(await getWrapped<unknown>(STORE_KEYS.excludedFoldersLegacy));
+    const byDir = isLegacyExcludedFoldersList(stored)
+      ? migrateLegacyList(stored, subdir)
+      : parseExcludedFoldersMap(stored);
+    const current = excludedFoldersFor(byDir, subdir, legacy);
+    byDir[exclusionScopeKey(subdir)] = current.filter((item) => item !== folder);
     await setWrapped(STORE_KEYS.excludedFolders, byDir);
   });
 }
@@ -266,6 +315,7 @@ export async function loadAppSettings(): Promise<{
   username: string;
   scanConcurrency: number;
   excludedFoldersByDir: ExcludedFoldersByDir;
+  excludedFoldersLegacy: string[];
 }> {
   const [baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency] = await Promise.all([
     getWebDAVBase(),
@@ -275,8 +325,19 @@ export async function loadAppSettings(): Promise<{
     getScanConcurrency(),
   ]);
   // The exclusion map read depends on the selected dir (legacy migration target).
-  const excludedFoldersByDir = await getExcludedFoldersMap(selectedSubdir);
-  return { baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency, excludedFoldersByDir };
+  const [excludedFoldersByDir, excludedFoldersLegacy] = await Promise.all([
+    getExcludedFoldersMap(selectedSubdir),
+    getLegacyExcludedFolders(),
+  ]);
+  return {
+    baseUrl,
+    selectedSubdir,
+    targetSubdir,
+    username,
+    scanConcurrency,
+    excludedFoldersByDir,
+    excludedFoldersLegacy,
+  };
 }
 
 /**
