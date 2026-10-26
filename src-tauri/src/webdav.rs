@@ -1148,6 +1148,32 @@ pub fn is_safe_relative_path(path: &str) -> bool {
 fn create_unique_part_file(target: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
     use std::hash::{BuildHasher, Hasher};
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    // The replace must not widen what the old truncate path allowed: a
+    // read-only (or otherwise unwritable) destination failed loudly with
+    // File::create, and an atomic rename over it would silently succeed on
+    // a writable directory — so write access is probed up front. Non-regular
+    // destinations (directories, symlinks) are refused outright: the temp
+    // scheme replaces the name itself, not what it points at.
+    if let Ok(meta) = std::fs::symlink_metadata(target) {
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("download destination exists and is not a regular file: {}", target.display()),
+            ));
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(target)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "download destination {} is not writable: {e}",
+                        target.display()
+                    ),
+                )
+            })?;
+    }
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for attempt in 0..64u64 {
         let mut noise = std::time::SystemTime::now()
@@ -1168,38 +1194,25 @@ fn create_unique_part_file(target: &Path) -> std::io::Result<(std::fs::File, Pat
         // limit, and the noise alone is both the uniqueness and the
         // unguessability.
         let candidate = dir.join(format!(".scs-part-{noise:016x}"));
-        let file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        // 0o600 at creation on Unix: there is no default-mode window at
+        // all, so no other local process can hold the partial body open.
+        // The prior target's mode is applied just before the rename below.
+        #[cfg(unix)]
+        let mut options = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true).mode(0o600);
+            o
+        };
+        #[cfg(not(unix))]
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(not(unix))]
+        options.write(true).create_new(true);
+        let file = match options.open(&candidate) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         };
-        // Restrictive permissions from the very first byte: default umask
-        // would leave the partial body readable by other local users for
-        // the whole transfer. On Unix the prior target's mode (when it
-        // exists) is applied instead, so the replace also preserves it.
-        #[cfg(unix)]
-        {
-            let mode = std::fs::metadata(target)
-                .map(|m| m.permissions())
-                .unwrap_or_else(|_| {
-                    std::os::unix::fs::PermissionsExt::from_mode(0o600)
-                });
-            file.set_permissions(mode).map_err(|e| {
-                let _ = std::fs::remove_file(&candidate);
-                e
-            })?;
-        }
-        #[cfg(not(unix))]
-        {
-            // Windows: std permissions only carry the read-only bit; the
-            // temp is created writable so the replace below cannot strand a
-            // read-only partial, and ACLs were never copied by std anyway.
-            let _ = target;
-        }
         return Ok((file, candidate));
     }
     Err(std::io::Error::new(
@@ -3719,6 +3732,21 @@ where
                                 "Downloaded file exceeded the maximum size limit ({} bytes > {} bytes)",
                                 written, max_size
                             )));
+                        }
+                        // The replaced file keeps the prior file's mode:
+                        // applied only now, after the body is fully written,
+                        // so a read-only mode can never block the stream.
+                        #[cfg(unix)]
+                        if let Ok(prior) = std::fs::metadata(&target_file) {
+                            std::fs::set_permissions(&temp_file, prior.permissions()).map_err(
+                                |e| {
+                                    remove_part_file(&temp_file);
+                                    AttemptError::Fatal(format!(
+                                        "Failed to apply the prior file's permissions to {}: {e}",
+                                        temp_file.display()
+                                    ))
+                                },
+                            )?;
                         }
                         // Atomic replace: the destination is only ever touched
                         // with a complete, size-checked body. std's rename
