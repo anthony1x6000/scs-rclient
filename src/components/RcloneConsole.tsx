@@ -6,9 +6,11 @@ interface RcloneConsoleProps {
   logs: string;
   onClear?: () => void;
   onOpenFolder?: () => void;
+  /** Live remote selection; exclusion panels remount when it changes. */
+  selectedSubdir?: string;
 }
 
-export function RcloneConsole({ logs, onClear, onOpenFolder }: RcloneConsoleProps) {
+export function RcloneConsole({ logs, onClear, onOpenFolder, selectedSubdir = "" }: RcloneConsoleProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [follow, setFollow] = useState(true);
@@ -122,8 +124,10 @@ export function RcloneConsole({ logs, onClear, onOpenFolder }: RcloneConsoleProp
           Exclude folder select
         </button>
       </div>
-      {showExcludeFolders && <ExcludeFolders />}
-      {showExcludeFolderSelect && <ExcludeFolderSelect />}
+      {showExcludeFolders && <ExcludeFolders key={selectedSubdir} subdir={selectedSubdir} />}
+      {showExcludeFolderSelect && (
+        <ExcludeFolderSelect key={selectedSubdir} subdir={selectedSubdir} />
+      )}
       <label className="sr-only" htmlFor="scs-console">WebDAV console output</label>
       <div ref={wrapRef} className="relative flex-1 min-h-0 flex flex-col overflow-hidden px-2 pb-1">
         {/* top fade */}

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   excludedFoldersFor,
   exclusionScopeKey,
+  migrateLegacyList,
   parseExcludedFoldersMap,
   normalizeExcludedFolder,
   normalizeExcludedFolders,
@@ -52,6 +53,42 @@ describe("parseExcludedFoldersMap", () => {
   it("rejects maps with non-list values", () => {
     expect(parseExcludedFoldersMap({ css: ".git" })).toEqual({});
     expect(parseExcludedFoldersMap({ css: [".git"], js: 3 })).toEqual({});
+  });
+
+  it("returns a prototype-less map so scope keys cannot pollute Object.prototype", () => {
+    expect(Object.getPrototypeOf(parseExcludedFoldersMap({}))).toBeNull();
+  });
+
+  it("keeps a __proto__ scope key as plain data", () => {
+    // JSON.parse creates an own "__proto__" property; parsing must preserve it
+    // as data on the prototype-less result instead of mutating a prototype.
+    const stored = JSON.parse('{"__proto__": [".git"]}');
+    const parsed = parseExcludedFoldersMap(stored);
+    expect(Object.keys(parsed)).toEqual(["__proto__"]);
+    expect(parsed["__proto__"]).toEqual([".git"]);
+    expect(Object.getPrototypeOf(parsed)).toBeNull();
+  });
+});
+
+describe("migrateLegacyList", () => {
+  it("moves the legacy flat list under the selected directory's scope key", () => {
+    expect(migrateLegacyList(["/.git/", ".git", "node_modules"], "content/x")).toEqual({
+      "content/x": [".git", "node_modules"],
+    });
+  });
+
+  it("normalizes and caps like every other write", () => {
+    const many = Array.from({ length: MAX_EXCLUDED_FOLDERS + 3 }, (_, i) => `f${i}/`);
+    const migrated = migrateLegacyList(many, "css");
+    expect(migrated["css"]).toHaveLength(MAX_EXCLUDED_FOLDERS);
+  });
+
+  it("drops invalid legacy entries instead of failing the migration", () => {
+    expect(migrateLegacyList(["..", "ok", "\u0000bad"], "css")).toEqual({ css: ["ok"] });
+  });
+
+  it("scopes to the root key when no directory is selected", () => {
+    expect(migrateLegacyList([".git"], "")).toEqual({ "": [".git"] });
   });
 });
 

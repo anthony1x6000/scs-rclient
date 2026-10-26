@@ -4,7 +4,6 @@ import {
   getExcludedFolders,
   setExcludedFolders,
   getSavedUsername,
-  getSelectedSubdir,
   getWebDAVBase,
 } from "../settings";
 import { MAX_EXCLUDED_FOLDERS, normalizeExcludedFolder } from "../exclusions";
@@ -18,8 +17,12 @@ import {
 
 interface PickerConfig {
   baseUrl: string;
-  subdir: string;
   username: string;
+}
+
+interface ExcludeFolderSelectProps {
+  /** Remote directory the tree is rooted at; the parent remounts on change. */
+  subdir: string;
 }
 
 /**
@@ -28,7 +31,7 @@ interface PickerConfig {
  * derive from that listing) with each folder's total size. Ticking a checkbox
  * persists that folder on the selected directory's exclusion list immediately.
  */
-export function ExcludeFolderSelect() {
+export function ExcludeFolderSelect({ subdir }: ExcludeFolderSelectProps) {
   const [config, setConfig] = useState<PickerConfig | null>(null);
   const [excluded, setExcluded] = useState<string[]>([]);
   const [folders, setFolders] = useState<RemoteFolder[] | null>(null);
@@ -41,12 +44,14 @@ export function ExcludeFolderSelect() {
 
   useEffect(() => {
     activeRef.current = true;
-    Promise.all([getWebDAVBase(), getSelectedSubdir(), getSavedUsername()])
-      .then(async ([baseUrl, subdir, username]) => {
+    Promise.all([getWebDAVBase(), getSavedUsername()])
+      .then(async ([baseUrl, username]) => {
         const stored = await getExcludedFolders(subdir);
         if (!activeRef.current) return;
-        setConfig({ baseUrl, subdir, username });
+        setConfig({ baseUrl, username });
         setExcluded(stored);
+        setFolders(null);
+        setExpanded(new Set());
       })
       .catch((e) => {
         console.error("Failed to load folder picker settings:", e);
@@ -55,7 +60,7 @@ export function ExcludeFolderSelect() {
     return () => {
       activeRef.current = false;
     };
-  }, []);
+  }, [subdir]);
 
   const childrenByParent = useMemo(() => groupFoldersByParent(folders ?? []), [folders]);
 
@@ -69,7 +74,7 @@ export function ExcludeFolderSelect() {
     try {
       const result = await invoke<RemoteFolder[]>("list_remote_folders", {
         baseUrl: config.baseUrl,
-        subdir: config.subdir,
+        subdir,
         username: config.username || undefined,
       });
       if (activeRef.current) setFolders(result);
@@ -101,7 +106,7 @@ export function ExcludeFolderSelect() {
     const previous = excluded;
     setExcluded(next);
     try {
-      await setExcludedFolders(config.subdir, next);
+      await setExcludedFolders(subdir, next);
       setSaveError(null);
     } catch (e) {
       console.error("Failed to save excluded folders:", e);
@@ -181,16 +186,16 @@ export function ExcludeFolderSelect() {
     <div id="scs-exclude-folder-select" className="px-2 pb-1 text-xs text-white">
       <p className="mt-1 text-[10px] text-gray-400 font-light">
         Tick remote folders to exclude for{" "}
-        <span className="font-mono">{config?.subdir || "…"}</span>. Sizes total
-        every file beneath a folder.
+        <span className="font-mono">{config ? subdir || "…" : "…"}</span>. Sizes
+        total every file beneath a folder.
       </p>
-      {config && !config.subdir && (
+      {config && !subdir && (
         <p className="mt-1 text-gray-400 font-light">Select a subdirectory first.</p>
       )}
-      {config?.subdir && (
+      {config && subdir && (
         <div
           role="tree"
-          aria-label={`Remote folders under ${config.subdir}`}
+          aria-label={`Remote folders under ${subdir}`}
           className="mt-1 max-h-64 overflow-y-auto"
         >
           <div role="treeitem" aria-expanded={rootOpen}>
@@ -203,8 +208,8 @@ export function ExcludeFolderSelect() {
               >
                 {rootOpen ? "▾" : "▸"}
               </button>
-              <span className="font-mono truncate" title={config.subdir}>
-                {config.subdir}
+              <span className="font-mono truncate" title={subdir}>
+                {subdir}
               </span>
               <span className="ml-auto pl-2 text-gray-400 font-light whitespace-nowrap">
                 {loading && folders === null
@@ -228,7 +233,7 @@ export function ExcludeFolderSelect() {
       )}
       {listError && (
         <p role="alert" className="mt-1 text-red-300">
-          {listError} Click ▸ to retry.
+          {listError} Toggle the root folder to retry.
         </p>
       )}
       {saveError && (

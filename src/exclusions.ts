@@ -44,14 +44,38 @@ export function normalizeExcludedFolders(raw: readonly string[]): string[] {
   return normalized;
 }
 
-/** Reads a raw stored value as a per-directory map; anything else is a clean slate. */
+/**
+ * Reads a raw stored value as a per-directory map. The result is
+ * prototype-less so a hand-edited `__proto__` scope key stays plain data.
+ * Legacy flat arrays are not handled here — see [`migrateLegacyList`].
+ */
 export function parseExcludedFoldersMap(value: unknown): ExcludedFoldersByDir {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
-  const map: ExcludedFoldersByDir = {};
+  const map = Object.create(null) as ExcludedFoldersByDir;
   for (const [key, list] of Object.entries(value)) {
     if (!Array.isArray(list)) return {};
     map[key] = list;
   }
+  return map;
+}
+
+/** True for the pre-scope storage shape: one flat pattern list. */
+export function isLegacyExcludedFoldersList(value: unknown): value is unknown[] {
+  return Array.isArray(value);
+}
+
+/**
+ * One-time import of the legacy flat exclusion list into `subdir`'s scope, so
+ * upgrading never silently strips protections the user had configured.
+ */
+export function migrateLegacyList(
+  raw: readonly unknown[],
+  subdir: string,
+): ExcludedFoldersByDir {
+  const map = Object.create(null) as ExcludedFoldersByDir;
+  map[exclusionScopeKey(subdir)] = normalizeExcludedFolders(
+    raw.filter((entry): entry is string => typeof entry === "string"),
+  );
   return map;
 }
 

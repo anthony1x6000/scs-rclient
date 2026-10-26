@@ -3,6 +3,8 @@ import type { BulkPreset } from "./bulkPresets";
 import {
   excludedFoldersFor,
   exclusionScopeKey,
+  isLegacyExcludedFoldersList,
+  migrateLegacyList,
   normalizeExcludedFolders,
   parseExcludedFoldersMap,
   type ExcludedFoldersByDir,
@@ -200,21 +202,60 @@ export async function setScanConcurrency(threads: number): Promise<void> {
   await setWrapped(STORE_KEYS.scanConcurrency, clamped);
 }
 
-/** Legacy pre-scope values were a flat array; they start fresh under the per-dir map. */
-async function getExcludedFoldersMap(): Promise<ExcludedFoldersByDir> {
-  const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
-  return parseExcludedFoldersMap(stored);
+/**
+ * Serializes every read-modify-write cycle on the exclusion map: the manual
+ * editor, the picker, and rapid checkbox toggles queue behind each other, so
+ * no save can clobber another's entries.
+ */
+let excludedFoldersQueue: Promise<unknown> = Promise.resolve();
+
+function enqueueExcludedFoldersWrite<T>(op: () => Promise<T>): Promise<T> {
+  const run = excludedFoldersQueue.then(op, op);
+  excludedFoldersQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/** Reads (or migrates) the stored value into the per-directory map shape. */
+function resolveExcludedFoldersMap(
+  stored: unknown,
+  subdir: string,
+): ExcludedFoldersByDir {
+  return isLegacyExcludedFoldersList(stored)
+    ? migrateLegacyList(stored, subdir)
+    : parseExcludedFoldersMap(stored);
+}
+
+/**
+ * The per-directory exclusion map for `subdir`. The first access after
+ * upgrading a legacy flat list imports it under `subdir`'s scope (persisted
+ * once), so an upgrade never silently drops the user's exclusions.
+ */
+async function getExcludedFoldersMap(subdir: string): Promise<ExcludedFoldersByDir> {
+  return enqueueExcludedFoldersWrite(async () => {
+    const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
+    const byDir = resolveExcludedFoldersMap(stored, subdir);
+    if (isLegacyExcludedFoldersList(stored)) {
+      await setWrapped(STORE_KEYS.excludedFolders, byDir);
+    }
+    return byDir;
+  });
 }
 
 /** Folders skipped by local and remote scanning of `subdir` (patterns relative to it). */
 export async function getExcludedFolders(subdir: string): Promise<string[]> {
-  return excludedFoldersFor(await getExcludedFoldersMap(), subdir);
+  return excludedFoldersFor(await getExcludedFoldersMap(subdir), subdir);
 }
 
 export async function setExcludedFolders(subdir: string, folders: readonly string[]): Promise<void> {
-  const byDir = await getExcludedFoldersMap();
-  byDir[exclusionScopeKey(subdir)] = normalizeExcludedFolders(folders);
-  await setWrapped(STORE_KEYS.excludedFolders, byDir);
+  await enqueueExcludedFoldersWrite(async () => {
+    const stored = await getWrapped<unknown>(STORE_KEYS.excludedFolders);
+    const byDir = resolveExcludedFoldersMap(stored, subdir);
+    byDir[exclusionScopeKey(subdir)] = normalizeExcludedFolders(folders);
+    await setWrapped(STORE_KEYS.excludedFolders, byDir);
+  });
 }
 
 /** Load the independent settings reads in parallel (no sequential waterfall). */
@@ -226,15 +267,15 @@ export async function loadAppSettings(): Promise<{
   scanConcurrency: number;
   excludedFoldersByDir: ExcludedFoldersByDir;
 }> {
-  const [baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency, excludedFoldersByDir] =
-    await Promise.all([
-      getWebDAVBase(),
-      getSelectedSubdir(),
-      getTargetSubdir(),
-      getSavedUsername(),
-      getScanConcurrency(),
-      getExcludedFoldersMap(),
-    ]);
+  const [baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency] = await Promise.all([
+    getWebDAVBase(),
+    getSelectedSubdir(),
+    getTargetSubdir(),
+    getSavedUsername(),
+    getScanConcurrency(),
+  ]);
+  // The exclusion map read depends on the selected dir (legacy migration target).
+  const excludedFoldersByDir = await getExcludedFoldersMap(selectedSubdir);
   return { baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency, excludedFoldersByDir };
 }
 

@@ -2,33 +2,34 @@ import { useEffect, useRef, useState } from "react";
 import {
   getExcludedFolders,
   setExcludedFolders,
-  getSelectedSubdir,
   normalizeExcludedFolder,
   MAX_EXCLUDED_FOLDERS,
 } from "../settings";
 import TextInput from "./TextInput";
+
+interface ExcludeFoldersProps {
+  /** Remote directory whose exclusions are edited; the parent remounts on change. */
+  subdir: string;
+}
 
 /**
  * Editor for the persisted list of folders that scan/transfer actions must skip.
  * Patterns are stored per selected remote subdirectory — relative to it — and
  * applied by the Rust backend to both local walks and remote listings.
  */
-export function ExcludeFolders() {
+export function ExcludeFolders({ subdir }: ExcludeFoldersProps) {
   const [folders, setFolders] = useState<string[]>([]);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const activeRef = useRef(true);
-  const subdirRef = useRef("");
+  const subdirRef = useRef(subdir);
+  subdirRef.current = subdir;
 
   useEffect(() => {
     activeRef.current = true;
-    getSelectedSubdir()
-      .then((subdir) => {
-        subdirRef.current = subdir;
-        return getExcludedFolders(subdir);
-      })
+    getExcludedFolders(subdir)
       .then((stored) => {
         if (activeRef.current) setFolders(stored);
       })
@@ -42,7 +43,7 @@ export function ExcludeFolders() {
     return () => {
       activeRef.current = false;
     };
-  }, []);
+  }, [subdir]);
 
   const persist = async (next: string[]) => {
     const previous = folders;
