@@ -368,12 +368,17 @@ pub fn get_max_file_size() -> u64 {
 /// client applies its 30s timeout per individual `read()`, so a body dripped
 /// at one byte per 29 seconds never times out; this ceiling bounds the whole
 /// transfer and the copy loop also observes the cancel flag every chunk.
+/// Configured values are clamped to one day: anything larger serves no
+/// plausible transfer and would overflow `Instant + Duration` into a panic.
+pub const DOWNLOAD_BODY_TIMEOUT_MAX_SECS: u64 = 86_400;
+
 pub fn get_download_body_timeout_secs() -> u64 {
     std::env::var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(600)
+        .min(DOWNLOAD_BODY_TIMEOUT_MAX_SECS)
 }
 
 /// Computes SHA256 checksum of a file on disk by streaming chunks to avoid buffering large files in RAM.
