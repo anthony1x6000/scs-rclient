@@ -952,10 +952,13 @@ pub fn clear_remote_cache() -> Result<(), String> {
     Ok(())
 }
 
-/// Parses a WebDAV date string into a UNIX timestamp (seconds since epoch).
 /// Reads a server-controlled listing body with a hard byte cap and strict
 /// UTF-8 (fail closed). Unbounded buffering of a hostile response is a
 /// memory-exhaustion vector; the cap turns it into a listing failure.
+/// Non-UTF-8 bodies are rejected rather than charset-converted: XML
+/// listings default to UTF-8, and guessing a declared charset would hand
+/// the server influence over decoding, so exotic encodings fail loudly
+/// and the caller falls back (Depth: 1) or errors.
 pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<String, String> {
     let mut limited = body.take(MAX_LISTING_BODY_BYTES + 1);
     let mut buf = String::new();
@@ -970,6 +973,7 @@ pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<String
     Ok(buf)
 }
 
+/// Parses a WebDAV date string into a UNIX timestamp (seconds since epoch).
 pub fn parse_webdav_date(date_str: &str) -> Option<u64> {
     let s = date_str.trim();
     if s.is_empty() {
