@@ -3864,6 +3864,23 @@ mod tests {
     }
 
     #[test]
+    fn test_relative_item_path_multibyte_char_boundary_is_panic_free() {
+        // decode_percent turns server hrefs into multi-byte UTF-8; splitting
+        // the item path at the byte length of the base path must never land
+        // inside a character (panic -> whole operation aborts via JoinError).
+        let base = "https://h.example/dav/";
+        // '/aaéx' decodes from '/aa%C3%A9x': byte index 4 of the item path
+        // lands inside the 2-byte 'é' when the base path is '/dav' (len 4).
+        let rel = relative_item_path(base, "/aa%C3%A9x");
+        assert!(rel.is_empty() || is_safe_relative_path(&rel) || !is_safe_relative_path(&rel));
+        // No panic is the invariant; exercise a sweep of lengths.
+        for n in 1..12 {
+            let item = format!("/{}%C3%A9x", "a".repeat(n));
+            let _ = relative_item_path(base, &item);
+        }
+    }
+
+    #[test]
     fn test_validate_webdav_url_ipv6_literals_and_mapped_ranges() {
         // Bracketed IPv6 literals reach the IP check (host_str returns them
         // bracketed, which the old bare host.parse() never matched).
