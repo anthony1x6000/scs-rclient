@@ -1303,7 +1303,7 @@ fn collection_path_segments(path: &str) -> Option<Vec<String>> {
 /// suffixes, so "..;" names the parent directory) collapse to a dot segment.
 fn normalizes_to_dot_segment(seg: &str) -> bool {
     fn dot_ish(s: &str) -> bool {
-        let trimmed = s.trim_end_matches([' ', '.', '\0']);
+        let trimmed = s.trim_end_matches(&[' ', '.', '\0'][..]);
         trimmed.is_empty() || trimmed == "." || trimmed == ".."
     }
     dot_ish(seg) || dot_ish(seg.split(';').next().unwrap_or(""))
