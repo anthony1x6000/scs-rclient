@@ -364,6 +364,23 @@ pub fn get_max_file_size() -> u64 {
         .unwrap_or(DEFAULT_MAX_FILE_SIZE)
 }
 
+/// End-to-end deadline for one streamed download body. reqwest's blocking
+/// client applies its 30s timeout per individual `read()`, so a body dripped
+/// at one byte per 29 seconds never times out; this ceiling bounds the whole
+/// transfer and the copy loop also observes the cancel flag every chunk.
+/// Configured values are clamped to one day: anything larger serves no
+/// plausible transfer and would overflow `Instant + Duration` into a panic.
+pub const DOWNLOAD_BODY_TIMEOUT_MAX_SECS: u64 = 86_400;
+
+pub fn get_download_body_timeout_secs() -> u64 {
+    std::env::var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(600)
+        .min(DOWNLOAD_BODY_TIMEOUT_MAX_SECS)
+}
+
 /// Computes SHA256 checksum of a file on disk by streaming chunks to avoid buffering large files in RAM.
 pub fn compute_file_sha256(path: &Path) -> Result<String, std::io::Error> {
     use sha2::{Digest, Sha256};
@@ -3119,10 +3136,62 @@ where
                             ))
                         })?;
                         let mut limited_reader = std::io::Read::take(get_res, max_size + 1);
-                        let written =
-                            std::io::copy(&mut limited_reader, &mut dest_file).map_err(|e| {
-                                classify_io_error(&format!("streaming GET {download_url}"), &e)
-                            })?;
+                        // Manual copy loop: io::copy neither observes the
+                        // cancel flag nor any whole-body deadline, and each
+                        // blocking read gets a fresh 30s window from reqwest,
+                        // so a slow-drip body would hang the attempt forever.
+                        // One read parked inside reqwest can still delay the
+                        // checks below by at most that per-read timeout; the
+                        // deadline bounds every other stretch of the transfer.
+                        let body_deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(get_download_body_timeout_secs());
+                        let mut buffer = [0u8; 65536];
+                        let mut written: u64 = 0;
+                        loop {
+                            if cancel_flag.load(Ordering::SeqCst) {
+                                // The outer error path checks the flag again,
+                                // cleans the partial, and ends the operation
+                                // as a user cancellation.
+                                return Err(AttemptError::Fatal(
+                                    "Operation canceled by user.".to_string(),
+                                ));
+                            }
+                            if std::time::Instant::now() >= body_deadline {
+                                return Err(AttemptError::Fatal(format!(
+                                    "Download body exceeded the {}s time limit",
+                                    get_download_body_timeout_secs()
+                                )));
+                            }
+                            use std::io::Read as _;
+                            match limited_reader.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    dest_file
+                                        .write_all(&buffer[..n])
+                                        .map_err(|e| {
+                                            classify_io_error(
+                                                &format!("writing GET {download_url}"),
+                                                &e,
+                                            )
+                                        })?;
+                                    written += n as u64;
+                                    if written > max_size {
+                                        break;
+                                    }
+                                }
+                                // io::copy retried EINTR reads; keep that
+                                // contract so a signal does not fail an
+                                // otherwise healthy transfer.
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                                Err(e) => {
+                                    return Err(classify_io_error(
+                                        &format!("streaming GET {download_url}"),
+                                        &e,
+                                    ))
+                                }
+                            }
+                        }
+                        use std::io::Write as _;
                         if written > max_size {
                             drop(dest_file);
                             let _ = std::fs::remove_file(&target_file);
@@ -4324,6 +4393,25 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_download_body_timeout_clamps_instead_of_overflowing() {
+        // A huge configured deadline must clamp to a sane maximum
+        // (DOWNLOAD_BODY_TIMEOUT_MAX_SECS, one day) instead of reaching the
+        // copy loop, where `Instant::now() + Duration::from_secs(u64::MAX)`
+        // would panic on overflow.
+        std::env::set_var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS", "18446744073709551615");
+        let configured = get_download_body_timeout_secs();
+        std::env::remove_var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS");
+        assert!(
+            configured <= 86_400,
+            "configured deadline must clamp to one day, got {configured}"
+        );
+        // The clamped ceiling must stay panic-free in deadline arithmetic.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(configured.max(1));
+        assert!(deadline > std::time::Instant::now());
     }
 }
 
