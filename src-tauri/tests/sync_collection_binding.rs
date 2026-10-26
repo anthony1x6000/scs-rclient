@@ -51,14 +51,17 @@ fn start_recording_server() -> (u16, Arc<Mutex<Vec<String>>>, Arc<AtomicBool>, s
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .push(first_line.clone());
-                    // PROPFIND answer: the collection itself + the hostile
-                    // out-of-collection href. DELETE gets a 204 either way so
-                    // the loop would continue if the guard were absent.
+                    // PROPFIND answer: the collection itself, an in-collection
+                    // control file (whose DELETE proves the delete loop ran),
+                    // and the hostile out-of-collection href. DELETE gets a
+                    // 204 either way so the loop would continue if the guard
+                    // were absent.
                     let is_propfind = first_line.starts_with("PROPFIND");
                     let body = if is_propfind {
                         "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\
 <D:multistatus xmlns:D=\"DAV:\">\
 <D:response><D:href>/mycourse/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+<D:response><D:href>/mycourse/control.txt</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>4</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
 <D:response><D:href>/othercourse/file.txt</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>6</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
 </D:multistatus>"
                     } else {
@@ -118,6 +121,14 @@ fn test_sync_never_deletes_out_of_collection_hrefs() {
         recorded.iter().any(|r| r.starts_with("PROPFIND")),
         "the scan must actually list the collection for this test to mean anything; recorded: {:?}",
         recorded
+    );
+    assert!(
+        recorded
+            .iter()
+            .any(|r| r.starts_with("DELETE") && r.contains("/mycourse/control.txt")),
+        "the in-collection control file must be deleted, proving the delete loop ran; recorded: {:?} (logs: {:?})",
+        recorded,
+        logs
     );
     let stray_requests: Vec<String> = recorded
         .iter()

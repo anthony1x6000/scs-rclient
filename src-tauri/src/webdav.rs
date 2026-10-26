@@ -1235,12 +1235,12 @@ fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
     )
 }
 
-/// True when `target_url`'s decoded path lies strictly below the configured
+/// True when `target_url`'s path lies strictly below the configured
 /// collection path of `remote_url` (exact-case; explicit default ports are
-/// absorbed by origin equality). Paths that can shift segment boundaries on
-/// the server — decoded backslashes, percent-encoded separators, or dot
-/// segments — never qualify, and the collection itself is not an item
-/// target: only strict descendants pass.
+/// absorbed by origin equality). Paths that could resolve to a different
+/// segment structure on the server — percent-encoded separators, dot
+/// segments, duplicate slashes — never qualify, and the collection itself is
+/// not an item target: only strict descendants pass.
 fn is_within_collection(remote_url: &str, target_url: &str) -> bool {
     let (Ok(base), Ok(target)) = (reqwest::Url::parse(remote_url), reqwest::Url::parse(target_url))
     else {
@@ -1253,32 +1253,46 @@ fn is_within_collection(remote_url: &str, target_url: &str) -> bool {
         return false;
     };
     if base_segs.is_empty() {
-        // Origin-root collection: every traversal-free same-origin path is inside it.
-        return true;
+        // Origin-root collection: any non-root, unambiguous same-origin
+        // path is a strict descendant — but the origin root itself ("/") is
+        // never a valid item target.
+        return !target_segs.is_empty();
     }
     target_segs.len() > base_segs.len() && target_segs[..base_segs.len()] == base_segs[..]
 }
 
-/// Non-empty percent-decoded path segments, or `None` when the path carries a
-/// traversal vector the URL parser could not normalize away. Literal dot
-/// segments are resolved during URL parsing, so any "." or ".." that appears
-/// after decoding came from percent-encoded forms (`%2e%2e`, or `%2f`-encoded
-/// separators splitting segments open again) — reject the whole path, and
-/// likewise any backslash, which decoders on Windows-flavored servers treat
-/// as a segment separator.
+/// Non-empty path segments, or `None` when the path is ambiguous. Segments
+/// are split on RAW '/' separators before decoding, so a percent-encoded
+/// separator can never shift a segment boundary: a segment that decodes to
+/// contain '/' or '\', decodes to "." / "..", or an internal empty segment
+/// (duplicate slash) is rejected wholesale — servers may resolve any of
+/// those differently from this client, so they can never be proven inside
+/// the collection. The URL parser has already resolved literal dot
+/// segments, so any that appear after decoding came from encoded forms.
 fn collection_path_segments(path: &str) -> Option<Vec<String>> {
-    let decoded = decode_percent(path);
-    if decoded.contains('\\') {
-        return None;
+    let raw_segs: Vec<&str> = path.split('/').collect();
+    let last_idx = raw_segs.len() - 1;
+    let mut segs = Vec::with_capacity(raw_segs.len());
+    for (idx, raw) in raw_segs.iter().enumerate() {
+        let decoded = decode_percent(raw);
+        if decoded.contains('/') || decoded.contains('\\') {
+            return None;
+        }
+        if decoded.is_empty() {
+            // The leading empty from an absolute path and the trailing
+            // empty from a collection's slash are fine; anything else is a
+            // duplicate slash, which servers may treat as distinct.
+            if idx != 0 && idx != last_idx {
+                return None;
+            }
+            continue;
+        }
+        if decoded == "." || decoded == ".." {
+            return None;
+        }
+        segs.push(decoded);
     }
-    decoded
-        .split('/')
-        .filter(|seg| !seg.is_empty())
-        .map(|seg| match seg {
-            "." | ".." => None,
-            other => Some(other.to_string()),
-        })
-        .collect()
+    Some(segs)
 }
 
 /// Gate for any URL taken from a server response before it becomes a request:
@@ -4259,8 +4273,8 @@ mod tests {
             guard_server_derived_url(base, "https://h.example/Content/Enforced/course123/notes/a.txt").is_err(),
             "case-folded hrefs must not match the configured collection"
         );
-        // Encoded separators and dot segments must not decode into traversal
-        // after the prefix check.
+        // Encoded separators and dot segments must not create segment
+        // boundaries the guard would trust.
         assert!(
             guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123%2F..%2Fothercourse/file.txt").is_err(),
             "percent-encoded separators decoding into traversal must be refused"
@@ -4277,16 +4291,30 @@ mod tests {
             guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/%2e%2e/othercourse/file.txt").is_err(),
             "encoded dot-dot segments must be refused"
         );
+        // Even a non-dot encoded separator stays inside one raw segment and
+        // is rejected: a server that does not decode %2F would route it to a
+        // different path than the one compared here.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/notes%2Fextra.txt").is_err(),
+            "encoded separators must never be treated as segment boundaries"
+        );
+        // Duplicate slashes may name a different path on the server.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123//file.txt").is_err(),
+            "duplicate slashes must be refused as ambiguous"
+        );
         // In-collection targets still pass: deeper exact-case paths, explicit
         // default port, and percent-encoded ordinary characters.
         assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/notes/a.txt").is_ok());
         assert!(guard_server_derived_url(base, "https://h.example:443/content/enforced/COURSE123/a.txt").is_ok());
         assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/my%20file.txt").is_ok());
-        // Origin-root collection contains every traversal-free path on the
-        // origin. (A bare /%2e%2e/ segment is already collapsed by URL
-        // parsing itself; boundary-shifting separators inside one segment
-        // are what this guard must still catch.)
+        // Origin-root collection: any unambiguous non-root path is a strict
+        // descendant, but the origin root itself is never an item target.
         assert!(guard_server_derived_url("https://h.example/", "https://h.example/any/path.txt").is_ok());
+        assert!(
+            guard_server_derived_url("https://h.example/", "https://h.example/").is_err(),
+            "the origin root itself must not pass as an item target"
+        );
         assert!(
             guard_server_derived_url("https://h.example/", "https://h.example/any/course%2F..%2Fother.txt").is_err(),
             "encoded-separator traversal is refused even for origin-root collections"
