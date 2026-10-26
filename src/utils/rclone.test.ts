@@ -40,6 +40,15 @@ describe("normalizeSubdir traversal scope", () => {
     expect(normalizeSubdir("v1.2/notes")).toBe("v1.2/notes");
   });
 
+  it("rejects encoded separators the backend guard refuses", () => {
+    // The Rust URL guard rejects %2f/%5c in any configured path, so a
+    // stored subdir carrying them would pass frontend validation and fail
+    // every request at runtime: reject them at the same boundary.
+    expect(() => normalizeSubdir("a%2fb")).toThrow();
+    expect(() => normalizeSubdir("a%5Cb")).toThrow();
+    expect(() => normalizeSubdir("notes/x%2fy")).toThrow();
+  });
+
   it("keeps encoded separators as literal names, not traversal", () => {
     // resolveRemoteUrl re-encodes the `%`, so an encoded separator reaches
     // the backend as a literal `%2f` inside one segment and cannot split
