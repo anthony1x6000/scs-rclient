@@ -496,13 +496,20 @@ pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
     let clean_url = match reqwest::Url::parse(remote_url) {
         Ok(url) => {
             let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+            // host_str() returns IPv6 literals WITHOUT brackets; re-wrap
+            // them or [::1]:8080 and ::1 (or a different v6 host) collide.
+            let host_display = if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            };
             let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
             // The path is kept EXACTLY as configured, trailing slash
             // included: it is part of the collection identity, and folding
             // it away would let /dav/A read or mutate /dav/A/'s entry.
             let path = url.path();
             let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
-            format!("{}://{}{}{}{}", url.scheme(), host, port, path, query)
+            format!("{}://{}{}{}{}", url.scheme(), host_display, port, path, query)
         }
         Err(_) => remote_url.trim_end_matches('/').to_string(),
     };
@@ -704,8 +711,11 @@ fn write_cache_map(path: &Path, cache: &HashMap<String, CachedRemoteListing>) {
 /// - Legitimate hidden files (e.g. `.gitignore`, `.env`) are preserved.
 /// - Does not rely on rigid prefix matching, correctly supporting root-relative hrefs returned by WebDAV servers.
 /// Equality modulo the case-insensitive parts of the URL grammar: scheme and
-/// host compare case-insensitively; path (modulo insignificant trailing
-/// slashes, matching the key) and query compare exactly.
+/// host compare case-insensitively; path (exactly as configured) and query
+/// compare exactly. Ports compare via port_or_known_default, so an omitted
+/// default port and its explicit spelling are the same collection here even
+/// though the cache KEY keeps them distinct — key over-partitioning is
+/// harmless (a miss), while comparator under-matching would cross-serve.
 fn url_same_collection(a: &str, b: &str) -> bool {
     match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
         (Ok(a), Ok(b)) => {
