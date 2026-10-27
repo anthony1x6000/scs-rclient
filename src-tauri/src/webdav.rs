@@ -505,16 +505,22 @@ pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
     };
     match auth_user {
         Some(user) if !user.trim().is_empty() => {
-            // Usernames are opaque, case-sensitive tokens: "Alice" and
-            // "alice" are distinct credentials, so the key keeps the exact
-            // case. The `u1:` marker versions the user-scoped key format:
-            // entries written when usernames were folded lowercase are
-            // unreachable under it, so a folded-credential entry can never
-            // be served to a case-variant account.
-            format!("u1:{}@{}", user.trim(), clean_url)
+            // Usernames are opaque, case-sensitive tokens compared by
+            // exact bytes: "Alice"/"alice" and "alice"/"alice " are each
+            // distinct credentials, so the key keeps every byte (no trim).
+            // The `u1:` marker versions the user-scoped key format.
+            format!("u1:{user}@{clean_url}")
         }
         _ => clean_url,
     }
+}
+
+/// True when a presented username names no account yet is not anonymous
+/// either (empty or nothing but whitespace). Cache entry points refuse it
+/// outright: an entry under it could be scoped to no credential at all, and
+/// conflating it with anonymous would let one read the other's listings.
+fn ambiguous_username(auth_user: Option<&str>) -> bool {
+    auth_user.is_some_and(|u| u.trim().is_empty())
 }
 
 /// Represents a cached remote WebDAV directory listing.
@@ -696,6 +702,9 @@ fn write_cache_map(path: &Path, cache: &HashMap<String, CachedRemoteListing>) {
 pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Vec<WebdavItem>> {
     let path = get_cache_file_path()?;
     let cache = read_cache_map(&path);
+    if ambiguous_username(auth_user) {
+        return None;
+    }
     let key = cache_key(remote_url, auth_user);
     let entry = cache.get(&key).filter(|entry| {
         // Key equality is necessary but not sufficient: the stored URL must
@@ -727,16 +736,14 @@ fn url_same_collection(a: &str, b: &str) -> bool {
     }
 }
 
-/// Equality for the cached credential: usernames are opaque tokens whose
-/// case distinguishes accounts on case-sensitive WebDAV servers, so the
-/// stored username must equal the requested one exactly. Empty and absent
-/// both mean "no credential".
+/// Equality for the cached credential: usernames are opaque tokens compared
+/// by exact bytes — case and surrounding whitespace distinguish accounts on
+/// case-sensitive WebDAV servers, and an absent credential (anonymous) is
+/// distinct from any username, empty included.
 fn same_auth_user(stored: &Option<String>, requested: Option<&str>) -> bool {
-    let stored = stored.as_deref().map(str::trim).filter(|u| !u.is_empty());
-    let requested = requested.map(str::trim).filter(|u| !u.is_empty());
-    match (stored, requested) {
-        (Some(a), Some(b)) => a == b,
+    match (stored.as_deref(), requested) {
         (None, None) => true,
+        (Some(a), Some(b)) => a == b,
         _ => false,
     }
 }
@@ -795,12 +802,15 @@ pub fn save_remote_cache(remote_url: &str, auth_user: Option<&str>, items: &[Web
         safe_items.push(item.clone());
     }
 
+    if ambiguous_username(auth_user) {
+        return;
+    }
     let key = cache_key(remote_url, auth_user);
     cache.insert(
         key,
         CachedRemoteListing {
             remote_url: remote_url.to_string(),
-            auth_user: auth_user.map(|u| u.trim().to_string()),
+            auth_user: auth_user.map(|u| u.to_string()),
             timestamp: now,
             items: safe_items,
         },
@@ -829,6 +839,9 @@ pub fn update_remote_cache_item(
         return;
     }
 
+    if ambiguous_username(auth_user) {
+        return;
+    }
     let key = cache_key(remote_url, auth_user);
     if let Some(entry) = cache.get_mut(&key) {
         let expected_url = build_file_url(remote_url, rel_path);
@@ -868,6 +881,9 @@ pub fn remove_remote_cache_item(remote_url: &str, auth_user: Option<&str>, rel_p
         return;
     }
 
+    if ambiguous_username(auth_user) {
+        return;
+    }
     let key = cache_key(remote_url, auth_user);
     if let Some(entry) = cache.get_mut(&key) {
         let expected_url = build_file_url(remote_url, rel_path);
