@@ -980,7 +980,7 @@ static INFLIGHT_LISTING_ROOM: Condvar = Condvar::new();
 /// before failing closed: real listings cycle through the budget in
 /// milliseconds, so only a server keeping many worst-case bodies pinned
 /// (exactly the attack the budget bounds) can exhaust this.
-const INFLIGHT_LISTING_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+const INFLIGHT_LISTING_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// RAII proof that one listing body's worst-case bytes are inside the shared
 /// in-flight ceiling; dropping it returns the reservation and wakes a waiter.
@@ -1008,16 +1008,21 @@ impl Drop for InflightListingGuard {
 /// `INFLIGHT_LISTING_WAIT`, at which point the caller's existing error
 /// handling skips the directory or fails the action instead of buffering
 /// beyond the budget.
-fn reserve_inflight_listing() -> Result<InflightListingGuard, String> {
+fn reserve_inflight_listing(cancel: &AtomicBool) -> Result<InflightListingGuard, String> {
     // The reservation covers the full envelope a listing can occupy: the
     // raw body, its decoded form (worst case for UTF-16), and the parsed
-    // item state — three worst-case bodies per slot.
+    // item state — three worst-case bodies per slot. The wait is bounded
+    // and CANCEL-AWARE: a parked worker wakes at least once a second and
+    // never outlives a user cancellation.
     let want = 3 * MAX_LISTING_BODY_BYTES as usize;
     let deadline = std::time::Instant::now() + INFLIGHT_LISTING_WAIT;
     let mut current = INFLIGHT_LISTING_BYTES
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("Operation canceled by user.".to_string());
+        }
         if let Some(next) = current.checked_add(want) {
             if next <= MAX_INFLIGHT_LISTING_BYTES {
                 *current = next;
@@ -1030,8 +1035,9 @@ fn reserve_inflight_listing() -> Result<InflightListingGuard, String> {
                 "aggregate in-flight listing bytes stayed above {MAX_INFLIGHT_LISTING_BYTES} for {INFLIGHT_LISTING_WAIT:?}; too many pinned listing bodies"
             ));
         }
+        let slice = deadline.min(now + std::time::Duration::from_secs(1)) - now;
         let (guard, _timeout) = INFLIGHT_LISTING_ROOM
-            .wait_timeout(current, deadline - now)
+            .wait_timeout(current, slice)
             .unwrap_or_else(|p| p.into_inner());
         current = guard;
     }
@@ -1096,11 +1102,14 @@ fn decode_listing_body(mut bytes: Vec<u8>) -> Result<String, String> {
 /// listings default to UTF-8, and guessing a declared charset would hand
 /// the server influence over decoding, so exotic encodings fail loudly
 /// and the caller falls back (Depth: 1) or errors.
-pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<ListingBody, String> {
+pub(crate) fn read_listing_body<R: std::io::Read>(
+    cancel: &AtomicBool,
+    body: &mut R,
+) -> Result<ListingBody, String> {
     // Hold the worst-case reservation for the whole read AND the parse that
     // follows it, so concurrent workers cannot each buffer a full body past
     // the shared ceiling.
-    let inflight = reserve_inflight_listing()?;
+    let inflight = reserve_inflight_listing(cancel)?;
     let mut limited = body.take(MAX_LISTING_BODY_BYTES + 1);
     // Read bytes, then convert in place: read_to_string would double-buffer
     // (a temporary String copy next to the internal Vec), briefly allocating
@@ -2373,7 +2382,8 @@ where
                 // A failed body read must not degrade into an empty listing:
                 // it flows through the same fallback as a malformed body, and
                 // the body itself is read through the bounded reader.
-                let parsed: Result<Vec<WebdavItem>, String> = read_listing_body(&mut res)
+                let parsed: Result<Vec<WebdavItem>, String> =
+                    read_listing_body(cancel_flag, &mut res)
                     .and_then(|listing| {
                         // Parse inside the reservation: the body and its
                         // parse both belong to the in-flight budget.
@@ -2697,8 +2707,11 @@ where
                     }
 
                     let mut res = res;
-                    let listing = match read_listing_body(&mut res) {
+                    let listing = match read_listing_body(cancel_flag, &mut res) {
                         Ok(listing) => listing,
+                        Err(reason) if reason.contains("canceled by user") => {
+                            return;
+                        }
                         Err(reason) => {
                             // A capacity timeout parks this directory only:
                             // other workers keep scanning, and the slow
@@ -3750,7 +3763,7 @@ where
                 return Err(format!("Server returned HTTP {}", res.status()));
             }
             let mut res = res;
-            let listing = read_listing_body(&mut res)?;
+            let listing = read_listing_body(cancel_flag, &mut res)?;
             let items = parse_propfind_xml(&listing.body)?;
             drop(listing);
             // Per-listing item caps are enforced by the parser itself.
@@ -4964,15 +4977,15 @@ mod tests {
         // bound: a response larger than the cap is an error, not a String.
         let over: String = "x".repeat(MAX_LISTING_BODY_BYTES as usize + 1);
         let mut cursor = std::io::Cursor::new(over.into_bytes());
-        assert!(read_listing_body(&mut cursor).is_err());
+        assert!(read_listing_body(&AtomicBool::new(false), &mut cursor).is_err());
 
         let under: String = "x".repeat(1024);
         let mut cursor = std::io::Cursor::new(under.clone().into_bytes());
-        assert_eq!(read_listing_body(&mut cursor).unwrap().body, under);
+        assert_eq!(read_listing_body(&AtomicBool::new(false), &mut cursor).unwrap().body, under);
 
         // Invalid UTF-8 is a read error (fail closed), not lossy acceptance.
         let mut cursor = std::io::Cursor::new(vec![0xff, 0xfe, 0x00]);
-        assert!(read_listing_body(&mut cursor).is_err());
+        assert!(read_listing_body(&AtomicBool::new(false), &mut cursor).is_err());
     }
 
     #[test]
@@ -5266,12 +5279,12 @@ mod tests {
         let mut held: Vec<InflightListingGuard> = Vec::new();
         for _ in 0..max_guards {
             held.push(
-                reserve_inflight_listing()
+                reserve_inflight_listing(&AtomicBool::new(false))
                     .expect("reservation within the ceiling must succeed"),
             );
         }
         // Ceiling full: a waiter must park instead of failing or overbooking.
-        let waiter = std::thread::spawn(|| reserve_inflight_listing().is_ok());
+        let waiter = std::thread::spawn(|| reserve_inflight_listing(&AtomicBool::new(false)).is_ok());
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
             !waiter.is_finished(),
@@ -5285,7 +5298,7 @@ mod tests {
         );
         drop(held);
         assert!(
-            reserve_inflight_listing().is_ok(),
+            reserve_inflight_listing(&AtomicBool::new(false)).is_ok(),
             "released reservations must be reusable"
         );
     }
@@ -5470,7 +5483,7 @@ mod tests {
         // Each read's ListingBody (and its in-flight reservation) is
         // released at the end of its own statement: shadowed bindings would
         // all live to scope end and stack three worst-case reservations.
-        let body = read_listing_body(&mut std::io::Cursor::new(le))
+        let body = read_listing_body(&AtomicBool::new(false), &mut std::io::Cursor::new(le))
             .expect("UTF-16LE with BOM must decode")
             .body;
         assert!(parse_propfind_xml(&body).is_ok());
@@ -5478,21 +5491,21 @@ mod tests {
         for u in &units {
             be.extend_from_slice(&u.to_be_bytes());
         }
-        let body = read_listing_body(&mut std::io::Cursor::new(be))
+        let body = read_listing_body(&AtomicBool::new(false), &mut std::io::Cursor::new(be))
             .expect("UTF-16BE with BOM must decode")
             .body;
         assert!(parse_propfind_xml(&body).is_ok());
         // A UTF-8 BOM is accepted and stripped.
         let mut utf8bom = vec![0xEF, 0xBB, 0xBF];
         utf8bom.extend_from_slice(xml.as_bytes());
-        let body = read_listing_body(&mut std::io::Cursor::new(utf8bom))
+        let body = read_listing_body(&AtomicBool::new(false), &mut std::io::Cursor::new(utf8bom))
             .expect("UTF-8 BOM must be accepted")
             .body;
         assert!(parse_propfind_xml(&body).is_ok());
         // A truncated (odd-length) UTF-16 body fails closed.
         let mut odd = vec![0xFF, 0xFE, b'x'];
         let _ = &mut odd;
-        assert!(read_listing_body(&mut std::io::Cursor::new(odd)).is_err());
+        assert!(read_listing_body(&AtomicBool::new(false), &mut std::io::Cursor::new(odd)).is_err());
     }
 
     #[test]
