@@ -5372,7 +5372,10 @@ mod tests {
             load_remote_cache(test_url, Some("")).is_none(),
             "an empty username is not anonymous and must read nothing"
         );
-        assert!(!same_auth_user(&Some(String::new()), &None));
+        // Anonymous and empty-string are distinct credentials: alice's
+        // stored entry answers neither (behavioral check — the comparator
+        // itself is exercised through load).
+        assert!(load_remote_cache(test_url, None).is_none());
         save_remote_cache(test_url, Some(""), &items);
         assert!(
             load_remote_cache(test_url, Some("")).is_none(),
