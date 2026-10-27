@@ -1414,9 +1414,92 @@ pub(crate) fn insecure_webdav_allowed() -> bool {
     cfg!(test) || std::env::var("ALLOW_INSECURE_WEBDAV").as_deref() == Ok("1")
 }
 
+/// Path-segment spellings the WHATWG URL parser collapses into dot segments
+/// (`.` removed, `..` pops the parent) even though they contain no literal
+/// `.` component: `%2e`, `.%2e`, `%2e.`, `%2e%2e` (ASCII case-insensitive).
+/// The collapse happens inside `Url::parse`, so the raw string this guard
+/// inspects is the only form where the original spelling is still visible.
+fn has_url_dot_segment(raw: &str) -> bool {
+    // Apply the WHATWG parser's input normalization first: it trims
+    // leading/trailing C0 control or space and removes all ASCII tab, LF,
+    // and CR anywhere in the input, so `https://h/base/..\n` reaches the
+    // parser as the segment `..`. The guard must examine that same
+    // normalized form, or the parent pop slips past the raw check.
+    let normalized: String = raw
+        .trim_matches(|c: char| (c as u32) <= 0x20)
+        .chars()
+        .filter(|&c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    // The scheme ends at the FIRST ':' only: a '://' inside the query or
+    // fragment must never be mistaken for the scheme delimiter (it would
+    // hide real dot segments or falsely reject query text as traversal).
+    // An optional '//' — or '\\' for special schemes — follows and is not
+    // part of the authority.
+    let after_scheme = match normalized.split_once(':') {
+        Some((_, rest)) => rest.trim_start_matches(['/', '\\']),
+        None => &normalized,
+    };
+    // A backslash directly after the authority is the path start too: the
+    // WHATWG parser accepts `\` as a path separator for special schemes, so
+    // `https://host\..\x` parses with a path of `/x` after the parent pop.
+    let path_start = after_scheme
+        .find(['/', '\\', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let path_and_rest = &after_scheme[path_start..];
+    let path = path_and_rest
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+    path.split(['/', '\\']).any(|seg| {
+        let s = seg.to_ascii_lowercase();
+        // Windows/IIS-family servers trim trailing ASCII spaces and dots
+        // (including the %20 spelling of space) from each path component, so
+        // a spelling like `.. `, `...`, or `..%20` resolves to a dot segment
+        // at the server even though the exact matches below do not see one:
+        // strip those suffixes first and reject anything that collapses to
+        // a dot form (or to nothing but dots and spaces).
+        // After the trailing trim, EVERY dot-form spelling — literal,
+        // mixed, or fully encoded ("%2e" is itself a trimmable suffix) —
+        // collapses to the empty check; nothing survives for exact matches.
+        let trimmed = trim_windows_alias_suffixes(&s);
+        (!s.is_empty() && trimmed.is_empty())
+            // Encoded separators can decode back into path separators
+            // server-side (a raw-concatenated `..%2fsecret` subdir), so a
+            // configured scope never carries them.
+            || s.contains("%2f")
+            || s.contains("%5c")
+    })
+}
+
+/// Strips any mix of trailing literal spaces, dots, and `%20` from a
+/// (lowercased) path segment: the per-component trim Windows-family servers
+/// apply before resolving the path.
+fn trim_windows_alias_suffixes(mut s: &str) -> &str {
+    // `s` arrives lowercased, so the encoded spellings need no case handling.
+    loop {
+        if s.ends_with(' ') || s.ends_with('.') {
+            s = &s[..s.len() - 1];
+        } else if let Some(stripped) = s.strip_suffix("%20").or_else(|| s.strip_suffix("%2e")) {
+            s = stripped;
+        } else {
+            return s;
+        }
+    }
+}
+
 pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Result<(), String> {
     let url = reqwest::Url::parse(url_str)
         .map_err(|e| format!("Invalid WebDAV URL: {}", e))?;
+
+    // Reject dot-segment spellings in their raw form: `Url::parse` collapses
+    // `..`/`.%2e`/`%2e.`/`%2e%2e` path segments (and drops `%2e`), silently
+    // shifting the effective remote scope above the configured base path.
+    if has_url_dot_segment(url_str) {
+        return Err(
+            "URL path contains a dot-segment ('.', '..' or percent-encoded form) or an encoded path separator ('%2f'/'%5c') that would resolve above the configured directory."
+                .to_string(),
+        );
+    }
 
     // Reject credentials embedded in the URL itself (https://user:pass@host/):
     // the password would be persisted verbatim in the settings store, echoed
@@ -4285,6 +4368,161 @@ mod tests {
             let item = format!("/{}%C3%A9x", "a".repeat(n));
             let _ = relative_item_path(base, &item);
         }
+    }
+
+    #[test]
+    fn test_validate_webdav_url_rejects_parser_normalized_traversal() {
+        // Url::parse trims C0 control/space at both ends and drops ASCII
+        // tab/LF/CR anywhere, so these raw spellings reach the parser as a
+        // parent-pop `..` (or encoded `%2e%2e`) segment even though the raw
+        // string never contains one literally. The error message pins the
+        // rejection to the dot-segment guard.
+        for raw in [
+            "https://courselinkdav.desire2learn.com/base/..\n",
+            "https://courselinkdav.desire2learn.com/base/.. ",
+            "https://courselinkdav.desire2learn.com/base/.\t.",
+            "https://courselinkdav.desire2learn.com/base/\n..",
+            "https://courselinkdav.desire2learn.com/base/%2e%2e\n",
+        ] {
+            let err = validate_webdav_url_internal(raw, false).unwrap_err();
+            assert!(
+                err.contains("dot-segment"),
+                "{raw:?} must be rejected as a dot-segment, got: {err}"
+            );
+        }
+        // Encoded separators decode back into path separators server-side,
+        // so a configured scope never carries them.
+        for raw in [
+            "https://courselinkdav.desire2learn.com/dav/..%2fsecret",
+            "https://courselinkdav.desire2learn.com/dav/..%5csecret",
+        ] {
+            let err = validate_webdav_url_internal(raw, false).unwrap_err();
+            assert!(
+                err.contains("encoded path separator"),
+                "{raw} must be rejected as an encoded separator, got: {err}"
+            );
+        }
+        // Edge whitespace alone is normalized away and stays accepted.
+        assert!(validate_webdav_url_internal(
+            "  https://courselinkdav.desire2learn.com/dav/my%20course  ",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_rejects_backslash_after_authority() {
+        // The WHATWG parser treats a backslash as a path separator for
+        // special schemes, so `https://host\..\x` parses with a path of
+        // `/x` after the parent pop. The guard must recognize the backslash
+        // as the path start rather than part of the authority, or the
+        // traversal escapes the configured scope unseen. The error message
+        // pins the rejection to the dot-segment guard itself.
+        for raw in [
+            r"https://courselinkdav.desire2learn.com\..\secret",
+            r"https://courselinkdav.desire2learn.com:8443\..\secret",
+            r"https://courselinkdav.desire2learn.com\%2e%2e/secret",
+            r"https://courselinkdav.desire2learn.com\.\secret",
+        ] {
+            let err = validate_webdav_url_internal(raw, false).unwrap_err();
+            assert!(
+                err.contains("dot-segment"),
+                "{raw} must be rejected as a dot-segment, got: {err}"
+            );
+        }
+        // A backslash separating ordinary segments is a path separator, not
+        // a traversal, and stays accepted.
+        assert!(validate_webdav_url_internal(
+            r"https://courselinkdav.desire2learn.com\dav\",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_rejects_encoded_dot_segments() {
+        // The WHATWG URL parser treats these path segments as double-dot
+        // segments and pops the parent directory, so a literal '.'/'..'
+        // check never sees them: the remote scope would silently shift
+        // above the configured base path.
+        for path in [
+            "/dav/%2e%2e/",
+            "/dav/.%2e/",
+            "/dav/%2e./",
+            "/dav/notes/%2e%2e",
+            "/dav/%2E%2E/",
+        ] {
+            assert!(
+                validate_webdav_url_internal(&format!("https://courselinkdav.desire2learn.com{path}"), false).is_err(),
+                "encoded dot-dot path segment must be rejected: {path}"
+            );
+        }
+        // The encoded single-dot form is silently dropped by the same rule.
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/%2e", false).is_err());
+        // Ordinary percent-encoded characters stay allowed.
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/my%20course/", false).is_ok());
+    }
+
+    #[test]
+    fn test_has_url_dot_segment_splits_scheme_only_at_the_first_colon() {
+        // A '://' inside the query or fragment must never be mistaken for
+        // the scheme delimiter: the first form hides a real dot segment,
+        // the second buries traversal-looking text in the query where the
+        // parser puts it.
+        assert!(
+            has_url_dot_segment("https:host/..?x=://"),
+            "dot segments before a query-borne '://' must still be caught"
+        );
+        assert!(
+            !has_url_dot_segment("https:host?x=://../.."),
+            "traversal-looking QUERY text is not a path dot segment"
+        );
+        assert!(has_url_dot_segment("https://h.example/dav/../x"));
+        assert!(!has_url_dot_segment("https://h.example/dav/x?return=https://other/p"));
+    }
+
+    #[test]
+    fn test_validate_webdav_url_rejects_windows_trim_dot_aliases() {
+        // Windows/IIS-family servers strip trailing ASCII spaces and dots
+        // (including their %20 spelling) from each path component, so these
+        // alias onto "." / ".." at resolve time even though an exact-match
+        // dot check passes them. The trailing trim must also strip %2e:
+        // `..%20%2e` decodes to `.. .` and trims to `..`.
+        for path in [
+            "/dav/.. /",
+            "/dav/.../",
+            "/dav/..%20/",
+            "/dav/. /",
+            "/dav/notes/..%20/x",
+            "/dav/..%20%2e/",
+            "/dav/..%2e/",
+            "/dav/notes/..%2E/x",
+            "/dav/%2e%2e%2e/",
+        ] {
+            assert!(
+                validate_webdav_url_internal(&format!("https://courselinkdav.desire2learn.com{path}"), false).is_err(),
+                "windows-trim dot alias must be rejected: {path}"
+            );
+        }
+        // A name that merely ends in a dot — literal or encoded — is not a
+        // dot segment.
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/report./", false).is_ok());
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/report%2e/", false).is_ok());
+    }
+
+    #[test]
+    fn test_build_remote_url_scope_cannot_escape_via_encoded_subdir() {
+        // build_remote_url concatenates the user-supplied subdir into the
+        // remote URL; the guard must reject the result before any request.
+        for subdir in ["%2e%2e", "notes/.%2e", "notes/%2e%2e/sub"] {
+            let url = build_remote_url("https://courselinkdav.desire2learn.com/content/enforced/1234", subdir);
+            assert!(
+                validate_webdav_url_internal(&url, false).is_err(),
+                "subdir {subdir:?} must not shift the remote scope"
+            );
+        }
+        let url = build_remote_url("https://courselinkdav.desire2learn.com/content/enforced/1234", "notes");
+        assert!(validate_webdav_url_internal(&url, false).is_ok());
     }
 
     #[test]
