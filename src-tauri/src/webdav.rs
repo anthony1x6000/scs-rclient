@@ -703,24 +703,6 @@ fn write_cache_map(path: &Path, cache: &HashMap<String, CachedRemoteListing>) {
 /// - Validates that hrefs and relative paths do not contain directory traversal sequences (`has_traversal_sequence`).
 /// - Legitimate hidden files (e.g. `.gitignore`, `.env`) are preserved.
 /// - Does not rely on rigid prefix matching, correctly supporting root-relative hrefs returned by WebDAV servers.
-pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Vec<WebdavItem>> {
-    let path = get_cache_file_path()?;
-    let cache = read_cache_map(&path);
-    if ambiguous_username(auth_user) {
-        return None;
-    }
-    let key = cache_key(remote_url, auth_user);
-    let entry = cache.get(&key).filter(|entry| {
-        // Key equality is necessary but not sufficient: the stored URL must
-        // match the requested collection as well — scheme and host
-        // case-insensitively (per URL grammar), the path exactly — and the
-        // stored credential must equal the requested username exactly, so
-        // no entry can ever be served for a different collection or a
-        // case-variant credential.
-        url_same_collection(&entry.remote_url, remote_url)
-            && same_auth_user(&entry.auth_user, auth_user)
-    })?;
-
 /// Equality modulo the case-insensitive parts of the URL grammar: scheme and
 /// host compare case-insensitively; path (modulo insignificant trailing
 /// slashes, matching the key) and query compare exactly.
@@ -752,6 +734,25 @@ fn same_auth_user(stored: &Option<String>, requested: Option<&str>) -> bool {
         _ => false,
     }
 }
+
+pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Vec<WebdavItem>> {
+    let path = get_cache_file_path()?;
+    let cache = read_cache_map(&path);
+    if ambiguous_username(auth_user) {
+        return None;
+    }
+    let key = cache_key(remote_url, auth_user);
+    let entry = cache.get(&key).filter(|entry| {
+        // Key equality is necessary but not sufficient: the stored URL must
+        // match the requested collection as well — scheme and host
+        // case-insensitively (per URL grammar), the path exactly — and the
+        // stored credential must equal the requested username exactly, so
+        // no entry can ever be served for a different collection or a
+        // case-variant credential.
+        url_same_collection(&entry.remote_url, remote_url)
+            && same_auth_user(&entry.auth_user, auth_user)
+    })?;
+
 
     let ttl = get_cache_ttl_secs();
     if ttl > 0 {
