@@ -39,6 +39,13 @@ pub const MAX_REMOTE_HREF_BYTES: usize = 4096;
 /// `all_items`/`seen_items` and the listing cache), complementing the
 /// per-listing in-flight budget with a whole-scan bound.
 pub const MAX_RETAINED_LISTING_BYTES: usize = 256 * 1024 * 1024;
+/// Per-entry overhead the retained budget charges for the Vec/set nodes
+/// around each href copy.
+const RETAINED_ITEM_OVERHEAD_BYTES: usize = 128;
+/// Whole-scan budget on items PROCESSED (duplicates included): dedup means
+/// duplicates never reach the retained budget, but the parse work they
+/// force is bounded here instead.
+pub const MAX_PROCESSED_LISTING_ITEMS: usize = 1_000_000;
 /// Maximum number of excluded folder patterns applied to a single action.
 pub const MAX_EXCLUDE_PATTERNS: usize = 64;
 /// Maximum length (in characters) of one excluded folder pattern.
@@ -1036,6 +1043,37 @@ pub(crate) struct ListingBody {
     _inflight: InflightListingGuard,
 }
 
+/// Decodes a listing body per its XML BOM: UTF-16LE/BE (which the XML
+/// standard requires to carry a BOM) decode to UTF-8 in place, a UTF-8 BOM
+/// is stripped, and anything else must already be valid UTF-8. Charset-less
+/// guessing stays out on purpose: an undeclared non-BOM encoding fails
+/// closed rather than handing the server decoding control.
+fn decode_listing_body(mut bytes: Vec<u8>) -> Result<String, String> {
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        let big_endian = bytes[0] == 0xFE;
+        bytes.drain(..2);
+        if bytes.len() % 2 != 0 {
+            return Err("listing body is a truncated UTF-16 sequence".to_string());
+        }
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|p| {
+                if big_endian {
+                    u16::from_be_bytes([p[0], p[1]])
+                } else {
+                    u16::from_le_bytes([p[0], p[1]])
+                }
+            })
+            .collect();
+        return String::from_utf16(&units)
+            .map_err(|e| format!("listing body is not valid UTF-16: {e}"));
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+    }
+    String::from_utf8(bytes).map_err(|e| format!("listing body is not valid UTF-8: {e}"))
+}
+
 /// Reads a server-controlled listing body with a hard byte cap and strict
 /// UTF-8 (fail closed). Unbounded buffering of a hostile response is a
 /// memory-exhaustion vector; the cap turns it into a listing failure.
@@ -1061,8 +1099,14 @@ pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<Listin
             "listing body exceeds the {MAX_LISTING_BODY_BYTES} byte limit"
         ));
     }
-    let buf = String::from_utf8(bytes)
-        .map_err(|e| format!("listing body is not valid UTF-8: {e}"))?;
+    let buf = decode_listing_body(bytes)?;
+    // The cap must also bind the DECODED form: UTF-16 -> UTF-8 can expand
+    // the text, and the budget is denominated in retained bytes.
+    if buf.len() as u64 > MAX_LISTING_BODY_BYTES {
+        return Err(format!(
+            "listing body exceeds the {MAX_LISTING_BODY_BYTES} byte limit after decoding"
+        ));
+    }
     Ok(ListingBody { body: buf, _inflight: inflight })
 }
 
@@ -1203,6 +1247,14 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                 if in_href {
                     if let Ok(text) = e.unescape() {
                         current_href.push_str(&text);
+                        // Incremental cap: the buffer itself must stay
+                        // bounded, or one huge href amplifies parser state
+                        // past the body reservation before any check runs.
+                        if current_href.len() > MAX_REMOTE_HREF_BYTES {
+                            return Err(format!(
+                                "listing href exceeds the {MAX_REMOTE_HREF_BYTES} byte limit"
+                            ));
+                        }
                     }
                 } else if in_getcontentlength {
                     if let Ok(text) = e.unescape() {
@@ -1225,6 +1277,11 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                 if in_href {
                     if let Ok(text) = std::str::from_utf8(e.as_ref()) {
                         current_href.push_str(text);
+                        if current_href.len() > MAX_REMOTE_HREF_BYTES {
+                            return Err(format!(
+                                "listing href exceeds the {MAX_REMOTE_HREF_BYTES} byte limit"
+                            ));
+                        }
                     }
                 } else if in_getcontentlength {
                     if let Ok(text) = std::str::from_utf8(e.as_ref()) {
@@ -2387,6 +2444,8 @@ where
         /// Retained bytes of every accepted href: a whole-scan budget next
         /// to the per-listing item cap.
         retained_listing_bytes: usize,
+        /// Items processed across all listings, duplicates included.
+        processed_listing_items: usize,
         scanned_count: usize,
         /// Directories whose listing kept failing after every retry and were skipped.
         skipped_dirs: Vec<String>,
@@ -2479,6 +2538,7 @@ where
         seen_items: HashSet::new(),
         all_items: Vec::new(),
         retained_listing_bytes: 0,
+        processed_listing_items: 0,
         scanned_count: 0,
         skipped_dirs: Vec::new(),
         error: None,
@@ -2719,6 +2779,14 @@ where
                         }
 
                         for item in discovered_items {
+                            state.processed_listing_items += 1;
+                            if state.processed_listing_items > MAX_PROCESSED_LISTING_ITEMS {
+                                state.error = Some(format!(
+                                    "Remote scan processed more than {MAX_PROCESSED_LISTING_ITEMS} listing items (duplicates included). Aborting for security."
+                                ));
+                                state.stopped = true;
+                                return;
+                            }
                             let key = (item.is_dir, item.href.clone());
                             if state.seen_items.insert(key) {
                                 if state.all_items.len() >= MAX_REMOTE_ITEMS {
@@ -2728,7 +2796,11 @@ where
                                     state.stopped = true;
                                     return;
                                 }
-                                state.retained_listing_bytes += item.href.len();
+                                // Both retained copies count (all_items'
+                                // String and the seen_items key clone), plus
+                                // fixed per-entry container overhead.
+                                state.retained_listing_bytes +=
+                                    2 * item.href.len() + RETAINED_ITEM_OVERHEAD_BYTES;
                                 if state.retained_listing_bytes > MAX_RETAINED_LISTING_BYTES {
                                     state.error = Some(format!(
                                         "Remote listing retained bytes exceeded the {MAX_RETAINED_LISTING_BYTES} byte budget. Aborting for security."
