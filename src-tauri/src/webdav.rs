@@ -5321,6 +5321,26 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_propfind_xml_rejects_oversized_hrefs() {
+        // Item counts alone do not bound retained bytes: without a per-href
+        // cap, one href can carry most of a listing body into per-item scan
+        // state and blow past every aggregate budget.
+        let href = format!("/course/{}.txt", "x".repeat(8192));
+        let xml = format!(
+            "<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\">\
+             <D:response><D:href>{href}</D:href><D:propstat><D:prop>\
+             <D:resourcetype/></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+             </D:propstat></D:response></D:multistatus>"
+        );
+        let err = parse_propfind_xml(&xml)
+            .expect_err("an oversized href must be refused outright");
+        assert!(
+            err.to_ascii_lowercase().contains("href"),
+            "error must name the href limit, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_parse_propfind_xml_stops_at_item_cap() {
         // An over-cap listing is hostile, and truncated acceptance is a
         // silent partial listing: the parser itself must refuse it, so no
