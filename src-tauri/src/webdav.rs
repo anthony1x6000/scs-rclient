@@ -5342,6 +5342,31 @@ mod tests {
             "an anonymous request should not see alice's cached items"
         );
 
+        // Exact usernames: trailing whitespace distinguishes credentials,
+        // and an ambiguous (empty/whitespace-only) username is neither
+        // anonymous nor any account — cache entry points refuse it entirely
+        // instead of conflating it with either.
+        let spaced_alice = Some("alice ");
+        assert_ne!(cache_key(test_url, alice_user), cache_key(test_url, spaced_alice));
+        assert!(
+            load_remote_cache(test_url, spaced_alice).is_none(),
+            "a trailing-space username is a different credential"
+        );
+        assert!(
+            load_remote_cache(test_url, Some("")).is_none(),
+            "an empty username is not anonymous and must read nothing"
+        );
+        assert!(!same_auth_user(&Some(String::new()), &None));
+        save_remote_cache(test_url, Some(""), &items);
+        assert!(
+            load_remote_cache(test_url, Some("")).is_none(),
+            "ambiguous credentials are never cached"
+        );
+        assert!(
+            load_remote_cache(test_url, None).is_none(),
+            "an ambiguous credential must not poison the anonymous entry"
+        );
+
         // Update item in alice's cache
         update_remote_cache_item(test_url, alice_user, "doc.pdf", 8192, Some(12345678));
         let updated = load_remote_cache(test_url, alice_user).unwrap();
