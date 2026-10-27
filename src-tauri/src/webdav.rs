@@ -4460,6 +4460,24 @@ mod tests {
     }
 
     #[test]
+    fn test_has_url_dot_segment_splits_scheme_only_at_the_first_colon() {
+        // A '://' inside the query or fragment must never be mistaken for
+        // the scheme delimiter: the first form hides a real dot segment,
+        // the second buries traversal-looking text in the query where the
+        // parser puts it.
+        assert!(
+            has_url_dot_segment("https:host/..?x=://"),
+            "dot segments before a query-borne '://' must still be caught"
+        );
+        assert!(
+            !has_url_dot_segment("https:host?x=://../.."),
+            "traversal-looking QUERY text is not a path dot segment"
+        );
+        assert!(has_url_dot_segment("https://h.example/dav/../x"));
+        assert!(!has_url_dot_segment("https://h.example/dav/x?return=https://other/p"));
+    }
+
+    #[test]
     fn test_validate_webdav_url_rejects_windows_trim_dot_aliases() {
         // Windows/IIS-family servers strip trailing ASCII spaces and dots
         // (including their %20 spelling) from each path component, so these
