@@ -289,34 +289,54 @@ jobs:
             .github/flatpak/online.anthonyis.scs-rclient.yml
 
       - name: Import Flatpak Repository Signing Key
+        id: signing_key
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          RELEASE_RUN: ${{ github.event_name == 'release' }}
         run: |
           set -euo pipefail
-          # Fail closed: an unsigned update channel must never be published.
-          if [ -z "${FLATPAK_GPG_PRIVATE_KEY:-}" ]; then
-            echo "::error title=signing key missing::secrets.FLATPAK_GPG_PRIVATE_KEY is not configured; refusing to build an unsigned update repository. See the PR description for the one-time key setup."
-            exit 1
+          # Fail closed where it matters: a release run must never publish an
+          # unsigned update channel. Non-release runs (PRs, pushes) build the
+          # repository unsigned for the test jobs — which install it with
+          # --no-gpg-verify — and publish nothing, so they may proceed so the
+          # signing code itself can be reviewed and merged.
+          if [ -z "${FLATPAK_GPG_PRIVATE_KEY:-}" ] || [ -z "${FLATPAK_GPG_KEY_ID:-}" ]; then
+            if [ "${RELEASE_RUN}" = "true" ]; then
+              echo "::error title=signing key missing::secrets.FLATPAK_GPG_PRIVATE_KEY / FLATPAK_GPG_KEY_ID are not configured; refusing to publish an unsigned update repository. See the PR description for the one-time key setup."
+              exit 1
+            fi
+            echo "::warning title=signing key missing::release signing secrets are not configured yet; building an UNSIGNED repository for this non-release run. No channel publication happens on this event."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           printf '%s' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "signed=true" >> "$GITHUB_OUTPUT"
 
       - name: Update OSTree Static Repository & Deltas
         env:
           FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          SIGNED: ${{ steps.signing_key.outputs.signed }}
         run: |
           set -euo pipefail
-          if [ -z "${FLATPAK_GPG_KEY_ID:-}" ]; then
-            echo "::error title=signing key id missing::secrets.FLATPAK_GPG_KEY_ID is not configured; refusing to build an unsigned update repository."
-            exit 1
+          if [ "${SIGNED}" = "true" ]; then
+            flatpak build-update-repo \
+              --title="scs-rclient" \
+              --comment="GUI wrapper for rclone" \
+              --description="Flatpak repository for scs-rclient desktop application" \
+              --homepage="https://github.com/anthony1x6000/scs-rclient" \
+              --gpg-sign="${FLATPAK_GPG_KEY_ID}" \
+              --generate-static-deltas \
+              repo
+          else
+            flatpak build-update-repo \
+              --title="scs-rclient" \
+              --comment="GUI wrapper for rclone" \
+              --description="Flatpak repository for scs-rclient desktop application" \
+              --homepage="https://github.com/anthony1x6000/scs-rclient" \
+              --generate-static-deltas \
+              repo
           fi
-          flatpak build-update-repo \
-            --title="scs-rclient" \
-            --comment="GUI wrapper for rclone" \
-            --description="Flatpak repository for scs-rclient desktop application" \
-            --homepage="https://github.com/anthony1x6000/scs-rclient" \
-            --gpg-sign="${FLATPAK_GPG_KEY_ID}" \
-            --generate-static-deltas \
-            repo
 
       - name: Create Flatpak Bundle
         run: |
