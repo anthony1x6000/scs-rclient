@@ -95,20 +95,29 @@ fn spawn_server(
                             .map(|(_, s)| *s)
                     })
                     .unwrap_or(4096);
-                let headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {advertised}\r\nConnection: close\r\n\r\n"
-                );
-                let _ = stream.write_all(headers.as_bytes());
                 match full_bodies {
+                    // Chunked and cleanly terminated: the client accepts the
+                    // body without error regardless of any advertised
+                    // length — exactly the hostile short-body shape.
                     Some(exact) => {
+                        let headers =
+                            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(headers.as_bytes());
                         let mut remaining = exact;
                         while remaining > 0 {
                             let n = remaining.min(4096) as usize;
+                            let _ = stream.write_all(format!("{n:x}\r\n").as_bytes());
                             let _ = stream.write_all(&vec![b'x'; n]);
+                            let _ = stream.write_all(b"\r\n");
                             remaining -= n as u64;
                         }
+                        let _ = stream.write_all(b"0\r\n\r\n");
                     }
                     None => {
+                        let headers = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {advertised}\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(headers.as_bytes());
                         let _ = stream.write_all(b"abcd");
                         let _ = stream.flush();
                         std::thread::sleep(Duration::from_millis(100));
