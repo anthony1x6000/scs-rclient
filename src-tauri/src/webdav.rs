@@ -3733,9 +3733,17 @@ where
                                 written, max_size
                             )));
                         }
-                        // The replaced file keeps the prior file's mode:
-                        // applied only now, after the body is fully written,
-                        // so a read-only mode can never block the stream.
+                        // The replaced file keeps the prior file's Unix
+                        // mode bits, applied only now, after the body is
+                        // fully written, so a read-only mode can never block
+                        // the stream. Scope note: std exposes only mode bits
+                        // — owner/group, xattrs, POSIX ACLs, and Windows
+                        // security descriptors are NOT carried across the
+                        // replace (same as the previous truncate-and-write
+                        // path, which rewrote the inode entirely). New
+                        // downloads (no prior file) intentionally land
+                        // 0600: private by default, instead of the umask
+                        // default of the old File::create path.
                         #[cfg(unix)]
                         if let Ok(prior) = std::fs::metadata(&target_file) {
                             std::fs::set_permissions(&temp_file, prior.permissions()).map_err(

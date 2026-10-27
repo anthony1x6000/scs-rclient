@@ -166,10 +166,11 @@ fn test_temp_name_collision_cannot_destroy_sibling_file() {
     std::env::set_var("ALLOW_INSECURE_WEBDAV", "1");
     std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
 
-    // A hostile server lists the exact name the download would want to use
-    // as its temp sibling (`a.scs-part-<pid>`); that sibling is itself a
-    // real local file. Neither a failed nor a successful download may
-    // truncate or delete it.
+    // A hostile server lists names a download might want for its temp
+    // sibling — the old predictable `a.scs-part-<pid>` shape and the new
+    // hidden `.scs-part-<noise>` shape alike; each is itself a real local
+    // file. Neither a failed nor a successful download may truncate or
+    // delete any of them.
     let collide = format!("a.scs-part-{}", std::process::id());
     // A pre-existing file shaped exactly like the new hidden temp form:
     // create_new must skip this name, never truncate it.
@@ -269,6 +270,23 @@ fn test_read_only_target_is_refused_not_replaced() {
     std::fs::write(local_dir.join("a.txt"), original).unwrap();
     std::fs::set_permissions(local_dir.join("a.txt"), std::fs::Permissions::from_mode(0o444))
         .unwrap();
+    // The guard the test exercises is ordinary Unix write permission: root
+    // (or a CAP_FOWNER-equivalent) can open 0444 for writing everywhere, so
+    // the assumption itself is probed and the test skipped where it cannot
+    // hold.
+    if let Ok(handle) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(local_dir.join("a.txt"))
+    {
+        drop(handle);
+        std::fs::set_permissions(
+            local_dir.join("a.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&local_dir);
+        return; // running with DAC override: nothing to assert
+    }
     let mut logs = Vec::new();
     run_get_action(port, &local_dir, &mut logs);
     stop.store(true, Ordering::SeqCst);
