@@ -5467,22 +5467,28 @@ mod tests {
         for u in &units {
             le.extend_from_slice(&u.to_le_bytes());
         }
-        let listing = read_listing_body(&mut std::io::Cursor::new(le))
-            .expect("UTF-16LE with BOM must decode");
-        assert!(parse_propfind_xml(&listing.body).is_ok());
+        // Each read's ListingBody (and its in-flight reservation) is
+        // released at the end of its own statement: shadowed bindings would
+        // all live to scope end and stack three worst-case reservations.
+        let body = read_listing_body(&mut std::io::Cursor::new(le))
+            .expect("UTF-16LE with BOM must decode")
+            .body;
+        assert!(parse_propfind_xml(&body).is_ok());
         let mut be = vec![0xFE, 0xFF];
         for u in &units {
             be.extend_from_slice(&u.to_be_bytes());
         }
-        let listing = read_listing_body(&mut std::io::Cursor::new(be))
-            .expect("UTF-16BE with BOM must decode");
-        assert!(parse_propfind_xml(&listing.body).is_ok());
+        let body = read_listing_body(&mut std::io::Cursor::new(be))
+            .expect("UTF-16BE with BOM must decode")
+            .body;
+        assert!(parse_propfind_xml(&body).is_ok());
         // A UTF-8 BOM is accepted and stripped.
         let mut utf8bom = vec![0xEF, 0xBB, 0xBF];
         utf8bom.extend_from_slice(xml.as_bytes());
-        let listing = read_listing_body(&mut std::io::Cursor::new(utf8bom))
-            .expect("UTF-8 BOM must be accepted");
-        assert!(parse_propfind_xml(&listing.body).is_ok());
+        let body = read_listing_body(&mut std::io::Cursor::new(utf8bom))
+            .expect("UTF-8 BOM must be accepted")
+            .body;
+        assert!(parse_propfind_xml(&body).is_ok());
         // A truncated (odd-length) UTF-16 body fails closed.
         let mut odd = vec![0xFF, 0xFE, b'x'];
         let _ = &mut odd;
