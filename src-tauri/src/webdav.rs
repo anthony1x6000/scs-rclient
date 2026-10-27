@@ -3737,6 +3737,19 @@ where
                                 written, max_size
                             )));
                         }
+                        // The listing advertised a length: a body that ends
+                        // cleanly but SHORT (a hostile chunked response does
+                        // exactly that) must not replace the prior file with
+                        // truncated content. An unknown/zero advertised size
+                        // is the only case that skips the comparison.
+                        if item.size > 0 && written != item.size as u64 {
+                            drop(dest_file);
+                            remove_part_file(&temp_file);
+                            return Err(AttemptError::Fatal(format!(
+                                "Downloaded {} bytes but the listing advertised {} for {download_url}",
+                                written, item.size
+                            )));
+                        }
                         // The replaced file keeps the prior file's Unix
                         // OWNER mode bits, applied only now, after the body
                         // is fully written, so a read-only mode can never
