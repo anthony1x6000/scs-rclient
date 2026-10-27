@@ -1430,8 +1430,13 @@ fn has_url_dot_segment(raw: &str) -> bool {
         .chars()
         .filter(|&c| !matches!(c, '\t' | '\n' | '\r'))
         .collect();
-    let after_scheme = match normalized.split_once("://") {
-        Some((_, rest)) => rest,
+    // The scheme ends at the FIRST ':' only: a '://' inside the query or
+    // fragment must never be mistaken for the scheme delimiter (it would
+    // hide real dot segments or falsely reject query text as traversal).
+    // An optional '//' — or '\\' for special schemes — follows and is not
+    // part of the authority.
+    let after_scheme = match normalized.split_once(':') {
+        Some((_, rest)) => rest.trim_start_matches(['/', '\\']),
         None => &normalized,
     };
     // A backslash directly after the authority is the path start too: the
@@ -1453,12 +1458,11 @@ fn has_url_dot_segment(raw: &str) -> bool {
         // at the server even though the exact matches below do not see one:
         // strip those suffixes first and reject anything that collapses to
         // a dot form (or to nothing but dots and spaces).
-        // After the trailing trim, literal "."/".." spellings (and "%2e.")
-        // have already collapsed to the empty check below; only the encoded
-        // forms that survive the trim remain for the exact matches.
+        // After the trailing trim, EVERY dot-form spelling — literal,
+        // mixed, or fully encoded ("%2e" is itself a trimmable suffix) —
+        // collapses to the empty check; nothing survives for exact matches.
         let trimmed = trim_windows_alias_suffixes(&s);
         (!s.is_empty() && trimmed.is_empty())
-            || matches!(trimmed, "%2e" | ".%2e" | "%2e%2e")
             // Encoded separators can decode back into path separators
             // server-side (a raw-concatenated `..%2fsecret` subdir), so a
             // configured scope never carries them.
