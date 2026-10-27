@@ -3176,6 +3176,7 @@ where
         auth_user,
         true,
         &[],
+        None,
         log,
     )?;
     Ok(aggregate_remote_folders(remote_url, &items))
