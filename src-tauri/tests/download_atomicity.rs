@@ -231,7 +231,9 @@ fn test_successful_download_preserves_target_permissions() {
     let _ = std::fs::remove_dir_all(&local_dir);
     std::fs::create_dir_all(&local_dir).unwrap();
     std::fs::write(local_dir.join("a.txt"), b"stale").unwrap();
-    std::fs::set_permissions(local_dir.join("a.txt"), std::fs::Permissions::from_mode(0o600))
+    // 0o644 is distinct from the temp's 0o600 creation mode, so the test
+    // actually proves prior-mode copying rather than the default.
+    std::fs::set_permissions(local_dir.join("a.txt"), std::fs::Permissions::from_mode(0o644))
         .unwrap();
     let mut logs = Vec::new();
     run_get_action(port, &local_dir, &mut logs);
@@ -248,8 +250,8 @@ fn test_successful_download_preserves_target_permissions() {
     assert_eq!(after, b"xxxxxxxx", "the full body must land (logs: {logs:?})");
     assert_eq!(
         mode & 0o777,
-        0o600,
-        "replacing the target must keep the prior file's mode (logs: {logs:?})"
+        0o644,
+        "replacing the target must keep the prior file's distinct mode (logs: {logs:?})"
     );
 }
 

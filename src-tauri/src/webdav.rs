@@ -3734,19 +3734,26 @@ where
                             )));
                         }
                         // The replaced file keeps the prior file's Unix
-                        // mode bits, applied only now, after the body is
-                        // fully written, so a read-only mode can never block
-                        // the stream. Scope note: std exposes only mode bits
-                        // — owner/group, xattrs, POSIX ACLs, and Windows
-                        // security descriptors are NOT carried across the
-                        // replace (same as the previous truncate-and-write
-                        // path, which rewrote the inode entirely). New
-                        // downloads (no prior file) intentionally land
-                        // 0600: private by default, instead of the umask
-                        // default of the old File::create path.
+                        // mode bits (setuid/setgid stripped: the new content
+                        // is not the old owner's), applied only now, after
+                        // the body is fully written, so a read-only mode can
+                        // never block the stream. Known regression vs the
+                        // old truncate-in-place path, documented in the PR:
+                        // an atomic rename swaps the inode, so owner/group,
+                        // xattrs, POSIX ACLs, and Windows security
+                        // descriptors are NOT carried over (the old
+                        // File::create wrote into the SAME inode and kept
+                        // them). Mode bits are what std can preserve without
+                        // platform-specific metadata APIs. New downloads
+                        // (no prior file) intentionally land 0600: private
+                        // by default, instead of the umask default.
                         #[cfg(unix)]
-                        if let Ok(prior) = std::fs::metadata(&target_file) {
-                            std::fs::set_permissions(&temp_file, prior.permissions()).map_err(
+                        if let Ok(prior) = std::fs::symlink_metadata(&target_file) {
+                            let mode = {
+                                use std::os::unix::fs::PermissionsExt;
+                                std::fs::Permissions::from_mode(prior.permissions().mode() & !0o6000)
+                            };
+                            std::fs::set_permissions(&temp_file, mode).map_err(
                                 |e| {
                                     remove_part_file(&temp_file);
                                     AttemptError::Fatal(format!(
