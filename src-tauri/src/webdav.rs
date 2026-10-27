@@ -2744,6 +2744,21 @@ where
                             return;
                         }
                     };
+                    // EVERY parsed item counts, excluded or not: a hostile
+                    // listing full of excluded entries must still burn the
+                    // processed budget, or the parse/filter work it forces
+                    // is unbounded.
+                    {
+                        let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                        state.processed_listing_items += items.len();
+                        if state.processed_listing_items > MAX_PROCESSED_LISTING_ITEMS {
+                            state.error = Some(format!(
+                                "Remote scan processed more than {MAX_PROCESSED_LISTING_ITEMS} listing items (excluded ones included). Aborting for security."
+                            ));
+                            state.stopped = true;
+                            return;
+                        }
+                    }
                     // The in-flight reservation lives until end of scope:
                     // the 0-children preview below still reads the body, and
                     // releasing a moment later only delays, never exceeds,
@@ -2831,14 +2846,7 @@ where
                         }
 
                         for item in discovered_items {
-                            state.processed_listing_items += 1;
-                            if state.processed_listing_items > MAX_PROCESSED_LISTING_ITEMS {
-                                state.error = Some(format!(
-                                    "Remote scan processed more than {MAX_PROCESSED_LISTING_ITEMS} listing items (duplicates included). Aborting for security."
-                                ));
-                                state.stopped = true;
-                                return;
-                            }
+
                             let key = (item.is_dir, item.href.clone());
                             if state.seen_items.insert(key) {
                                 if state.all_items.len() >= MAX_REMOTE_ITEMS {
