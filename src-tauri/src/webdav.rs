@@ -1226,15 +1226,26 @@ fn create_unique_part_file(target: &Path) -> std::io::Result<(std::fs::File, Pat
 }
 
 /// Removes a partial temp file this call created, coping with a temp that
-/// ended up read-only (a read-only bit blocks deletion on Windows).
+/// ended up read-only. Clearing the read-only bit is a Windows-only
+/// fallback: on Unix, std's set_readonly(false) ORs the writable bits into
+/// the mode, which would widen a 0600 partial to group/other-writable just
+/// to delete it — a Unix removal failure is simply reported by doing
+/// nothing further (the hidden temp stays for the user, never the data).
 fn remove_part_file(temp: &Path) {
     if std::fs::remove_file(temp).is_err() {
-        let mut perms = std::fs::metadata(temp).map(|m| m.permissions());
-        if let Ok(p) = &mut perms {
-            p.set_readonly(false);
-            let _ = std::fs::set_permissions(temp, p.clone());
+        #[cfg(windows)]
+        {
+            let mut perms = std::fs::metadata(temp).map(|m| m.permissions());
+            if let Ok(p) = &mut perms {
+                p.set_readonly(false);
+                let _ = std::fs::set_permissions(temp, p.clone());
+                let _ = std::fs::remove_file(temp);
+            }
         }
-        let _ = std::fs::remove_file(temp);
+        #[cfg(not(windows))]
+        {
+            let _ = temp;
+        }
     }
 }
 
@@ -3740,9 +3751,11 @@ where
                         // The listing advertised a length: a body that ends
                         // cleanly but SHORT (a hostile chunked response does
                         // exactly that) must not replace the prior file with
-                        // truncated content. An unknown/zero advertised size
-                        // is the only case that skips the comparison.
-                        if item.size > 0 && written != item.size as u64 {
+                        // truncated content. A LONGER body is accepted — the
+                        // remote file may legitimately have grown since the
+                        // listing — and an unknown/zero advertised size skips
+                        // the comparison entirely.
+                        if item.size > 0 && written < item.size as u64 {
                             drop(dest_file);
                             remove_part_file(&temp_file);
                             return Err(AttemptError::Fatal(format!(

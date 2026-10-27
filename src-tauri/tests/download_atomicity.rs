@@ -357,6 +357,21 @@ fn test_non_writable_directory_fails_loudly() {
     // (writable) file inside it; the atomic replace needs to create a temp
     // sibling there and must fail loudly instead, leaving the file intact.
     std::fs::set_permissions(&local_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root (or CAP_DAC_OVERRIDE) can create files regardless of directory
+    // mode: probe the assumption and skip where it cannot hold.
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(local_dir.join(".probe-writable"))
+        .is_ok()
+    {
+        let _ = std::fs::remove_file(local_dir.join(".probe-writable"));
+        std::fs::set_permissions(&local_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&local_dir);
+        std::env::remove_var("ALLOW_INSECURE_WEBDAV");
+        std::env::remove_var("WEBDAV_CACHE_DISABLED");
+        return;
+    }
     let mut logs = Vec::new();
     run_get_action(port, &local_dir, &mut logs);
     stop.store(true, Ordering::SeqCst);
