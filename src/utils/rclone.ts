@@ -9,16 +9,43 @@ export function normalizeUrl(url: string): string {
   return clean;
 }
 
+/** WHATWG dot-segment spellings the URL parser collapses into parent pops. */
+const DOT_SEGMENT = /^(\.|\.\.|%2e|\.%2e|%2e\.|%2e%2e)$/i;
+/** Control characters never valid in a folder name handed to the backend. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+/** Encoded separators the Rust URL guard refuses in any configured path. */
+const ENCODED_SEPARATORS = /%2f|%5c/i;
+
 /**
  * Normalizes a subdirectory path by trimming whitespace, leading slashes, and trailing slashes.
- * Rejects `.` / `..` segments and backslash separators to prevent scope escape.
+ * Rejects `.` / `..` segments, percent-encoded dot segments, control characters, and backslash
+ * separators to prevent scope escape. Segments are also checked after stripping trailing ASCII
+ * spaces, dots, and `%20` (the trim Windows/IIS-family servers apply per component), so
+ * spellings like `.. `, `...`, or `..%20` that alias onto a dot segment at resolve time are
+ * rejected. Encoded separators (`%2f`/`%5c`) cannot traverse here: `resolveRemoteUrl` passes
+ * each segment through `encodeURIComponent`, which re-encodes the `%` (so `%2f` is sent as
+ * `%252f`) and the backend decodes it back to a literal, separator-free name; the Rust-side
+ * guard additionally rejects them in the configured URL, so they are refused
+ * here as well — a stored value the backend would refuse could otherwise
+ * pass frontend validation and fail every request at runtime.
  */
 export function normalizeSubdir(subdir: string): string {
   const trimmed = subdir.trim().replace(/\\/g, "/");
   const parts = trimmed.split("/").filter((p) => p.length > 0);
   for (const part of parts) {
-    if (part === "." || part === "..") {
-      throw new Error(`Invalid subdirectory "${subdir}": "." and ".." segments are not allowed.`);
+    // What remains after the Windows-style per-segment trim: a part made
+    // entirely of dots/spaces (or their %20/%2e spellings) collapses to "",
+    // and encoded-dot spellings are exposed to the DOT_SEGMENT check.
+    const core = part.replace(/(%20|%2e|[ .])+$/i, "");
+    if (
+      core === "" ||
+      core === "." ||
+      core === ".." ||
+      DOT_SEGMENT.test(core) ||
+      CONTROL_CHARS.test(part) ||
+      ENCODED_SEPARATORS.test(part)
+    ) {
+      throw new Error(`Invalid subdirectory "${subdir}": dot segments, encoded dot segments, windows dot-alias spellings, encoded separators, and control characters are not allowed.`);
     }
   }
   return parts.join("/");

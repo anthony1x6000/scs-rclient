@@ -1,0 +1,84 @@
+import { describe, expect, it } from "vitest";
+import { normalizeSubdir, resolveRemoteUrl, resolveLocalPath } from "./rclone";
+
+describe("normalizeSubdir traversal scope", () => {
+  it("rejects literal dot segments", () => {
+    expect(() => normalizeSubdir("..")).toThrow();
+    expect(() => normalizeSubdir("a/../b")).toThrow();
+  });
+
+  it("rejects percent-encoded dot segments the URL parser would collapse", () => {
+    for (const bad of ["%2e%2e", ".%2e", "%2e.", "%2E%2E", "notes/%2e%2e", "%2e"]) {
+      expect(() => normalizeSubdir(bad), `subdir ${bad} must be rejected`).toThrow();
+    }
+  });
+
+  it("rejects control characters", () => {
+    expect(() => normalizeSubdir("a\u0000b")).toThrow();
+    expect(() => normalizeSubdir("a\nb")).toThrow();
+  });
+
+  it("rejects trailing-space/dot aliases of dot segments (Windows-style trimming)", () => {
+    // Windows/IIS-family servers strip trailing ASCII spaces and dots from
+    // each path component — including their %20/%2e spellings — so these
+    // resolve to "." / ".." despite passing an exact-match dot check.
+    for (const bad of [
+      ".. ", ".. /secret", "notes/.. /x", "...", ". ", "notes/...", "..%20", "notes/..%20/x",
+      "..%20%2e", "..%2e", "notes/..%2E/x", "%2e%2e%2e",
+    ]) {
+      expect(() => normalizeSubdir(bad), `subdir ${bad} must be rejected`).toThrow();
+    }
+  });
+
+  it("accepts ordinary folder names", () => {
+    expect(normalizeSubdir("notes")).toBe("notes");
+    expect(normalizeSubdir(" My Folder ")).toBe("My Folder");
+    // A name that merely ends in a dot — literal or encoded — is not a
+    // dot-segment alias.
+    expect(normalizeSubdir("report.")).toBe("report.");
+    expect(normalizeSubdir("report%2e")).toBe("report%2e");
+    expect(normalizeSubdir("v1.2/notes")).toBe("v1.2/notes");
+  });
+
+  it("rejects encoded separators the backend guard refuses", () => {
+    // The Rust URL guard rejects %2f/%5c in any configured path, so a
+    // stored subdir carrying them would pass frontend validation and fail
+    // every request at runtime: reject them at the same boundary.
+    expect(() => normalizeSubdir("a%2fb")).toThrow();
+    expect(() => normalizeSubdir("a%5Cb")).toThrow();
+    expect(() => normalizeSubdir("notes/x%2fy")).toThrow();
+  });
+
+  it("encodes percent sequences as literals and refuses encoded separators", () => {
+    // resolveRemoteUrl re-encodes the `%`, so any percent sequence reaches
+    // the backend as a literal inside one segment and cannot split the path
+    // or pop a parent.
+    expect(resolveRemoteUrl("https://h.example/dav", "a%20b")).toBe(
+      "https://h.example/dav/a%2520b",
+    );
+    // Encoded separators are refused outright, matching the Rust URL guard
+    // that would reject the built URL at runtime.
+    expect(() => resolveRemoteUrl("https://h.example/dav", "a%2fb")).toThrow();
+    expect(() => resolveRemoteUrl("https://h.example/dav", "a%5Cb")).toThrow();
+  });
+
+  it("resolveRemoteUrl keeps the segment inside the base", () => {
+    expect(resolveRemoteUrl("https://h.example/dav", "notes")).toBe("https://h.example/dav/notes");
+  });
+});
+
+describe("resolveLocalPath containment", () => {
+  it("stays under the mount directory", () => {
+    expect(resolveLocalPath("/home/u/m", "a/b")).toBe("/home/u/m/a/b");
+  });
+
+  it("rejects subdirs that would escape the mount directory", () => {
+    expect(() => resolveLocalPath("/home/u/m", "../outside")).toThrow();
+    expect(() => resolveLocalPath("/home/u/m", "%2e%2e/outside")).toThrow();
+    expect(() => resolveLocalPath("/home/u/m", "a/../../outside")).toThrow();
+  });
+
+  it("normalizes an absolute-looking subdir to a relative one", () => {
+    expect(resolveLocalPath("/home/u/m", "/abs")).toBe("/home/u/m/abs");
+  });
+});

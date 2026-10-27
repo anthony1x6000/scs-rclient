@@ -141,7 +141,22 @@ export async function setSavedUsername(username: string): Promise<void> {
 export async function getSubdirectories(): Promise<string[]> {
   const store = await getStore();
   const raw = await store.get<WrappedValue<unknown>>(STORE_KEYS.subdirectories);
-  return Array.isArray(raw?.value) ? (raw.value as string[]) : [];
+  if (!Array.isArray(raw?.value)) return [];
+  // Stored entries are re-validated on load: legacy stores persisted raw text,
+  // and a poisoned store file must not select a run scope the add-input guard
+  // would have rejected (encoded dot segments, traversal, control characters).
+  const { normalizeSubdir } = await import("./utils/rclone");
+  const kept: string[] = [];
+  for (const entry of raw.value as unknown[]) {
+    if (typeof entry !== "string") continue;
+    try {
+      const normalized = normalizeSubdir(entry);
+      if (normalized && !kept.includes(normalized)) kept.push(normalized);
+    } catch {
+      // Drop entries that fail the same validation applied at add time.
+    }
+  }
+  return kept;
 }
 
 export async function setSubdirectories(items: string[]): Promise<void> {
