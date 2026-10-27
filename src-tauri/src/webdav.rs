@@ -1036,9 +1036,10 @@ fn reserve_inflight_listing(cancel: &AtomicBool) -> Result<InflightListingGuard,
             ));
         }
         let slice = deadline.min(now + std::time::Duration::from_secs(1)) - now;
-        let (guard, _timeout) = INFLIGHT_LISTING_ROOM
-            .wait_timeout(current, slice)
-            .unwrap_or_else(|p| p.into_inner());
+        let (guard, _timeout) = match INFLIGHT_LISTING_ROOM.wait_timeout(current, slice) {
+            Ok(pair) => pair,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         current = guard;
     }
 }
