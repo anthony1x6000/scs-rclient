@@ -7,6 +7,15 @@
 - **Applies Everywhere, Both Sides**: The filter gates every action (upload, download, previews, backup, compare, list, overwrite) on the local walk and the remote scan alike, so filtered files are never transferred in either direction, and the remote listing cache is bypassed while a filter is active. Bulk runs resolve each ticked folder's own list, so they stay compatible with multi-folder selection.
 - **Tests**: Rust unit tests cover normalization and verdicts, live Copyparty e2e tests prove whitelist/blacklist put/get behavior against the simulated D2L endpoint, and a Vitest suite pins CSV parsing and the per-dir/global resolution rules.
 
+## Bulk Folder Presets
+
+- **Auto-Saved Bulk Presets**: Every bulk action run saves the ticked folder set as a preset. Identical sets dedupe (the run just refreshes that preset as most recent), the list stays ordered most-recent-first, and it is capped at 20 presets, evicting the oldest past the cap.
+- **Presets in the Subdir Dropdown**: Saved presets appear inside the subdirectory dropdown in their own section below the folder list, behind a subtle divider. Each is labeled "N folders · first-member" (same-label collisions get " (2)", " (3)" suffixes), most recent first.
+- **Hover Shows Every Member**: Hovering a preset shows a native tooltip listing all of its member dirs, one per line — including stale members that no longer exist in the folder list.
+- **Click Re-Ticks, × Deletes**: Clicking a preset ticks its still-existing members as the bulk selection and closes the dropdown — no action fires and the regular single selection is untouched, exactly like manual ticking; stale members simply stay listed in the tooltip. The red × next to a preset deletes it.
+- **Search Filters Presets Too**: The dropdown's top search field matches presets by label or member dir, case-insensitively, alongside the regular folders.
+- **Frontend Unit Tests**: The preset logic (dedupe, cap, recency order, labels, tooltips, filtering) is covered by the Vitest unit suite.
+
 ## Bulk Subfolder Actions
 
 - **Multi-Select Subfolders**: The subdirectory dropdown now shows a checkbox on every row. Ticking two or more folders switches the whole action grid into bulk mode — every button (Upload, Download, previews, Compare, List, Backup, Overwrite) relabels with the folder count (e.g. "Upload · 7 folders") and runs the action on each ticked folder sequentially, in list order. Clicking a row's name still single-selects that folder and clears the ticks.

@@ -339,6 +339,80 @@ fn clear_webdav_cache() -> Result<(), String> {
     webdav::clear_remote_cache()
 }
 
+/// Lists every folder beneath the remote directory `subdir`, each with the total
+/// size of the files beneath it (PROPFIND metadata only — no downloads).
+///
+/// Powers the "Exclude folder select" picker. Uses its own cancel flag so
+/// opening the picker never resets cancellation of a running action.
+///
+/// Hardening: the authenticated origin and identity are backend-owned — both
+/// come from the saved settings store, renderer input is never accepted for
+/// them, and missing or malformed stored auth state is an error rather than a
+/// fallback. Traversal segments in `subdir` (literal or percent-encoded) are
+/// rejected because `build_remote_url` is a plain join.
+#[tauri::command]
+async fn list_remote_folders(
+    app: tauri::AppHandle,
+    subdir: String,
+    concurrency: Option<usize>,
+) -> Result<Vec<webdav::RemoteFolder>, String> {
+    const STORE_FILE: &str = "settings.json";
+    let stored_setting = |key: &str| -> Option<String> {
+        // `store()` loads-or-creates, so the command does not depend on the
+        // renderer having registered the store first.
+        tauri_plugin_store::StoreExt::store(&app, STORE_FILE)
+            .ok()
+            .and_then(|store| store.get(key))
+            .and_then(|value| value.get("value").and_then(|v| v.as_str()).map(str::to_string))
+            .filter(|v| !v.trim().is_empty())
+    };
+
+    let base_url = stored_setting("webdav_url")
+        .ok_or("WebDAV URL is not configured. Set it in Settings first.")?;
+    let username = stored_setting("saved_username")
+        .ok_or("No saved username. Save your credentials first.")?;
+    let concurrency = concurrency.map(|c| c.clamp(1, webdav::MAX_SCAN_CONCURRENCY));
+
+    if webdav::has_traversal_segments(&subdir) {
+        return Err("Invalid subdirectory: \"..\" segments are not allowed.".to_string());
+    }
+
+    let remote_url = webdav::build_remote_url(&base_url, &subdir);
+    webdav::validate_webdav_url(&remote_url)?;
+    // Belt-and-braces origin pinning: the built URL must stay on the stored
+    // base's scheme/host/port before credentials are attached, whatever
+    // build_remote_url does to the path.
+    let (base_origin, remote_origin) = (
+        reqwest::Url::parse(&base_url).map_err(|e| format!("Invalid stored WebDAV URL: {e}"))?,
+        reqwest::Url::parse(&remote_url).map_err(|e| format!("Invalid remote URL: {e}"))?,
+    );
+    if base_origin.scheme() != remote_origin.scheme()
+        || base_origin.host_str() != remote_origin.host_str()
+        || base_origin.port() != remote_origin.port()
+    {
+        return Err("Resolved remote URL leaves the configured WebDAV origin.".to_string());
+    }
+
+    // A username with no keyring entry must fail loudly instead of
+    // authenticating with an empty password.
+    let pass = get_credentials(username.clone())?;
+    let client = dav_client::Client::init(&username, &pass, &remote_url)?;
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    tauri::async_runtime::spawn_blocking(move || {
+        webdav::list_remote_folders(
+            &client,
+            &remote_url,
+            &cancel_flag,
+            concurrency,
+            Some(username.as_str()),
+            |_| {},
+        )
+    })
+    .await
+    .map_err(|e| format!("Task execution error: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -395,6 +469,7 @@ pub fn run() {
             cancel_webdav_action,
             set_scan_concurrency,
             run_webdav_action,
+            list_remote_folders,
             clear_webdav_cache
         ])
         .run(tauri::generate_context!())

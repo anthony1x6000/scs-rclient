@@ -16,6 +16,36 @@ pub const MAX_SCAN_CONCURRENCY: usize = 64;
 /// Set to 10,000 to comfortably accommodate very large course hierarchies (typical max depth ~10 * breadth ~100)
 /// while bounding memory usage and avoiding infinite traversal cycles.
 pub const MAX_SCANNED_DIRS_LIMIT: usize = 10_000;
+/// Hard byte cap for a single server-controlled listing body (PROPFIND
+/// multistatus). GET downloads are capped by `DEFAULT_MAX_FILE_SIZE`; listing
+/// bodies must be bounded the same way or one response can exhaust memory.
+pub const MAX_LISTING_BODY_BYTES: u64 = 64 * 1024 * 1024;
+/// Ceiling on the total bytes of listing bodies buffered concurrently across
+/// scan workers. The per-body cap alone would let `MAX_SCAN_CONCURRENCY`
+/// workers each hold a full `MAX_LISTING_BODY_BYTES` body (~4 GiB) before any
+/// aggregate check runs, so every listing read reserves its worst case
+/// against this shared budget and fails closed beyond it.
+pub const MAX_INFLIGHT_LISTING_BYTES: usize = 512 * 1024 * 1024;
+/// Aggregate item cap across one scan: bounds memory, the cache file, and the
+/// number of local files a hostile listing can materialize via `get`. The
+/// same bound is enforced per listing during XML item collection, so no
+/// single PROPFIND response can materialize unbounded item state either.
+pub const MAX_REMOTE_ITEMS: usize = 100_000;
+/// Hard cap on one server-advertised href: item counts alone do not bound
+/// retained bytes, and a single href could otherwise carry most of a listing
+/// body into per-item scan state past every aggregate budget.
+pub const MAX_REMOTE_HREF_BYTES: usize = 4096;
+/// Aggregate retained-bytes budget for one scan's item state (hrefs held in
+/// `all_items`/`seen_items` and the listing cache), complementing the
+/// per-listing in-flight budget with a whole-scan bound.
+pub const MAX_RETAINED_LISTING_BYTES: usize = 256 * 1024 * 1024;
+/// Per-entry overhead the retained budget charges for the Vec/set nodes
+/// around each href copy.
+const RETAINED_ITEM_OVERHEAD_BYTES: usize = 128;
+/// Whole-scan budget on items PROCESSED (duplicates included): dedup means
+/// duplicates never reach the retained budget, but the parse work they
+/// force is bounded here instead.
+pub const MAX_PROCESSED_LISTING_ITEMS: usize = 1_000_000;
 /// Maximum number of excluded folder patterns applied to a single action.
 pub const MAX_EXCLUDE_PATTERNS: usize = 64;
 /// Maximum length (in characters) of one excluded folder pattern.
@@ -473,6 +503,23 @@ pub fn get_max_file_size() -> u64 {
         .unwrap_or(DEFAULT_MAX_FILE_SIZE)
 }
 
+/// End-to-end deadline for one streamed download body. reqwest's blocking
+/// client applies its 30s timeout per individual `read()`, so a body dripped
+/// at one byte per 29 seconds never times out; this ceiling bounds the whole
+/// transfer and the copy loop also observes the cancel flag every chunk.
+/// Configured values are clamped to one day: anything larger serves no
+/// plausible transfer and would overflow `Instant + Duration` into a panic.
+pub const DOWNLOAD_BODY_TIMEOUT_MAX_SECS: u64 = 86_400;
+
+pub fn get_download_body_timeout_secs() -> u64 {
+    std::env::var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(600)
+        .min(DOWNLOAD_BODY_TIMEOUT_MAX_SECS)
+}
+
 /// Computes SHA256 checksum of a file on disk by streaming chunks to avoid buffering large files in RAM.
 pub fn compute_file_sha256(path: &Path) -> Result<String, std::io::Error> {
     use sha2::{Digest, Sha256};
@@ -526,6 +573,29 @@ impl Default for WebdavItem {
     }
 }
 
+/// True when `subdir` contains traversal segments or other path-hostile
+/// bytes, checking the raw text and each percent-decoding of it until the
+/// text stabilizes: `..` segments, backslashes, and control characters count
+/// in every form, because [`build_remote_url`] is a plain join and servers
+/// decode `%2F`/`%5C` into separators (possibly more than once, and may
+/// truncate at NUL).
+pub fn has_traversal_segments(subdir: &str) -> bool {
+    let mut text = subdir.to_string();
+    loop {
+        if text.contains('\\')
+            || text.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || text.split('/').any(|segment| segment.trim() == "..")
+        {
+            return true;
+        }
+        let decoded = decode_percent(&text);
+        if decoded == text {
+            return false;
+        }
+        text = decoded;
+    }
+}
+
 /// Returns true if a path or href contains directory traversal sequences or forbidden characters.
 /// Allows legitimate hidden files (e.g. `.gitignore`, `.env`, `.github`) while strictly blocking
 /// directory traversal attacks (`..`, `../`, `..\`, `/..`, `\..`, `%2e%2e`).
@@ -551,16 +621,56 @@ pub fn has_traversal_sequence(s: &str) -> bool {
 /// Computes a normalized cache key partitioned by authenticated credential context.
 ///
 /// Multi-Account Isolation:
-/// Cache keys include the authenticated username when available (`username@clean_url`) to prevent
-/// cache collisions across different user credentials accessing the same WebDAV host (CWE-287 / CWE-384).
+/// Cache keys include the authenticated username when available (`u1:username@clean_url`, username
+/// at its exact case) to prevent cache collisions across different user credentials accessing the
+/// same WebDAV host (CWE-287 / CWE-384).
 pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
-    let clean_url = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    // Fold case only where the URL grammar is case-insensitive (scheme,
+    // host); the path selects the collection and is case-sensitive
+    // (RFC 3986 6.2.2.1), so /dav/A/ and /dav/a/ must keep distinct keys.
+    // The query selects the collection on query-aware endpoints (share
+    // tokens, tenants), so it partitions the key exactly as sent. URL
+    // userinfo never reaches here: validate_webdav_url_internal rejects
+    // credentials embedded in the URL before any client exists.
+    let clean_url = match reqwest::Url::parse(remote_url) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+            // host_str() returns IPv6 literals WITHOUT brackets; re-wrap
+            // them or [::1]:8080 and ::1 (or a different v6 host) collide.
+            let host_display = if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            };
+            let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+            // The path is kept EXACTLY as configured, trailing slash
+            // included: it is part of the collection identity, and folding
+            // it away would let /dav/A read or mutate /dav/A/'s entry.
+            let path = url.path();
+            let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+            format!("{}://{}{}{}{}", url.scheme(), host_display, port, path, query)
+        }
+        Err(_) => remote_url.trim_end_matches('/').to_string(),
+    };
     match auth_user {
         Some(user) if !user.trim().is_empty() => {
-            format!("{}@{}", user.trim().to_ascii_lowercase(), clean_url)
+            // Usernames are opaque, case-sensitive tokens compared by
+            // exact bytes, and the key LENGTH-PREFIXES the name so a
+            // username containing '@' can never collide with a different
+            // (user, url) pair that concatenates to the same string.
+            // The `u1:` marker versions the user-scoped key format.
+            format!("u1:{}:{user}@{clean_url}", user.len())
         }
         _ => clean_url,
     }
+}
+
+/// True when a presented username names no account yet is not anonymous
+/// either (empty or nothing but whitespace). Cache entry points refuse it
+/// outright: an entry under it could be scoped to no credential at all, and
+/// conflating it with anonymous would let one read the other's listings.
+fn ambiguous_username(auth_user: Option<&str>) -> bool {
+    auth_user.is_some_and(|u| u.trim().is_empty())
 }
 
 /// Represents a cached remote WebDAV directory listing.
@@ -739,11 +849,59 @@ fn write_cache_map(path: &Path, cache: &HashMap<String, CachedRemoteListing>) {
 /// - Validates that hrefs and relative paths do not contain directory traversal sequences (`has_traversal_sequence`).
 /// - Legitimate hidden files (e.g. `.gitignore`, `.env`) are preserved.
 /// - Does not rely on rigid prefix matching, correctly supporting root-relative hrefs returned by WebDAV servers.
+/// Equality modulo the case-insensitive parts of the URL grammar: scheme and
+/// host compare case-insensitively; path (exactly as configured) and query
+/// compare exactly. Ports compare via port_or_known_default, so an omitted
+/// default port and its explicit spelling are the same collection here even
+/// though the cache KEY keeps them distinct — key over-partitioning is
+/// harmless (a miss), while comparator under-matching would cross-serve.
+fn url_same_collection(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            let host_a = a.host_str().unwrap_or_default().to_ascii_lowercase();
+            let host_b = b.host_str().unwrap_or_default().to_ascii_lowercase();
+            a.scheme() == b.scheme()
+                && host_a == host_b
+                && a.port_or_known_default() == b.port_or_known_default()
+                && a.path() == b.path()
+                && a.query() == b.query()
+        }
+        // Unparseable stored entries never match a parseable request.
+        (Err(_), Err(_)) => a.trim_end_matches('/') == b.trim_end_matches('/'),
+        _ => false,
+    }
+}
+
+/// Equality for the cached credential: usernames are opaque tokens compared
+/// by exact bytes — case and surrounding whitespace distinguish accounts on
+/// case-sensitive WebDAV servers, and an absent credential (anonymous) is
+/// distinct from any username, empty included.
+fn same_auth_user(stored: &Option<String>, requested: Option<&str>) -> bool {
+    match (stored.as_deref(), requested) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Vec<WebdavItem>> {
     let path = get_cache_file_path()?;
     let cache = read_cache_map(&path);
+    if ambiguous_username(auth_user) {
+        return None;
+    }
     let key = cache_key(remote_url, auth_user);
-    let entry = cache.get(&key)?;
+    let entry = cache.get(&key).filter(|entry| {
+        // Key equality is necessary but not sufficient: the stored URL must
+        // match the requested collection as well — scheme and host
+        // case-insensitively (per URL grammar), the path exactly — and the
+        // stored credential must equal the requested username exactly, so
+        // no entry can ever be served for a different collection or a
+        // case-variant credential.
+        url_same_collection(&entry.remote_url, remote_url)
+            && same_auth_user(&entry.auth_user, auth_user)
+    })?;
+
 
     let ttl = get_cache_ttl_secs();
     if ttl > 0 {
@@ -799,12 +957,15 @@ pub fn save_remote_cache(remote_url: &str, auth_user: Option<&str>, items: &[Web
         safe_items.push(item.clone());
     }
 
+    if ambiguous_username(auth_user) {
+        return;
+    }
     let key = cache_key(remote_url, auth_user);
     cache.insert(
         key,
         CachedRemoteListing {
             remote_url: remote_url.to_string(),
-            auth_user: auth_user.map(|u| u.trim().to_ascii_lowercase()),
+            auth_user: auth_user.map(|u| u.to_string()),
             timestamp: now,
             items: safe_items,
         },
@@ -833,8 +994,18 @@ pub fn update_remote_cache_item(
         return;
     }
 
+    if ambiguous_username(auth_user) {
+        return;
+    }
     let key = cache_key(remote_url, auth_user);
     if let Some(entry) = cache.get_mut(&key) {
+        // Key equality alone must never authorize a mutation: the stored
+        // collection and credential are rechecked exactly as load does.
+        if !url_same_collection(&entry.remote_url, remote_url)
+            || !same_auth_user(&entry.auth_user, auth_user)
+        {
+            return;
+        }
         let expected_url = build_file_url(remote_url, rel_path);
         let mut found = false;
         for item in &mut entry.items {
@@ -872,8 +1043,18 @@ pub fn remove_remote_cache_item(remote_url: &str, auth_user: Option<&str>, rel_p
         return;
     }
 
+    if ambiguous_username(auth_user) {
+        return;
+    }
     let key = cache_key(remote_url, auth_user);
     if let Some(entry) = cache.get_mut(&key) {
+        // Key equality alone must never authorize a mutation: the stored
+        // collection and credential are rechecked exactly as load does.
+        if !url_same_collection(&entry.remote_url, remote_url)
+            || !same_auth_user(&entry.auth_user, auth_user)
+        {
+            return;
+        }
         let expected_url = build_file_url(remote_url, rel_path);
         entry.items.retain(|item| {
             let item_rel = relative_item_path(remote_url, &item.href);
@@ -899,6 +1080,168 @@ pub fn clear_remote_cache() -> Result<(), String> {
         std::fs::remove_file(&path).map_err(|e| format!("Failed to clear cache: {}", e))?;
     }
     Ok(())
+}
+
+static INFLIGHT_LISTING_BYTES: Mutex<usize> = Mutex::new(0);
+static INFLIGHT_LISTING_ROOM: Condvar = Condvar::new();
+
+/// How long a scan worker parks waiting for in-flight listing capacity
+/// before failing closed: real listings cycle through the budget in
+/// milliseconds, so only a server keeping many worst-case bodies pinned
+/// (exactly the attack the budget bounds) can exhaust this.
+const INFLIGHT_LISTING_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// RAII proof that one listing body's worst-case bytes are inside the shared
+/// in-flight ceiling; dropping it returns the reservation and wakes a waiter.
+pub(crate) struct InflightListingGuard {
+    reserved: usize,
+}
+
+impl Drop for InflightListingGuard {
+    fn drop(&mut self) {
+        let mut current = INFLIGHT_LISTING_BYTES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *current = current.saturating_sub(self.reserved);
+        drop(current);
+        // One release frees exactly one worst-case body slot.
+        INFLIGHT_LISTING_ROOM.notify_one();
+    }
+}
+
+/// Reserves one worst-case listing body against `MAX_INFLIGHT_LISTING_BYTES`,
+/// bounding the aggregate memory concurrent scan workers can pour into
+/// server-controlled listing bodies. A worker that finds the ceiling full
+/// WAITS for another reservation to be released — legitimate scans at every
+/// thread count keep succeeding — and only fails closed after
+/// `INFLIGHT_LISTING_WAIT`, at which point the caller's existing error
+/// handling skips the directory or fails the action instead of buffering
+/// beyond the budget.
+fn reserve_inflight_listing(cancel: &AtomicBool) -> Result<InflightListingGuard, String> {
+    // The reservation covers the full envelope a listing can occupy: the
+    // raw body, its decoded form (worst case for UTF-16), and the parsed
+    // item state — three worst-case bodies per slot. The wait is bounded
+    // and CANCEL-AWARE: a parked worker wakes at least once a second and
+    // never outlives a user cancellation.
+    let want = 3 * MAX_LISTING_BODY_BYTES as usize;
+    let deadline = std::time::Instant::now() + INFLIGHT_LISTING_WAIT;
+    let mut current = INFLIGHT_LISTING_BYTES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("Operation canceled by user.".to_string());
+        }
+        if let Some(next) = current.checked_add(want) {
+            if next <= MAX_INFLIGHT_LISTING_BYTES {
+                *current = next;
+                return Ok(InflightListingGuard { reserved: want });
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "aggregate in-flight listing bytes stayed above {MAX_INFLIGHT_LISTING_BYTES} for {INFLIGHT_LISTING_WAIT:?}; too many pinned listing bodies"
+            ));
+        }
+        let slice = deadline.min(now + std::time::Duration::from_secs(1)) - now;
+        let (guard, _timeout) = match INFLIGHT_LISTING_ROOM.wait_timeout(current, slice) {
+            Ok(pair) => pair,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        current = guard;
+    }
+}
+
+/// The body String and the in-flight reservation that covers it: the guard
+/// MUST outlive the parse (the buffered body and the parser both work on it
+/// inside the reserved budget), so callers keep both bindings until the
+/// parsed items exist, then drop the guard.
+pub(crate) struct ListingBody {
+    pub(crate) body: String,
+    _inflight: InflightListingGuard,
+}
+
+/// Decodes a listing body per its XML BOM: UTF-16LE/BE (which the XML
+/// standard requires to carry a BOM) decode to UTF-8 in place, a UTF-8 BOM
+/// is stripped, and anything else must already be valid UTF-8. Charset-less
+/// guessing stays out on purpose: an undeclared non-BOM encoding fails
+/// closed rather than handing the server decoding control.
+fn decode_listing_body(mut bytes: Vec<u8>) -> Result<String, String> {
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        let big_endian = bytes[0] == 0xFE;
+        bytes.drain(..2);
+        if bytes.len() % 2 != 0 {
+            return Err("listing body is a truncated UTF-16 sequence".to_string());
+        }
+        // Incremental decode straight from the byte pairs — no intermediate
+        // u16 vector — with the decoded size capped BEFORE each push, so
+        // peak memory is raw body + decoded body and both are inside the
+        // reservation envelope.
+        let mut out = String::with_capacity(bytes.len());
+        let units = bytes
+            .chunks_exact(2)
+            .map(|p| {
+                if big_endian {
+                    u16::from_be_bytes([p[0], p[1]])
+                } else {
+                    u16::from_le_bytes([p[0], p[1]])
+                }
+            });
+        for unit in std::char::decode_utf16(units) {
+            let ch = unit.map_err(|e| format!("listing body is not valid UTF-16: {e}"))?;
+            if out.len() + ch.len_utf8() > MAX_LISTING_BODY_BYTES as usize {
+                return Err(format!(
+                    "listing body exceeds the {MAX_LISTING_BODY_BYTES} byte limit after decoding"
+                ));
+            }
+            out.push(ch);
+        }
+        return Ok(out);
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+    }
+    String::from_utf8(bytes).map_err(|e| format!("listing body is not valid UTF-8: {e}"))
+}
+
+/// Reads a server-controlled listing body with a hard byte cap and strict
+/// UTF-8 (fail closed). Unbounded buffering of a hostile response is a
+/// memory-exhaustion vector; the cap turns it into a listing failure.
+/// Non-UTF-8 bodies are rejected rather than charset-converted: XML
+/// listings default to UTF-8, and guessing a declared charset would hand
+/// the server influence over decoding, so exotic encodings fail loudly
+/// and the caller falls back (Depth: 1) or errors.
+pub(crate) fn read_listing_body<R: std::io::Read>(
+    cancel: &AtomicBool,
+    body: &mut R,
+) -> Result<ListingBody, String> {
+    // Hold the worst-case reservation for the whole read AND the parse that
+    // follows it, so concurrent workers cannot each buffer a full body past
+    // the shared ceiling.
+    let inflight = reserve_inflight_listing(cancel)?;
+    let mut limited = body.take(MAX_LISTING_BODY_BYTES + 1);
+    // Read bytes, then convert in place: read_to_string would double-buffer
+    // (a temporary String copy next to the internal Vec), briefly allocating
+    // ~2x the body while the reservation covers only 1x.
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("listing body read failed: {e}"))?;
+    if bytes.len() as u64 > MAX_LISTING_BODY_BYTES {
+        return Err(format!(
+            "listing body exceeds the {MAX_LISTING_BODY_BYTES} byte limit"
+        ));
+    }
+    let buf = decode_listing_body(bytes)?;
+    // The cap must also bind the DECODED form: UTF-16 -> UTF-8 can expand
+    // the text, and the budget is denominated in retained bytes.
+    if buf.len() as u64 > MAX_LISTING_BODY_BYTES {
+        return Err(format!(
+            "listing body exceeds the {MAX_LISTING_BODY_BYTES} byte limit after decoding"
+        ));
+    }
+    Ok(ListingBody { body: buf, _inflight: inflight })
 }
 
 /// Parses a WebDAV date string into a UNIX timestamp (seconds since epoch).
@@ -927,7 +1270,7 @@ pub fn parse_webdav_date(date_str: &str) -> Option<u64> {
 }
 
 /// Parses the WebDAV PROPFIND XML response into WebdavItem records.
-pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
+pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
     let mut items = Vec::new();
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -944,11 +1287,42 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
     let mut current_size: u64 = 0;
     let mut current_mtime: Option<u64> = None;
 
+    // A PROPFIND response is a single multistatus document. quick_xml only
+    // raises syntax errors; a body that never opens a multistatus root or
+    // one truncated after a complete child element still parses "fine", so
+    // the document shape is tracked here and enforced at EOF.
+    let mut depth: i64 = 0;
+    let mut saw_multistatus_root = false;
+
     let mut buf = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(ref e)) => {
+                if depth == 0 {
+                    // Fail closed on document shape: the first element must
+                    // be the multistatus root, and nothing may follow the
+                    // closed root — a response before or after the root is
+                    // not part of the document and must not inject items.
+                    if saw_multistatus_root {
+                        return Err(
+                            "malformed PROPFIND XML: content after the multistatus root"
+                                .to_string(),
+                        );
+                    }
+                    if !e
+                        .local_name()
+                        .as_ref()
+                        .eq_ignore_ascii_case(b"multistatus")
+                    {
+                        return Err(
+                            "malformed PROPFIND XML: root element is not multistatus"
+                                .to_string(),
+                        );
+                    }
+                    saw_multistatus_root = true;
+                }
+                depth += 1;
                 let local = e.local_name();
                 let name = local.as_ref();
                 if name.eq_ignore_ascii_case(b"response") {
@@ -975,6 +1349,28 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                 }
             }
             Ok(quick_xml::events::Event::Empty(ref e)) => {
+                if depth == 0 {
+                    // Same root-shape rules as Start: a self-closing element
+                    // at document level is either the multistatus root or an
+                    // error, never silent content before/after it.
+                    if saw_multistatus_root {
+                        return Err(
+                            "malformed PROPFIND XML: content after the multistatus root"
+                                .to_string(),
+                        );
+                    }
+                    if !e
+                        .local_name()
+                        .as_ref()
+                        .eq_ignore_ascii_case(b"multistatus")
+                    {
+                        return Err(
+                            "malformed PROPFIND XML: root element is not multistatus"
+                                .to_string(),
+                        );
+                    }
+                    saw_multistatus_root = true;
+                }
                 let local = e.local_name();
                 let name = local.as_ref();
                 if in_resourcetype && name.eq_ignore_ascii_case(b"collection") {
@@ -984,6 +1380,18 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
             Ok(quick_xml::events::Event::Text(ref e)) => {
                 if in_href {
                     if let Ok(text) = e.unescape() {
+                        // Cap BEFORE appending: the buffer must never
+                        // allocate past the limit, or one huge text node
+                        // amplifies parser state past the reservation.
+                        if current_href
+                            .len()
+                            .saturating_add(text.len())
+                            > MAX_REMOTE_HREF_BYTES
+                        {
+                            return Err(format!(
+                                "listing href exceeds the {MAX_REMOTE_HREF_BYTES} byte limit"
+                            ));
+                        }
                         current_href.push_str(&text);
                     }
                 } else if in_getcontentlength {
@@ -1006,6 +1414,15 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
             Ok(quick_xml::events::Event::CData(ref e)) => {
                 if in_href {
                     if let Ok(text) = std::str::from_utf8(e.as_ref()) {
+                        if current_href
+                            .len()
+                            .saturating_add(text.len())
+                            > MAX_REMOTE_HREF_BYTES
+                        {
+                            return Err(format!(
+                                "listing href exceeds the {MAX_REMOTE_HREF_BYTES} byte limit"
+                            ));
+                        }
                         current_href.push_str(text);
                     }
                 } else if in_getcontentlength {
@@ -1026,12 +1443,18 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                 }
             }
             Ok(quick_xml::events::Event::End(ref e)) => {
+                depth = depth.saturating_sub(1);
                 let local = e.local_name();
                 let name = local.as_ref();
                 if name.eq_ignore_ascii_case(b"response") {
                     in_response = false;
                     let clean_href = current_href.trim();
                     if !clean_href.is_empty() {
+                        if clean_href.len() > MAX_REMOTE_HREF_BYTES {
+                            return Err(format!(
+                                "listing href exceeds the {MAX_REMOTE_HREF_BYTES} byte limit"
+                            ));
+                        }
                         let is_dir = current_is_dir || clean_href.ends_with('/');
                         items.push(WebdavItem {
                             href: clean_href.to_string(),
@@ -1039,6 +1462,16 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                             size: current_size,
                             mtime: current_mtime,
                         });
+                        // An over-cap listing is refused outright: a
+                        // truncated Ok would let duplicate-padded responses
+                        // pass as complete (uniqueness is a caller concern
+                        // the parser cannot see), so overflow is an error
+                        // and every caller rejects the listing.
+                        if items.len() > MAX_REMOTE_ITEMS {
+                            return Err(format!(
+                                "listing exceeded the {MAX_REMOTE_ITEMS} item limit"
+                            ));
+                        }
                     }
                 } else if name.eq_ignore_ascii_case(b"href") {
                     in_href = false;
@@ -1054,18 +1487,38 @@ pub fn parse_propfind_xml(xml: &str) -> Vec<WebdavItem> {
                     in_iscollection = false;
                 }
             }
-            Ok(quick_xml::events::Event::Eof) => break,
-            Err(_) => break,
+            Ok(quick_xml::events::Event::Eof) => {
+                if !saw_multistatus_root {
+                    return Err(
+                        "malformed PROPFIND XML: no multistatus root element (empty or non-WebDAV body)"
+                            .to_string(),
+                    );
+                }
+                if depth != 0 {
+                    return Err(format!(
+                        "malformed PROPFIND XML: truncated body with {depth} unclosed element(s)"
+                    ));
+                }
+                break;
+            }
+            Err(e) => {
+                // A malformed document must fail the whole listing: callers
+                // treat the returned set as complete ground truth (sync
+                // upload/delete decisions, the listing cache). Silently
+                // returning the items parsed so far turns a broken response
+                // into a wrong-but-plausible listing.
+                return Err(format!("malformed PROPFIND XML: {e}"));
+            }
             _ => {}
         }
         buf.clear();
     }
 
-    items
+    Ok(items)
 }
 
 /// Simple percent decoder for URI path segments.
-fn decode_percent(s: &str) -> String {
+pub fn decode_percent(s: &str) -> String {
     let mut result = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -1132,6 +1585,118 @@ pub fn is_safe_relative_path(path: &str) -> bool {
     true
 }
 
+/// Creates the hidden, unpredictable temporary sibling a streamed download
+/// writes into before it replaces the destination. The name is fixed-form
+/// and target-independent (`.scs-part-<noise>`): the noise mixes OS-seeded
+/// randomness (`RandomState`), the clock, the pid, and a process-wide
+/// counter, and the file is opened with `create_new`, so the path is
+/// guaranteed not to exist before this call: no other file — a sibling the
+/// server listed, the destination itself, or another worker's temp — can be
+/// truncated by opening it, and cleanup only ever removes a file this call
+/// created. Creating the temp also requires write permission on the parent
+/// directory (the rename does too): a writable file inside a non-writable
+/// or sticky directory, which the old in-place truncate could write, now
+/// fails loudly before any byte is fetched.
+fn create_unique_part_file(target: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
+    use std::hash::{BuildHasher, Hasher};
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    // The replace must not widen what the old truncate path allowed: a
+    // read-only (or otherwise unwritable) destination failed loudly with
+    // File::create, and an atomic rename over it would silently succeed on
+    // a writable directory — so write access is probed up front. Non-regular
+    // destinations (directories, symlinks) are refused outright: the temp
+    // scheme replaces the name itself, not what it points at.
+    if let Ok(meta) = std::fs::symlink_metadata(target) {
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("download destination exists and is not a regular file: {}", target.display()),
+            ));
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(target)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "download destination {} is not writable: {e}",
+                        target.display()
+                    ),
+                )
+            })?;
+    }
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for attempt in 0..64u64 {
+        let mut noise = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        noise ^= noise << 13;
+        noise ^= noise >> 7;
+        noise ^= noise << 17;
+        noise ^= std::process::id() as u64;
+        noise ^= std::collections::hash_map::RandomState::new().build_hasher().finish();
+        noise ^= COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (attempt << 32);
+        // Fixed-form, target-independent name: embedding the target name
+        // would push long (valid) targets past the filesystem component
+        // limit, and the noise alone is both the uniqueness and the
+        // unguessability.
+        let candidate = dir.join(format!(".scs-part-{noise:016x}"));
+        // 0o600 at creation on Unix: there is no default-mode window at
+        // all, so no other local process can hold the partial body open.
+        // The prior target's mode is applied just before the rename below.
+        #[cfg(unix)]
+        let mut options = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true).mode(0o600);
+            o
+        };
+        #[cfg(not(unix))]
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(not(unix))]
+        options.write(true).create_new(true);
+        let file = match options.open(&candidate) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        return Ok((file, candidate));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no unique temporary sibling available after 64 attempts",
+    ))
+}
+
+/// Removes a partial temp file this call created, coping with a temp that
+/// ended up read-only. Clearing the read-only bit is a Windows-only
+/// fallback: on Unix, std's set_readonly(false) ORs the writable bits into
+/// the mode, which would widen a 0600 partial to group/other-writable just
+/// to delete it — a Unix removal failure is simply reported by doing
+/// nothing further (the hidden temp stays for the user, never the data).
+fn remove_part_file(temp: &Path) {
+    if std::fs::remove_file(temp).is_err() {
+        #[cfg(windows)]
+        {
+            let mut perms = std::fs::metadata(temp).map(|m| m.permissions());
+            if let Ok(p) = &mut perms {
+                p.set_readonly(false);
+                let _ = std::fs::set_permissions(temp, p.clone());
+                let _ = std::fs::remove_file(temp);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = temp;
+        }
+    }
+}
+
 /// Safely joins a relative path to a base directory, rejecting any path traversal attempts.
 pub fn safe_join_path(base: &Path, rel: &str) -> Result<PathBuf, String> {
     if !is_safe_relative_path(rel) {
@@ -1185,13 +1750,16 @@ pub fn relative_item_path(base_url: &str, item_href: &str) -> String {
         return String::new();
     }
 
-    // 2. Direct prefix match (case-insensitive)
+    // 2. Direct prefix match (case-insensitive). `split_at_checked` keeps the
+    // slice panic-free when a percent-decoded multi-byte character in the
+    // item path straddles the byte length of the base path.
     if trimmed_item.len() > trimmed_base.len() {
-        let (prefix, suffix) = trimmed_item.split_at(trimmed_base.len());
-        if prefix.eq_ignore_ascii_case(trimmed_base)
-            && (suffix.starts_with('/') || trimmed_base.is_empty())
-        {
-            return sanitize_relative_path(suffix);
+        if let Some((prefix, suffix)) = trimmed_item.split_at_checked(trimmed_base.len()) {
+            if prefix.eq_ignore_ascii_case(trimmed_base)
+                && (suffix.starts_with('/') || trimmed_base.is_empty())
+            {
+                return sanitize_relative_path(suffix);
+            }
         }
     }
 
@@ -1250,9 +1818,110 @@ fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
     )
 }
 
+/// True when `target_url`'s path lies strictly below the configured
+/// collection path of `remote_url` (exact-case; explicit default ports are
+/// absorbed by origin equality). Paths that could resolve to a different
+/// segment structure on the server — percent-encoded separators, dot
+/// segments, duplicate slashes — never qualify, and the collection itself is
+/// not an item target: only strict descendants pass.
+fn is_within_collection(remote_url: &str, target_url: &str) -> bool {
+    let (Ok(base), Ok(target)) = (reqwest::Url::parse(remote_url), reqwest::Url::parse(target_url))
+    else {
+        return false;
+    };
+    let (Some(base_segs), Some(target_segs)) = (
+        collection_path_segments(base.path()),
+        collection_path_segments(target.path()),
+    ) else {
+        return false;
+    };
+    if base_segs.is_empty() {
+        // Origin-root collection: any non-root, unambiguous same-origin
+        // path is a strict descendant — but the origin root itself ("/") is
+        // never a valid item target.
+        return !target_segs.is_empty();
+    }
+    // The decoded segments above only VALIDATE the path (no encoded
+    // separators, dot aliases, or duplicate slashes). The prefix comparison
+    // itself is byte-exact on the RAW spellings: a target like
+    // `COURSE12%33` decodes onto the configured `COURSE123`, but a server
+    // that treats the escape literally routes it to a sibling collection.
+    let base_raw = raw_path_segments(base.path());
+    let target_raw = raw_path_segments(target.path());
+    target_raw.len() > base_raw.len() && target_raw[..base_raw.len()] == base_raw[..]
+}
+
+/// Raw `/`-split non-empty segments with no decoding, aligned with
+/// `collection_path_segments` (which is still the validity gate: paths it
+/// rejects never reach this comparison).
+fn raw_path_segments(path: &str) -> Vec<&str> {
+    path.split('/').filter(|seg| !seg.is_empty()).collect()
+}
+
+/// Non-empty path segments, or `None` when the path is ambiguous. Segments
+/// are split on RAW '/' separators before decoding, so a percent-encoded
+/// separator can never shift a segment boundary: a segment that decodes to
+/// contain '/' or '\', an internal empty segment (duplicate slash), or any
+/// spelling that a server could normalize into a dot segment is rejected
+/// wholesale — servers may resolve any of those differently from this
+/// client, so they can never be proven inside the collection. The URL
+/// parser has already resolved literal dot segments, so anything dot-like
+/// that appears after decoding came from encoded or aliased forms, and
+/// decoding runs to a fixed point so double-encoded spellings (`%252e`) are
+/// caught in the same net as single-encoded ones.
+fn collection_path_segments(path: &str) -> Option<Vec<String>> {
+    let raw_segs: Vec<&str> = path.split('/').collect();
+    let last_idx = raw_segs.len() - 1;
+    let mut segs = Vec::with_capacity(raw_segs.len());
+    for (idx, raw) in raw_segs.iter().enumerate() {
+        let mut decoded = decode_percent(raw);
+        // Decode to a fixed point: a double-decoding server would resolve
+        // `%252e` one step further each pass, so every reachable spelling
+        // must be checked, not just the first decoding.
+        for _ in 0..8 {
+            let next = decode_percent(&decoded);
+            if next == decoded {
+                break;
+            }
+            decoded = next;
+        }
+        if decoded.contains('/') || decoded.contains('\\') || decoded.contains('\0') {
+            return None;
+        }
+        if decoded.is_empty() {
+            // The leading empty from an absolute path and the trailing
+            // empty from a collection's slash are fine; anything else is a
+            // duplicate slash, which servers may treat as distinct.
+            if idx != 0 && idx != last_idx {
+                return None;
+            }
+            continue;
+        }
+        if normalizes_to_dot_segment(&decoded) {
+            return None;
+        }
+        segs.push(decoded);
+    }
+    Some(segs)
+}
+
+/// True for segments a server could resolve to "." or "..": the literal dot
+/// segments themselves, and spellings whose trailing ASCII spaces/dots/NULs
+/// (which Windows/IIS-family servers trim, so "..%20" and "..." re-alias to
+/// dot segments) or path-parameter suffixes (servlet containers strip ";..."
+/// suffixes, so "..;" names the parent directory) collapse to a dot segment.
+fn normalizes_to_dot_segment(seg: &str) -> bool {
+    fn dot_ish(s: &str) -> bool {
+        let trimmed = s.trim_end_matches(&[' ', '.', '\0'][..]);
+        trimmed.is_empty() || trimmed == "." || trimmed == ".."
+    }
+    dot_ish(seg) || dot_ish(seg.split(';').next().unwrap_or(""))
+}
+
 /// Gate for any URL taken from a server response before it becomes a request:
-/// it must stay on the configured remote's origin and still pass the SSRF
-/// guard. Returns the user-facing reason when the URL must not be used.
+/// it must stay on the configured remote's origin, inside the configured
+/// collection, and still pass the SSRF guard. Returns the user-facing reason
+/// when the URL must not be used.
 ///
 /// Redirect targets never reach the transport: the in-repo `dav_client`
 /// builds its reqwest client with `redirect::Policy::none()`, so a 3xx sent
@@ -1261,6 +1930,9 @@ fn same_remote_origin(remote_url: &str, target_url: &str) -> bool {
 fn guard_server_derived_url(remote_url: &str, target_url: &str) -> Result<(), String> {
     if !same_remote_origin(remote_url, target_url) {
         return Err("href resolves outside the configured remote origin".to_string());
+    }
+    if !is_within_collection(remote_url, target_url) {
+        return Err("href resolves outside the configured collection directory".to_string());
     }
     validate_webdav_url(target_url)
 }
@@ -1299,14 +1971,95 @@ pub fn validate_webdav_url(url_str: &str) -> Result<(), String> {
 /// permitted in this process: unit tests, an explicit development override,
 /// or a configured live test server.
 pub(crate) fn insecure_webdav_allowed() -> bool {
-    cfg!(test)
-        || std::env::var("ALLOW_INSECURE_WEBDAV").as_deref() == Ok("1")
-        || std::env::var("TEST_WEBDAV_URL").is_ok()
+    cfg!(test) || std::env::var("ALLOW_INSECURE_WEBDAV").as_deref() == Ok("1")
+}
+
+/// Path-segment spellings the WHATWG URL parser collapses into dot segments
+/// (`.` removed, `..` pops the parent) even though they contain no literal
+/// `.` component: `%2e`, `.%2e`, `%2e.`, `%2e%2e` (ASCII case-insensitive).
+/// The collapse happens inside `Url::parse`, so the raw string this guard
+/// inspects is the only form where the original spelling is still visible.
+fn has_url_dot_segment(raw: &str) -> bool {
+    // Apply the WHATWG parser's input normalization first: it trims
+    // leading/trailing C0 control or space and removes all ASCII tab, LF,
+    // and CR anywhere in the input, so `https://h/base/..\n` reaches the
+    // parser as the segment `..`. The guard must examine that same
+    // normalized form, or the parent pop slips past the raw check.
+    let normalized: String = raw
+        .trim_matches(|c: char| (c as u32) <= 0x20)
+        .chars()
+        .filter(|&c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    // The scheme ends at the FIRST ':' only: a '://' inside the query or
+    // fragment must never be mistaken for the scheme delimiter (it would
+    // hide real dot segments or falsely reject query text as traversal).
+    // An optional '//' — or '\\' for special schemes — follows and is not
+    // part of the authority.
+    let after_scheme = match normalized.split_once(':') {
+        Some((_, rest)) => rest.trim_start_matches(['/', '\\']),
+        None => &normalized,
+    };
+    // A backslash directly after the authority is the path start too: the
+    // WHATWG parser accepts `\` as a path separator for special schemes, so
+    // `https://host\..\x` parses with a path of `/x` after the parent pop.
+    let path_start = after_scheme
+        .find(['/', '\\', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let path_and_rest = &after_scheme[path_start..];
+    let path = path_and_rest
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+    path.split(['/', '\\']).any(|seg| {
+        let s = seg.to_ascii_lowercase();
+        // Windows/IIS-family servers trim trailing ASCII spaces and dots
+        // (including the %20 spelling of space) from each path component, so
+        // a spelling like `.. `, `...`, or `..%20` resolves to a dot segment
+        // at the server even though the exact matches below do not see one:
+        // strip those suffixes first and reject anything that collapses to
+        // a dot form (or to nothing but dots and spaces).
+        // After the trailing trim, EVERY dot-form spelling — literal,
+        // mixed, or fully encoded ("%2e" is itself a trimmable suffix) —
+        // collapses to the empty check; nothing survives for exact matches.
+        let trimmed = trim_windows_alias_suffixes(&s);
+        (!s.is_empty() && trimmed.is_empty())
+            // Encoded separators can decode back into path separators
+            // server-side (a raw-concatenated `..%2fsecret` subdir), so a
+            // configured scope never carries them.
+            || s.contains("%2f")
+            || s.contains("%5c")
+    })
+}
+
+/// Strips any mix of trailing literal spaces, dots, and `%20` from a
+/// (lowercased) path segment: the per-component trim Windows-family servers
+/// apply before resolving the path.
+fn trim_windows_alias_suffixes(mut s: &str) -> &str {
+    // `s` arrives lowercased, so the encoded spellings need no case handling.
+    loop {
+        if s.ends_with(' ') || s.ends_with('.') {
+            s = &s[..s.len() - 1];
+        } else if let Some(stripped) = s.strip_suffix("%20").or_else(|| s.strip_suffix("%2e")) {
+            s = stripped;
+        } else {
+            return s;
+        }
+    }
 }
 
 pub fn validate_webdav_url_internal(url_str: &str, allow_insecure: bool) -> Result<(), String> {
     let url = reqwest::Url::parse(url_str)
         .map_err(|e| format!("Invalid WebDAV URL: {}", e))?;
+
+    // Reject dot-segment spellings in their raw form: `Url::parse` collapses
+    // `..`/`.%2e`/`%2e.`/`%2e%2e` path segments (and drops `%2e`), silently
+    // shifting the effective remote scope above the configured base path.
+    if has_url_dot_segment(url_str) {
+        return Err(
+            "URL path contains a dot-segment ('.', '..' or percent-encoded form) or an encoded path separator ('%2f'/'%5c') that would resolve above the configured directory."
+                .to_string(),
+        );
+    }
 
     // Reject credentials embedded in the URL itself (https://user:pass@host/):
     // the password would be persisted verbatim in the settings store, echoed
@@ -1739,12 +2492,34 @@ where
         },
     );
     match infinity_result {
-        Ok(res) => {
+        Ok(mut res) => {
             let status = res.status();
             if status.is_success() || status.as_u16() == 207 {
-                let body = res.text().unwrap_or_default();
-                let items: Vec<WebdavItem> = parse_propfind_xml(&body)
-                    .into_iter()
+                // A failed body read must not degrade into an empty listing:
+                // it flows through the same fallback as a malformed body, and
+                // the body itself is read through the bounded reader.
+                let parsed: Result<Vec<WebdavItem>, String> =
+                    read_listing_body(cancel_flag, &mut res)
+                    .and_then(|listing| {
+                        // Parse inside the reservation: the body and its
+                        // parse both belong to the in-flight budget.
+                        let parsed = parse_propfind_xml(&listing.body);
+                        drop(listing);
+                        parsed
+                    });
+                let items: Vec<WebdavItem> = match parsed {
+                    Ok(items) => items,
+                    Err(reason) => {
+                        // A malformed listing must not be treated as a
+                        // complete result: fall back to the Depth:1 traversal
+                        // below instead of trusting a partial parse.
+                        log(&format!(
+                            "{reason}; falling back to Depth: 1 traversal...\n"
+                        ));
+                        Vec::new()
+                    }
+                }
+                .into_iter()
                     // A Depth: infinity response is expanded server-side, so drop excluded
                     // folders, everything under them, and filtered files before they can be
                     // cached or used.
@@ -1754,6 +2529,8 @@ where
                             && extension_allowed(&rel, item.is_dir, extension_filter)
                     })
                     .collect();
+                // Per-listing item caps are enforced by the parser itself:
+                // an over-cap listing is a parse error on every path.
                 // Depth: infinity is only accepted if it returned child items (not just the root collection itself)
                 let child_count = items
                     .iter()
@@ -1795,8 +2572,9 @@ where
     if let Some(requested) = concurrency {
         set_scan_concurrency(requested);
     }
-    let remote_parsed = reqwest::Url::parse(remote_url)
-        .map_err(|e| format!("Invalid remote URL: {}", e))?;
+    // Kept for its validation side effect: an unparsable remote must fail the
+    // scan before any worker is spawned.
+    let _ = reqwest::Url::parse(remote_url).map_err(|e| format!("Invalid remote URL: {e}"))?;
 
     let root_visited_key = remote_url.trim_end_matches('/').to_ascii_lowercase();
     let mut initial_visited = HashSet::new();
@@ -1811,6 +2589,11 @@ where
         visited: HashSet<String>,
         seen_items: HashSet<(bool, String)>,
         all_items: Vec<WebdavItem>,
+        /// Retained bytes of every accepted href: a whole-scan budget next
+        /// to the per-listing item cap.
+        retained_listing_bytes: usize,
+        /// Items processed across all listings, duplicates included.
+        processed_listing_items: usize,
         scanned_count: usize,
         /// Directories whose listing kept failing after every retry and were skipped.
         skipped_dirs: Vec<String>,
@@ -1902,6 +2685,8 @@ where
         visited: initial_visited,
         seen_items: HashSet::new(),
         all_items: Vec::new(),
+        retained_listing_bytes: 0,
+        processed_listing_items: 0,
         scanned_count: 0,
         skipped_dirs: Vec::new(),
         error: None,
@@ -1929,7 +2714,6 @@ where
         scope: &'scope std::thread::Scope<'scope, 'env>,
         client: &'env Client,
         remote_url: &'env str,
-        remote_origin: reqwest::Url,
         cancel_flag: &'env AtomicBool,
         state_ref: &'env Mutex<ScanState>,
         cvar_ref: &'env Condvar,
@@ -1938,7 +2722,6 @@ where
         log_tx: mpsc::Sender<String>,
     ) {
         let worker_log_tx = log_tx;
-        let worker_remote_origin = remote_origin.origin();
         scope.spawn(move || {
             let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 loop {
@@ -2039,8 +2822,74 @@ where
                         return;
                     }
 
-                    let body = res.text().unwrap_or_default();
-                    let items = parse_propfind_xml(&body);
+                    let mut res = res;
+                    let listing = match read_listing_body(cancel_flag, &mut res) {
+                        Ok(listing) => listing,
+                        Err(reason) if reason.contains("canceled by user") => {
+                            return;
+                        }
+                        Err(reason) => {
+                            // A capacity timeout parks this directory only:
+                            // other workers keep scanning, and the slow
+                            // listing is reported as skipped rather than
+                            // aborting the whole action.
+                            if reason.contains("in-flight") {
+                                let mut state =
+                                    state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                                state.skipped_dirs.push(current_url.clone());
+                                drop(state);
+                                let _ = worker_log_tx.send(format!(
+                                    "[{}] WARNING: skipping {}: {}\n",
+                                    scan_idx, display_folder, reason
+                                ));
+                                continue;
+                            }
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.error = Some(format!("PROPFIND {current_url}: {reason}"));
+                            state.stopped = true;
+                            return;
+                        }
+                    };
+                    let items = match parse_propfind_xml(&listing.body) {
+                        Ok(items) => items,
+                        Err(reason) => {
+                            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                            state.error = Some(format!("PROPFIND {current_url}: {reason}"));
+                            state.stopped = true;
+                            return;
+                        }
+                    };
+                    // EVERY parsed item counts, excluded or not: a hostile
+                    // listing full of excluded entries must still burn the
+                    // processed budget, or the parse/filter work it forces
+                    // is unbounded.
+                    {
+                        let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                        state.processed_listing_items += items.len();
+                        if state.processed_listing_items > MAX_PROCESSED_LISTING_ITEMS {
+                            state.error = Some(format!(
+                                "Remote scan processed more than {MAX_PROCESSED_LISTING_ITEMS} listing items (excluded ones included). Aborting for security."
+                            ));
+                            state.stopped = true;
+                            return;
+                        }
+                    }
+                    // The in-flight reservation lives until end of scope:
+                    // the 0-children preview below still reads the body, and
+                    // releasing a moment later only delays, never exceeds,
+                    // the shared budget.
+                    if items.is_empty() {
+                        // A Depth: 1 listing always contains at least the
+                        // collection itself; zero responses means the body
+                        // was never a real listing and must not be trusted as
+                        // "directory is empty" ground truth for deletes.
+                        let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+                        state.error = Some(format!(
+                            "PROPFIND returned an empty multistatus for {current_url}"
+                        ));
+                        state.stopped = true;
+                        return;
+                    }
 
                     let mut children_in_dir = 0;
                     let mut new_dirs = 0;
@@ -2079,14 +2928,13 @@ where
                         children_in_dir += 1;
                         if item.is_dir {
                             new_dirs += 1;
-                            if let Ok(parsed_sub) = reqwest::Url::parse(&item_url) {
-                                if parsed_sub.origin() == worker_remote_origin
-                                    && !rel_from_root.is_empty()
-                                    && is_safe_relative_path(&rel_from_root)
-                                    && validate_webdav_url(&item_url).is_ok()
-                                {
-                                    discovered_sub_urls.push(item_url);
-                                }
+                            if same_remote_origin(remote_url, &item_url)
+                                && !rel_from_root.is_empty()
+                                && is_safe_relative_path(&rel_from_root)
+                                && validate_webdav_url(&item_url).is_ok()
+                                && is_within_collection(remote_url, &item_url)
+                            {
+                                discovered_sub_urls.push(item_url);
                             }
                             discovered_items.push(item);
                         } else {
@@ -2099,7 +2947,7 @@ where
                         // Char-based truncation: a fixed byte index can split a
                         // multi-byte UTF-8 code point in a server-controlled body,
                         // which panics and aborts the whole scan.
-                        let preview: String = body.chars().take(400).collect();
+                        let preview: String = listing.body.chars().take(400).collect();
                         let _ = worker_log_tx.send(format!(
                             "Notice: 0 items parsed from collection listing. Response preview:\n{}\n",
                             preview
@@ -2118,8 +2966,28 @@ where
                         }
 
                         for item in discovered_items {
+
                             let key = (item.is_dir, item.href.clone());
                             if state.seen_items.insert(key) {
+                                if state.all_items.len() >= MAX_REMOTE_ITEMS {
+                                    state.error = Some(format!(
+                                        "Remote listing exceeded the {MAX_REMOTE_ITEMS} item limit. Aborting for security."
+                                    ));
+                                    state.stopped = true;
+                                    return;
+                                }
+                                // Both retained copies count (all_items'
+                                // String and the seen_items key clone), plus
+                                // fixed per-entry container overhead.
+                                state.retained_listing_bytes +=
+                                    2 * item.href.len() + RETAINED_ITEM_OVERHEAD_BYTES;
+                                if state.retained_listing_bytes > MAX_RETAINED_LISTING_BYTES {
+                                    state.error = Some(format!(
+                                        "Remote listing retained bytes exceeded the {MAX_RETAINED_LISTING_BYTES} byte budget. Aborting for security."
+                                    ));
+                                    state.stopped = true;
+                                    return;
+                                }
                                 state.all_items.push(item);
                             }
                         }
@@ -2175,7 +3043,6 @@ where
                         s,
                         client,
                         remote_url,
-                        remote_parsed.clone(),
                         cancel_flag,
                         state_ref,
                         cvar_ref,
@@ -2229,6 +3096,89 @@ where
     ));
 
     Ok(std::mem::take(&mut state.all_items))
+}
+
+/// A remote folder paired with the total byte size of every file beneath it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RemoteFolder {
+    /// Slash-separated path relative to the listed collection; "" is the collection itself.
+    pub path: String,
+    /// Sum of file sizes anywhere beneath this folder (0 when it holds no files).
+    pub size: u64,
+}
+
+/// Aggregates a recursive listing of `remote_url` into one [`RemoteFolder`] per
+/// folder, sorted by path with the root first.
+///
+/// Each file's size is credited to the root and to every folder it is nested in;
+/// empty folders still appear with size 0; files themselves never appear.
+pub fn aggregate_remote_folders(remote_url: &str, items: &[WebdavItem]) -> Vec<RemoteFolder> {
+    // BTreeMap keeps output sorted by path, with "" (the root) first.
+    let mut sizes: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    sizes.entry(String::new()).or_insert(0);
+    for item in items {
+        let rel = relative_item_path(remote_url, &item.href);
+        let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            continue;
+        }
+        if item.is_dir {
+            // Register the folder (and, defensively, every ancestor).
+            let mut acc = String::new();
+            for segment in &segments {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(segment);
+                sizes.entry(acc.clone()).or_insert(0);
+            }
+        } else {
+            // Credit the root and every ancestor folder; never the file itself.
+            *sizes.entry(String::new()).or_insert(0) += item.size;
+            let mut acc = String::new();
+            for segment in &segments[..segments.len() - 1] {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(segment);
+                *sizes.entry(acc.clone()).or_insert(0) += item.size;
+            }
+        }
+    }
+    sizes
+        .into_iter()
+        .map(|(path, size)| RemoteFolder { path, size })
+        .collect()
+}
+
+/// Lists every folder beneath `remote_url` with its aggregated size, using the
+/// shared recursive listing machinery (retries, worker pool, listing cache).
+///
+/// Exclusions are deliberately not applied so already-excluded folders stay
+/// visible and selectable in the picker this feeds. Only PROPFIND metadata is
+/// requested — no file contents are ever downloaded.
+pub fn list_remote_folders<F>(
+    client: &Client,
+    remote_url: &str,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
+    auth_user: Option<&str>,
+    log: F,
+) -> Result<Vec<RemoteFolder>, String>
+where
+    F: FnMut(&str),
+{
+    let items = list_remote_recursive_with_exclusions_and_log(
+        client,
+        remote_url,
+        cancel_flag,
+        concurrency,
+        auth_user,
+        true,
+        &[],
+        log,
+    )?;
+    Ok(aggregate_remote_folders(remote_url, &items))
 }
 
 /// Extracts modification time from std::fs::Metadata as UNIX timestamp (seconds).
@@ -2968,8 +3918,17 @@ where
             if !res.status().is_success() && res.status().as_u16() != 207 {
                 return Err(format!("Server returned HTTP {}", res.status()));
             }
-            let body = res.text().unwrap_or_default();
-            let items = parse_propfind_xml(&body);
+            let mut res = res;
+            let listing = read_listing_body(cancel_flag, &mut res)?;
+            let items = parse_propfind_xml(&listing.body)?;
+            drop(listing);
+            // Per-listing item caps are enforced by the parser itself.
+            if items.is_empty() {
+                return Err(
+                    "PROPFIND returned an empty multistatus (no resources, not even the collection)"
+                        .to_string(),
+                );
+            }
             let mut count = 0;
             for item in &items {
                 if !item.is_dir {
@@ -3257,46 +4216,180 @@ where
                                 "GET {download_url} returned HTTP {status}"
                             )));
                         }
-                        // Recreate the file on every attempt so a retried download never appends
-                        // to bytes left behind by a timed-out body stream.
-                        let mut dest_file = std::fs::File::create(&target_file).map_err(|e| {
-                            AttemptError::Fatal(format!(
-                                "Failed to create {}: {}",
-                                target_file.display(),
-                                e
-                            ))
-                        })?;
-                        let mut limited_reader = std::io::Read::take(get_res, max_size + 1);
-                        let written =
-                            std::io::copy(&mut limited_reader, &mut dest_file).map_err(|e| {
-                                classify_io_error(&format!("streaming GET {download_url}"), &e)
+                        // Stream to a hidden, unpredictable temporary sibling
+                        // and replace the destination only after the body
+                        // completed: File::create would truncate the user's
+                        // existing copy before the first body byte arrives,
+                        // and a PREDICTABLE temp name could collide with a
+                        // real sibling file (a hostile listing can contain
+                        // `foo.scs-part-<pid>`) and truncate/delete that
+                        // instead. create_new guarantees the path did not
+                        // exist, so cleanup only ever removes this call's own
+                        // file — every failure exit below does exactly that,
+                        // because the random name cannot be recomputed later.
+                        let (mut dest_file, temp_file) = create_unique_part_file(&target_file)
+                            .map_err(|e| {
+                                AttemptError::Fatal(format!(
+                                    "Failed to create a temporary sibling of {}: {}",
+                                    target_file.display(),
+                                    e
+                                ))
                             })?;
+                        let mut limited_reader = std::io::Read::take(get_res, max_size + 1);
+                        // Manual copy loop: io::copy neither observes the
+                        // cancel flag nor any whole-body deadline, and each
+                        // blocking read gets a fresh 30s window from reqwest,
+                        // so a slow-drip body would hang the attempt forever.
+                        // One read parked inside reqwest can still delay the
+                        // checks below by at most that per-read timeout; the
+                        // deadline bounds every other stretch of the transfer.
+                        let body_deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(get_download_body_timeout_secs());
+                        let mut buffer = [0u8; 65536];
+                        let mut written: u64 = 0;
+                        loop {
+                            if cancel_flag.load(Ordering::SeqCst) {
+                                // The outer error path checks the flag again
+                                // and ends the operation as a user
+                                // cancellation; this exit owns the temp file.
+                                drop(dest_file);
+                                remove_part_file(&temp_file);
+                                return Err(AttemptError::Fatal(
+                                    "Operation canceled by user.".to_string(),
+                                ));
+                            }
+                            if std::time::Instant::now() >= body_deadline {
+                                drop(dest_file);
+                                remove_part_file(&temp_file);
+                                return Err(AttemptError::Fatal(format!(
+                                    "Download body exceeded the {}s time limit",
+                                    get_download_body_timeout_secs()
+                                )));
+                            }
+                            use std::io::Read as _;
+                            match limited_reader.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if let Err(e) = dest_file.write_all(&buffer[..n]) {
+                                        // Close before remove so Windows can
+                                        // delete this call's own temp file.
+                                        drop(dest_file);
+                                        remove_part_file(&temp_file);
+                                        return Err(classify_io_error(
+                                            &format!("writing GET {download_url}"),
+                                            &e,
+                                        ));
+                                    }
+                                    written += n as u64;
+                                    if written > max_size {
+                                        break;
+                                    }
+                                }
+                                // io::copy retried EINTR reads; keep that
+                                // contract so a signal does not fail an
+                                // otherwise healthy transfer.
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                                Err(e) => {
+                                    drop(dest_file);
+                                    remove_part_file(&temp_file);
+                                    return Err(classify_io_error(
+                                        &format!("streaming GET {download_url}"),
+                                        &e,
+                                    ));
+                                }
+                            }
+                        }
+                        use std::io::Write as _;
                         if written > max_size {
                             drop(dest_file);
-                            let _ = std::fs::remove_file(&target_file);
+                            remove_part_file(&temp_file);
                             return Err(AttemptError::Fatal(format!(
                                 "Downloaded file exceeded the maximum size limit ({} bytes > {} bytes)",
                                 written, max_size
                             )));
                         }
+                        // The listing advertised a length: a body that ends
+                        // cleanly but SHORT (a hostile chunked response does
+                        // exactly that) must not replace the prior file with
+                        // truncated content. A LONGER body is accepted — the
+                        // remote file may legitimately have grown since the
+                        // listing — and an unknown/zero advertised size skips
+                        // the comparison entirely.
+                        if item.size > 0 && written < item.size as u64 {
+                            drop(dest_file);
+                            remove_part_file(&temp_file);
+                            return Err(AttemptError::Fatal(format!(
+                                "Downloaded {} bytes but the listing advertised {} for {download_url}",
+                                written, item.size
+                            )));
+                        }
+                        // The replaced file keeps the prior file's Unix
+                        // OWNER mode bits, applied only now, after the body
+                        // is fully written, so a read-only mode can never
+                        // block the stream. Known regression vs the
+                        // old truncate-in-place path, documented in the PR:
+                        // an atomic rename swaps the inode, so owner/group,
+                        // xattrs, POSIX ACLs, and Windows security
+                        // descriptors are NOT carried over (the old
+                        // File::create wrote into the SAME inode and kept
+                        // them). Mode bits are what std can preserve without
+                        // platform-specific metadata APIs. New downloads
+                        // (no prior file) intentionally land 0600: private
+                        // by default, instead of the umask default.
+                        #[cfg(unix)]
+                        if let Ok(prior) = std::fs::symlink_metadata(&target_file) {
+                            // Only a still-regular destination contributes a
+                            // mode: anything swapped in mid-flight (a symlink
+                            // would carry 0777) must not widen the temp.
+                            if prior.is_file() {
+                                let mode = {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    // Owner bits only: the replace loses the
+                                    // original group/owner, so keeping
+                                    // group/other bits would grant them to
+                                    // whoever the new group happens to be.
+                                    std::fs::Permissions::from_mode(
+                                        prior.permissions().mode() & 0o700,
+                                    )
+                                };
+                                // Handle-based: a path-based chmod would
+                                // follow a symlink swapped onto the temp
+                                // path; the open handle cannot be swapped.
+                                dest_file.set_permissions(mode).map_err(
+                                    |e| {
+                                        remove_part_file(&temp_file);
+                                        AttemptError::Fatal(format!(
+                                            "Failed to apply the prior file's permissions to {}: {e}",
+                                            temp_file.display()
+                                        ))
+                                    },
+                                )?;
+                            }
+                        }
+                        // Atomic replace: the destination is only ever touched
+                        // with a complete, size-checked body. std's rename
+                        // replaces an existing destination file on Windows as
+                        // well (MoveFileExW with MOVEFILE_REPLACE_EXISTING).
+                        drop(dest_file);
+                        std::fs::rename(&temp_file, &target_file).map_err(|e| {
+                            remove_part_file(&temp_file);
+                            AttemptError::Fatal(format!(
+                                "Failed to finalize {}: {}",
+                                target_file.display(),
+                                e
+                            ))
+                        })?;
                         Ok(written)
                     },
                 );
                 let downloaded_len = match download_result {
                     Ok(len) => len,
                     Err(e) => {
-                        // Never leave a truncated partial behind after the final attempt.
-                        if let Err(remove_err) = std::fs::remove_file(&target_file) {
-                            if remove_err.kind() != std::io::ErrorKind::NotFound {
-                                log(&format!(
-                                    "[{}/{}] WARNING: Could not remove partial download {}: {}\n",
-                                    current_num,
-                                    total_files,
-                                    target_file.display(),
-                                    remove_err
-                                ));
-                            }
-                        }
+                        // Never leave a partial behind after the final
+                        // attempt: every attempt already removed its own
+                        // temp sibling on failure, and the destination was
+                        // never touched, so the prior local file survives a
+                        // failed download as-is.
                         if cancel_flag.load(Ordering::SeqCst) {
                             log("Operation canceled by user.\n");
                             return Ok(());
@@ -3688,7 +4781,7 @@ mod tests {
             </D:response>
         </D:multistatus>"#;
 
-        let items = parse_propfind_xml(sample);
+        let items = parse_propfind_xml(sample).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].href, "/files/myuser/docs/");
         assert!(items[0].is_dir);
@@ -3774,7 +4867,7 @@ mod tests {
             </D:Response>
         </D:multistatus>"#;
 
-        let items = parse_propfind_xml(xml);
+        let items = parse_propfind_xml(xml).unwrap();
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].href, "/content/enforced/1052175-dev_asteve18/");
         assert!(items[0].is_dir);
@@ -3892,7 +4985,7 @@ mod tests {
 </d:multistatus>"#;
 
         let base = "https://courselinkdav.desire2learn.com/content/enforced/1052175-dev_asteve18/";
-        let items = parse_propfind_xml(xml);
+        let items = parse_propfind_xml(xml).unwrap();
         assert_eq!(items.len(), 5);
 
         // Item 0: Root collection
@@ -4014,6 +5107,611 @@ mod tests {
 
         // In test / dev mode (allow_insecure = true):
         assert!(validate_webdav_url_internal("http://127.0.0.1:3923/content/", true).is_ok());
+    }
+
+    #[test]
+    fn test_relative_item_path_multibyte_char_boundary_is_panic_free() {
+        // decode_percent turns server hrefs into multi-byte UTF-8; splitting
+        // the item path at the byte length of the base path must never land
+        // inside a character (panic -> whole operation aborts via JoinError).
+        let base = "https://h.example/dav/";
+        // '/aaéx' decodes from '/aa%C3%A9x': byte index 4 of the item path
+        // lands inside the 2-byte 'é' when the base path is '/dav' (len 4).
+        let rel = relative_item_path(base, "/aa%C3%A9x");
+        assert!(rel.is_empty() || is_safe_relative_path(&rel) || !is_safe_relative_path(&rel));
+        // No panic is the invariant; exercise a sweep of lengths.
+        for n in 1..12 {
+            let item = format!("/{}%C3%A9x", "a".repeat(n));
+            let _ = relative_item_path(base, &item);
+        }
+    }
+
+    /// Serializes the tests that touch the shared in-flight budget or the
+    /// bounded reader, so a parallel `cargo test` cannot interleave them.
+    static LISTING_BUDGET_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_listing_body_is_byte_bounded() {
+        let _guard = LISTING_BUDGET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // Server-controlled listing bodies must never be buffered without a
+        // bound: a response larger than the cap is an error, not a String.
+        let over: String = "x".repeat(MAX_LISTING_BODY_BYTES as usize + 1);
+        let mut cursor = std::io::Cursor::new(over.into_bytes());
+        assert!(read_listing_body(&AtomicBool::new(false), &mut cursor).is_err());
+
+        let under: String = "x".repeat(1024);
+        let mut cursor = std::io::Cursor::new(under.clone().into_bytes());
+        assert_eq!(read_listing_body(&AtomicBool::new(false), &mut cursor).unwrap().body, under);
+
+        // Invalid UTF-8 is a read error (fail closed), not lossy acceptance.
+        let mut cursor = std::io::Cursor::new(vec![0xff, 0xfe, 0x00]);
+        assert!(read_listing_body(&AtomicBool::new(false), &mut cursor).is_err());
+    }
+
+    #[test]
+    fn test_cache_key_does_not_fold_url_path_case() {
+        // URL paths are case-sensitive (RFC 3986 6.2.2.1): two collections
+        // differing only in path case are distinct remotes and must never
+        // share a listing-cache entry (a shared entry steers sync's
+        // delete set at the wrong collection).
+        assert_ne!(
+            cache_key("https://h.example/dav/A/", Some("u")),
+            cache_key("https://h.example/dav/a/", Some("u"))
+        );
+        // Scheme and host remain case-insensitive by URL grammar.
+        assert_eq!(
+            cache_key("https://H.EXAMPLE/dav/A/", Some("u")),
+            cache_key("https://h.example/dav/A/", Some("u"))
+        );
+        // Host case folding must not leak into the path.
+        assert_ne!(
+            cache_key("https://h.example/dav/A/", Some("u")),
+            cache_key("https://H.example/dav/a/", Some("u"))
+        );
+    }
+
+    #[test]
+    fn test_validate_webdav_url_rejects_parser_normalized_traversal() {
+        // Url::parse trims C0 control/space at both ends and drops ASCII
+        // tab/LF/CR anywhere, so these raw spellings reach the parser as a
+        // parent-pop `..` (or encoded `%2e%2e`) segment even though the raw
+        // string never contains one literally. The error message pins the
+        // rejection to the dot-segment guard.
+        for raw in [
+            "https://courselinkdav.desire2learn.com/base/..\n",
+            "https://courselinkdav.desire2learn.com/base/.. ",
+            "https://courselinkdav.desire2learn.com/base/.\t.",
+            "https://courselinkdav.desire2learn.com/base/\n..",
+            "https://courselinkdav.desire2learn.com/base/%2e%2e\n",
+        ] {
+            let err = validate_webdav_url_internal(raw, false).unwrap_err();
+            assert!(
+                err.contains("dot-segment"),
+                "{raw:?} must be rejected as a dot-segment, got: {err}"
+            );
+        }
+        // Encoded separators decode back into path separators server-side,
+        // so a configured scope never carries them.
+        for raw in [
+            "https://courselinkdav.desire2learn.com/dav/..%2fsecret",
+            "https://courselinkdav.desire2learn.com/dav/..%5csecret",
+        ] {
+            let err = validate_webdav_url_internal(raw, false).unwrap_err();
+            assert!(
+                err.contains("encoded path separator"),
+                "{raw} must be rejected as an encoded separator, got: {err}"
+            );
+        }
+        // Edge whitespace alone is normalized away and stays accepted.
+        assert!(validate_webdav_url_internal(
+            "  https://courselinkdav.desire2learn.com/dav/my%20course  ",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_rejects_backslash_after_authority() {
+        // The WHATWG parser treats a backslash as a path separator for
+        // special schemes, so `https://host\..\x` parses with a path of
+        // `/x` after the parent pop. The guard must recognize the backslash
+        // as the path start rather than part of the authority, or the
+        // traversal escapes the configured scope unseen. The error message
+        // pins the rejection to the dot-segment guard itself.
+        for raw in [
+            r"https://courselinkdav.desire2learn.com\..\secret",
+            r"https://courselinkdav.desire2learn.com:8443\..\secret",
+            r"https://courselinkdav.desire2learn.com\%2e%2e/secret",
+            r"https://courselinkdav.desire2learn.com\.\secret",
+        ] {
+            let err = validate_webdav_url_internal(raw, false).unwrap_err();
+            assert!(
+                err.contains("dot-segment"),
+                "{raw} must be rejected as a dot-segment, got: {err}"
+            );
+        }
+        // A backslash separating ordinary segments is a path separator, not
+        // a traversal, and stays accepted.
+        assert!(validate_webdav_url_internal(
+            r"https://courselinkdav.desire2learn.com\dav\",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_webdav_url_rejects_encoded_dot_segments() {
+        // The WHATWG URL parser treats these path segments as double-dot
+        // segments and pops the parent directory, so a literal '.'/'..'
+        // check never sees them: the remote scope would silently shift
+        // above the configured base path.
+        for path in [
+            "/dav/%2e%2e/",
+            "/dav/.%2e/",
+            "/dav/%2e./",
+            "/dav/notes/%2e%2e",
+            "/dav/%2E%2E/",
+        ] {
+            assert!(
+                validate_webdav_url_internal(&format!("https://courselinkdav.desire2learn.com{path}"), false).is_err(),
+                "encoded dot-dot path segment must be rejected: {path}"
+            );
+        }
+        // The encoded single-dot form is silently dropped by the same rule.
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/%2e", false).is_err());
+        // Ordinary percent-encoded characters stay allowed.
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/my%20course/", false).is_ok());
+    }
+
+    #[test]
+    fn test_has_url_dot_segment_splits_scheme_only_at_the_first_colon() {
+        // A '://' inside the query or fragment must never be mistaken for
+        // the scheme delimiter: the first form hides a real dot segment,
+        // the second buries traversal-looking text in the query where the
+        // parser puts it.
+        assert!(
+            has_url_dot_segment("https:host/..?x=://"),
+            "dot segments before a query-borne '://' must still be caught"
+        );
+        assert!(
+            !has_url_dot_segment("https:host?x=://../.."),
+            "traversal-looking QUERY text is not a path dot segment"
+        );
+        assert!(has_url_dot_segment("https://h.example/dav/../x"));
+        assert!(!has_url_dot_segment("https://h.example/dav/x?return=https://other/p"));
+    }
+
+    #[test]
+    fn test_validate_webdav_url_rejects_windows_trim_dot_aliases() {
+        // Windows/IIS-family servers strip trailing ASCII spaces and dots
+        // (including their %20 spelling) from each path component, so these
+        // alias onto "." / ".." at resolve time even though an exact-match
+        // dot check passes them. The trailing trim must also strip %2e:
+        // `..%20%2e` decodes to `.. .` and trims to `..`.
+        for path in [
+            "/dav/.. /",
+            "/dav/.../",
+            "/dav/..%20/",
+            "/dav/. /",
+            "/dav/notes/..%20/x",
+            "/dav/..%20%2e/",
+            "/dav/..%2e/",
+            "/dav/notes/..%2E/x",
+            "/dav/%2e%2e%2e/",
+        ] {
+            assert!(
+                validate_webdav_url_internal(&format!("https://courselinkdav.desire2learn.com{path}"), false).is_err(),
+                "windows-trim dot alias must be rejected: {path}"
+            );
+        }
+        // A name that merely ends in a dot — literal or encoded — is not a
+        // dot segment.
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/report./", false).is_ok());
+        assert!(validate_webdav_url_internal("https://courselinkdav.desire2learn.com/dav/report%2e/", false).is_ok());
+    }
+
+    #[test]
+    fn test_build_remote_url_scope_cannot_escape_via_encoded_subdir() {
+        // build_remote_url concatenates the user-supplied subdir into the
+        // remote URL; the guard must reject the result before any request.
+        for subdir in ["%2e%2e", "notes/.%2e", "notes/%2e%2e/sub"] {
+            let url = build_remote_url("https://courselinkdav.desire2learn.com/content/enforced/1234", subdir);
+            assert!(
+                validate_webdav_url_internal(&url, false).is_err(),
+                "subdir {subdir:?} must not shift the remote scope"
+            );
+        }
+        let url = build_remote_url("https://courselinkdav.desire2learn.com/content/enforced/1234", "notes");
+        assert!(validate_webdav_url_internal(&url, false).is_ok());
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_rejects_malformed_tail() {
+        // A malformed tail must fail the whole listing, not silently return
+        // the items parsed so far: sync treats the returned set as ground
+        // truth (files missing from it get re-uploaded unconditionally, and
+        // the truncated set is cached for 24h).
+        let body = concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?>",
+            "<D:multistatus xmlns:D=\"DAV:\">",
+            "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+            "<D:response><D:href>/c/b.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+            "<D:response><D:href>/c/c.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:respo",
+        );
+        let parsed = parse_propfind_xml(body);
+        assert!(
+            parsed.is_err(),
+            "malformed XML tail must be an error, not a silent 2-item listing"
+        );
+        // Complete only the truncated tail. Appending — instead of replacing
+        // "</D:respo", which also matches inside the first two blocks'
+        // "</D:response>" close tags — leaves the well-formed responses
+        // untouched.
+        let ok_body = format!("{body}nse></D:multistatus>");
+        assert_eq!(parse_propfind_xml(&ok_body).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_requires_multistatus_root() {
+        // An empty body (e.g. a defaulted body read) or well-formed
+        // non-multistatus XML (proxied HTML error pages) must not parse as
+        // an empty-but-complete listing: callers treat Ok(vec![]) as ground
+        // truth and act on everything "missing" from it.
+        assert!(
+            parse_propfind_xml("").is_err(),
+            "empty body must be an error, not an empty listing"
+        );
+        assert!(
+            parse_propfind_xml("<html><body><h1>404 Not Found</h1></body></html>").is_err(),
+            "well-formed non-multistatus XML must be an error"
+        );
+        assert!(
+            parse_propfind_xml(
+                "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>\
+                 <D:resourcetype/></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+                 </D:propstat></D:response>"
+            )
+            .is_err(),
+            "response without a multistatus root must be an error"
+        );
+        // Elements BEFORE the root are not part of the document: a response
+        // ahead of a real multistatus root must fail the parse outright, not
+        // inject its items into the listing.
+        assert!(
+            parse_propfind_xml(
+                "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>\
+                 <D:resourcetype/></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+                 </D:propstat></D:response>\
+                 <D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/c/b.txt</D:href>\
+                 <D:propstat><D:prop><D:resourcetype/></D:prop>\
+                 <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+                 </D:multistatus>"
+            )
+            .is_err(),
+            "a response before the multistatus root must be an error"
+        );
+        // Nothing may follow the closed root either.
+        assert!(
+            parse_propfind_xml(
+                "<D:multistatus xmlns:D=\"DAV:\"></D:multistatus><D:multistatus xmlns:D=\"DAV:\"/>"
+            )
+            .is_err(),
+            "a second root after the closed multistatus must be an error"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_keeps_query_distinct() {
+        // Queries select distinct collections on query-aware WebDAV
+        // endpoints (share tokens, tenants), so they must partition the
+        // key; the path's insignificant trailing slash must not.
+        assert_ne!(
+            cache_key("https://h.example/dav?share=a", Some("u")),
+            cache_key("https://h.example/dav?share=b", Some("u"))
+        );
+        assert_ne!(
+            cache_key("https://h.example/dav/?share=a", Some("u")),
+            cache_key("https://h.example/dav?share=a", Some("u")),
+            "the trailing slash is part of the collection identity"
+        );
+        assert_eq!(
+            cache_key("https://h.example/dav?share=a", Some("u")),
+            cache_key("https://h.example/dav?share=a", Some("u"))
+        );
+    }
+
+    #[test]
+    fn test_inflight_listing_budget_bounds_concurrent_bodies() {
+        let _guard = LISTING_BUDGET_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // The per-body cap alone would let MAX_SCAN_CONCURRENCY workers each
+        // buffer a full MAX_LISTING_BODY_BYTES body (~4 GiB aggregate) before
+        // any aggregate check runs: every listing read reserves its worst
+        // case against a shared ceiling. A worker that finds the ceiling
+        // full WAITS for capacity (scans at every thread count must still
+        // succeed) and only fails closed once the wait budget is exhausted.
+        let max_guards = MAX_INFLIGHT_LISTING_BYTES / (3 * MAX_LISTING_BODY_BYTES as usize);
+        let mut held: Vec<InflightListingGuard> = Vec::new();
+        for _ in 0..max_guards {
+            held.push(
+                reserve_inflight_listing(&AtomicBool::new(false))
+                    .expect("reservation within the ceiling must succeed"),
+            );
+        }
+        // Ceiling full: a waiter must park instead of failing or overbooking.
+        let waiter = std::thread::spawn(|| reserve_inflight_listing(&AtomicBool::new(false)).is_ok());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !waiter.is_finished(),
+            "a waiter must block while the ceiling is full"
+        );
+        // Releasing one reservation must admit the waiter.
+        drop(held.pop().expect("guards held"));
+        assert!(
+            waiter.join().expect("waiter must not panic"),
+            "the waiter must acquire after a release"
+        );
+        drop(held);
+        assert!(
+            reserve_inflight_listing(&AtomicBool::new(false)).is_ok(),
+            "released reservations must be reusable"
+        );
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_rejects_truncation_after_complete_response() {
+        // quick_xml raises no syntax error for XML that simply stops after a
+        // complete </D:response>: unclosed ancestors are only detectable at
+        // EOF, so the parser must track element depth itself.
+        let body = concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?>",
+            "<D:multistatus xmlns:D=\"DAV:\">",
+            "<D:response><D:href>/c/a.txt</D:href><D:propstat><D:prop>",
+            "<D:resourcetype/><D:getcontentlength>3</D:getcontentlength>",
+            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+        );
+        let parsed = parse_propfind_xml(body);
+        assert!(
+            parsed.is_err(),
+            "truncation after a complete response must be an error, not a 1-item listing"
+        );
+        let ok_body = format!("{body}</D:multistatus>");
+        assert_eq!(parse_propfind_xml(&ok_body).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_guard_server_derived_url_bounds_targets_to_the_collection() {
+        // The user confirms an action for ONE collection (base_url + subdir).
+        // A server-advertised href may point anywhere on the same origin; the
+        // guard must refuse to let it steer authenticated DELETE/GET outside
+        // the configured collection.
+        let base = "https://h.example/content/enforced/COURSE123/";
+        assert!(
+            guard_server_derived_url(base, "https://h.example/othercourse/file.txt").is_err(),
+            "same-origin out-of-collection href must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "/othercourse/file.txt").is_err(),
+            "relative out-of-collection href must be refused"
+        );
+        // Strict descendants only: the collection itself is never a valid
+        // item-level request target, and case-folded spellings name a
+        // different collection on case-sensitive servers.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/").is_err(),
+            "the collection root itself must not pass as an item target"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/Content/Enforced/course123/notes/a.txt").is_err(),
+            "case-folded hrefs must not match the configured collection"
+        );
+        // Encoded separators and dot segments must not create segment
+        // boundaries the guard would trust.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123%2F..%2Fothercourse/file.txt").is_err(),
+            "percent-encoded separators decoding into traversal must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%2f..%2fothercourse/file.txt").is_err(),
+            "encoded dot segments must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/sub%5C..%5Cothercourse/file.txt").is_err(),
+            "encoded backslash traversal must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/%2e%2e/othercourse/file.txt").is_err(),
+            "encoded dot-dot segments must be refused"
+        );
+        // Even a non-dot encoded separator stays inside one raw segment and
+        // is rejected: a server that does not decode %2F would route it to a
+        // different path than the one compared here.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/notes%2Fextra.txt").is_err(),
+            "encoded separators must never be treated as segment boundaries"
+        );
+        // Duplicate slashes may name a different path on the server.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123//file.txt").is_err(),
+            "duplicate slashes must be refused as ambiguous"
+        );
+        // Dot-segment aliases that normalizing servers collapse: servlet
+        // path parameters (";..."), Windows-style trailing space/dot
+        // trimming, and embedded NULs.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%20/othercourse/file.txt").is_err(),
+            "trailing-space dot segments must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%3B/othercourse/file.txt").is_err(),
+            "path-parameter dot aliases must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/..%00/othercourse/file.txt").is_err(),
+            "NUL-terminated dot segments must be refused"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/.../othercourse/file.txt").is_err(),
+            "trailing-dot aliases of dot segments must be refused"
+        );
+        // In-collection targets still pass: deeper exact-case paths, explicit
+        // default port, and percent-encoded ordinary characters.
+        assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/notes/a.txt").is_ok());
+        assert!(guard_server_derived_url(base, "https://h.example:443/content/enforced/COURSE123/a.txt").is_ok());
+        assert!(guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/my%20file.txt").is_ok());
+        // A legitimate name that merely ENDS in a dot or space is not a dot
+        // segment: only spellings whose trailing-trimmed remainder collapses
+        // to "", ".", or ".." can re-alias onto a dot segment.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/report./a.txt").is_ok(),
+            "trailing-dot file names must not be rejected as dot aliases"
+        );
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/note%20file.txt").is_ok(),
+            "in-segment spaces are ordinary characters"
+        );
+        // Encoded spellings that DECODE onto the collection name must not
+        // match it: a server that treats `%33` literally routes the request
+        // to a sibling collection, so the prefix comparison is byte-exact on
+        // the raw segments.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE12%33/file.txt").is_err(),
+            "an encoded alias of the collection name must not match the collection"
+        );
+        // Double-encoded dot segments decode to `..` on a double-decoding
+        // server and must be rejected before that can happen.
+        assert!(
+            guard_server_derived_url(base, "https://h.example/content/enforced/COURSE123/%252e%252e/othercourse/file.txt").is_err(),
+            "double-encoded dot segments must be refused"
+        );
+        // Origin-root collection: any unambiguous non-root path is a strict
+        // descendant, but the origin root itself is never an item target.
+        assert!(guard_server_derived_url("https://h.example/", "https://h.example/any/path.txt").is_ok());
+        assert!(
+            guard_server_derived_url("https://h.example/", "https://h.example/").is_err(),
+            "the origin root itself must not pass as an item target"
+        );
+        assert!(
+            guard_server_derived_url("https://h.example/", "https://h.example/any/course%2F..%2Fother.txt").is_err(),
+            "encoded-separator traversal is refused even for origin-root collections"
+        );
+    }
+
+    #[test]
+    fn test_create_unique_part_file_name_is_short_and_hidden() {
+        // The temp sibling's name must not embed the target filename: a
+        // long (valid) target name would push the temp past the filesystem
+        // component limit (ENAMETOOLONG). Fixed prefix + fixed-width noise
+        // only, hidden, and unique per call.
+        let dir = std::env::temp_dir();
+        let long_name = "x".repeat(200);
+        let target = dir.join(&long_name);
+        let (_f1, t1) = create_unique_part_file(&target).expect("temp creation must succeed");
+        let (_f2, t2) = create_unique_part_file(&target).expect("second temp creation must succeed");
+        let name1 = t1.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(name1.starts_with('.'), "temp must be hidden: {name1}");
+        assert!(
+            name1.starts_with(".scs-part-"),
+            "temp name is fixed-form, target-independent: {name1}"
+        );
+        assert!(
+            name1.len() <= ".scs-part-".len() + 16,
+            "temp name must be bounded by the noise width, got {name1}"
+        );
+        assert_ne!(t1, t2, "consecutive temps must not collide");
+        let _ = std::fs::remove_file(&t1);
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    #[test]
+    fn test_read_listing_body_decodes_bom_marked_utf16() {
+        // WebDAV/XML bodies may be UTF-16 with a BOM; the bounded reader
+        // must decode them under the same byte cap instead of failing.
+        let xml = "<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\">\
+                   <D:response><D:href>/course/a.txt</D:href></D:response>\
+                   </D:multistatus>";
+        let units: Vec<u16> = xml.encode_utf16().collect();
+        let mut le = vec![0xFF, 0xFE];
+        for u in &units {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        // Each read's ListingBody (and its in-flight reservation) is
+        // released at the end of its own statement: shadowed bindings would
+        // all live to scope end and stack three worst-case reservations.
+        let body = read_listing_body(&AtomicBool::new(false), &mut std::io::Cursor::new(le))
+            .expect("UTF-16LE with BOM must decode")
+            .body;
+        assert!(parse_propfind_xml(&body).is_ok());
+        let mut be = vec![0xFE, 0xFF];
+        for u in &units {
+            be.extend_from_slice(&u.to_be_bytes());
+        }
+        let body = read_listing_body(&AtomicBool::new(false), &mut std::io::Cursor::new(be))
+            .expect("UTF-16BE with BOM must decode")
+            .body;
+        assert!(parse_propfind_xml(&body).is_ok());
+        // A UTF-8 BOM is accepted and stripped.
+        let mut utf8bom = vec![0xEF, 0xBB, 0xBF];
+        utf8bom.extend_from_slice(xml.as_bytes());
+        let body = read_listing_body(&AtomicBool::new(false), &mut std::io::Cursor::new(utf8bom))
+            .expect("UTF-8 BOM must be accepted")
+            .body;
+        assert!(parse_propfind_xml(&body).is_ok());
+        // A truncated (odd-length) UTF-16 body fails closed.
+        let mut odd = vec![0xFF, 0xFE, b'x'];
+        let _ = &mut odd;
+        assert!(read_listing_body(&AtomicBool::new(false), &mut std::io::Cursor::new(odd)).is_err());
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_rejects_oversized_hrefs() {
+        // Item counts alone do not bound retained bytes: without a per-href
+        // cap, one href can carry most of a listing body into per-item scan
+        // state and blow past every aggregate budget.
+        let href = format!("/course/{}.txt", "x".repeat(8192));
+        let xml = format!(
+            "<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\">\
+             <D:response><D:href>{href}</D:href><D:propstat><D:prop>\
+             <D:resourcetype/></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+             </D:propstat></D:response></D:multistatus>"
+        );
+        let err = parse_propfind_xml(&xml)
+            .expect_err("an oversized href must be refused outright");
+        assert!(
+            err.to_ascii_lowercase().contains("href"),
+            "error must name the href limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_stops_at_item_cap() {
+        // An over-cap listing is hostile, and truncated acceptance is a
+        // silent partial listing: the parser itself must refuse it, so no
+        // caller can be talked into treating the first cap+1 items as a
+        // complete result (duplicates included — uniqueness is a caller
+        // concern the parser cannot see).
+        let mut xml =
+            String::from("<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\">");
+        for i in 0..(MAX_REMOTE_ITEMS + 500) {
+            xml.push_str(&format!(
+                "<D:response><D:href>/course/f{i}.txt</D:href>\
+                 <D:propstat><D:prop><D:resourcetype/>\
+                 <D:getcontentlength>1</D:getcontentlength></D:prop>\
+                 <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+            ));
+        }
+        xml.push_str("</D:multistatus>");
+        let err = parse_propfind_xml(&xml)
+            .expect_err("an over-cap listing must be an outright parse error");
+        assert!(
+            err.to_ascii_lowercase().contains("item limit"),
+            "error must name the item limit, got: {err}"
+        );
     }
 
     #[test]
@@ -4203,7 +5901,7 @@ mod tests {
         let computed = compute_file_sha256(&temp_file).unwrap();
         let direct = compute_sha256(b"test payload for streaming sha256");
         assert_eq!(computed, direct);
-        let _ = std::fs::remove_file(&temp_file);
+        remove_part_file(&temp_file);
     }
 
     #[test]
@@ -4276,6 +5974,62 @@ mod tests {
         let loaded_bob = load_remote_cache(test_url, bob_user);
         assert!(loaded_bob.is_none(), "Bob should not see Alice's cached items");
 
+        // Case-variant usernames are distinct credentials: WebDAV usernames
+        // are opaque, case-sensitive tokens, so "Alice" is not "alice" and
+        // must neither read her listing nor share her key; an anonymous
+        // request must not read it either.
+        let case_variant_alice = Some("Alice");
+        assert_ne!(cache_key(test_url, alice_user), cache_key(test_url, case_variant_alice));
+        assert!(
+            load_remote_cache(test_url, case_variant_alice).is_none(),
+            "Alice (case variant) should not see alice's cached items"
+        );
+        assert!(
+            load_remote_cache(test_url, None).is_none(),
+            "an anonymous request should not see alice's cached items"
+        );
+
+        // Exact usernames: trailing whitespace distinguishes credentials,
+        // and an ambiguous (empty/whitespace-only) username is neither
+        // anonymous nor any account — cache entry points refuse it entirely
+        // instead of conflating it with either.
+        let spaced_alice = Some("alice ");
+        assert_ne!(cache_key(test_url, alice_user), cache_key(test_url, spaced_alice));
+        assert!(
+            load_remote_cache(test_url, spaced_alice).is_none(),
+            "a trailing-space username is a different credential"
+        );
+        assert!(
+            load_remote_cache(test_url, Some("")).is_none(),
+            "an empty username is not anonymous and must read nothing"
+        );
+        // Anonymous and empty-string are distinct credentials: alice's
+        // stored entry answers neither (behavioral check — the comparator
+        // itself is exercised through load).
+        assert!(load_remote_cache(test_url, None).is_none());
+        save_remote_cache(test_url, Some(""), &items);
+        assert!(
+            load_remote_cache(test_url, Some("")).is_none(),
+            "ambiguous credentials are never cached"
+        );
+        assert!(
+            load_remote_cache(test_url, None).is_none(),
+            "an ambiguous credential must not poison the anonymous entry"
+        );
+
+        // Trailing slashes are part of the collection path: /files and
+        // /files/ are distinct collections and must not share a key or an
+        // entry (a shared entry steers the sync delete set at the wrong
+        // collection).
+        let slashed = "https://example.com/remote/files/";
+        let unslashed = "https://example.com/remote/files";
+        assert_ne!(cache_key(slashed, alice_user), cache_key(unslashed, alice_user));
+        save_remote_cache(slashed, alice_user, &items);
+        assert!(
+            load_remote_cache(unslashed, alice_user).is_none(),
+            "the unslashed collection must not read the slashed one's entry"
+        );
+
         // Update item in alice's cache
         update_remote_cache_item(test_url, alice_user, "doc.pdf", 8192, Some(12345678));
         let updated = load_remote_cache(test_url, alice_user).unwrap();
@@ -4314,6 +6068,27 @@ mod tests {
         assert!(!has_traversal_sequence(".gitignore"));
         assert!(!has_traversal_sequence(".env"));
         assert!(!has_traversal_sequence("subdir/.hidden_file"));
+
+        // Query-scoped collections are distinct listings: a different
+        // share token must never read another token's entry, and the path
+        // is identity exactly as configured — the trailing slash included —
+        // so the unslashed spelling is a different collection.
+        let query_url = "https://example.com/remote/files/?share=token1";
+        save_remote_cache(query_url, alice_user, &items);
+        assert!(
+            load_remote_cache("https://example.com/remote/files?share=token2", alice_user).is_none(),
+            "a different share token must not read another token's cached listing"
+        );
+        assert!(
+            load_remote_cache("https://example.com/remote/files?share=token1", alice_user).is_none(),
+            "the unslashed path is a different collection and must not read the slashed one's entry"
+        );
+        assert_eq!(
+            load_remote_cache(query_url, alice_user)
+                .expect("the exact configured spelling must hit its entry")
+                .len(),
+            items.len()
+        );
 
         clear_remote_cache().unwrap();
         assert!(!temp_cache.exists());
@@ -4621,6 +6396,145 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_aggregate_remote_folders_credits_ancestors_and_includes_empty_dirs() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let items = vec![
+            WebdavItem::new("/docs/", true, 0),
+            WebdavItem::new("/docs/root.txt", false, 5),
+            WebdavItem::new("/docs/a/", true, 0),
+            WebdavItem::new("/docs/a/b/", true, 0),
+            WebdavItem::new("/docs/a/b/file.bin", false, 100),
+            WebdavItem::new("/docs/a/empty/", true, 0),
+        ];
+
+        let folders = aggregate_remote_folders(base, &items);
+        let by_path: Vec<(String, u64)> = folders
+            .into_iter()
+            .map(|f| (f.path, f.size))
+            .collect();
+        assert_eq!(
+            by_path,
+            vec![
+                (String::new(), 105),
+                ("a".to_string(), 100),
+                ("a/b".to_string(), 100),
+                ("a/empty".to_string(), 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_aggregate_remote_folders_decodes_percent_encoded_paths() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let items = vec![
+            WebdavItem::new("/docs/my%20dir/", true, 0),
+            WebdavItem::new("/docs/my%20dir/file%20one.txt", false, 7),
+        ];
+
+        let folders = aggregate_remote_folders(base, &items);
+        let by_path: Vec<(String, u64)> = folders
+            .into_iter()
+            .map(|f| (f.path, f.size))
+            .collect();
+        assert_eq!(
+            by_path,
+            vec![(String::new(), 7), ("my dir".to_string(), 7)]
+        );
+    }
+
+    #[test]
+    fn test_aggregate_remote_folders_sums_files_across_siblings() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let items = vec![
+            WebdavItem::new("/docs/x/", true, 0),
+            WebdavItem::new("/docs/x/one.bin", false, 10),
+            WebdavItem::new("/docs/y/", true, 0),
+            WebdavItem::new("/docs/y/two.bin", false, 5),
+            WebdavItem::new("/docs/y/three.bin", false, 2),
+        ];
+
+        let folders = aggregate_remote_folders(base, &items);
+        let by_path: Vec<(String, u64)> = folders
+            .into_iter()
+            .map(|f| (f.path, f.size))
+            .collect();
+        assert_eq!(
+            by_path,
+            vec![
+                (String::new(), 17),
+                ("x".to_string(), 10),
+                ("y".to_string(), 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_has_traversal_segments_rejects_literal_and_encoded_escapes() {
+        for subdir in [
+            "..",
+            "a/../b",
+            "..%2f",
+            "..%2F",
+            "%2e%2e",
+            "%2E%2E",
+            "..%2f..%2f",
+            "a%2F..%2F..",
+            "%2e%2e%2fetc",
+            "a/..",
+            "..\\..",
+            "a%5Cb", // encoded backslash
+            "a\\b",
+            "..%00",           // NUL-truncated dot-dot
+            "%252e%252e",      // double-encoded dot-dot
+            "%252e%252e%252f", // double-encoded traversal
+            "a%00b",           // raw NUL
+            "a%01b",           // other control byte
+        ] {
+            assert!(
+                has_traversal_segments(subdir),
+                "subdir {subdir:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_has_traversal_segments_accepts_plain_paths() {
+        for subdir in [
+            "",
+            "content/enforced/1052175-dev_asteve18",
+            "my%20dir/sub",
+            "a/b/c",
+            "a..b",
+            "..hidden",
+            "x/..y/z",
+        ] {
+            assert!(
+                !has_traversal_segments(subdir),
+                "subdir {subdir:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_download_body_timeout_clamps_instead_of_overflowing() {
+        // A huge configured deadline must clamp to a sane maximum
+        // (DOWNLOAD_BODY_TIMEOUT_MAX_SECS, one day) instead of reaching the
+        // copy loop, where `Instant::now() + Duration::from_secs(u64::MAX)`
+        // would panic on overflow.
+        std::env::set_var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS", "18446744073709551615");
+        let configured = get_download_body_timeout_secs();
+        std::env::remove_var("WEBDAV_DOWNLOAD_BODY_TIMEOUT_SECS");
+        assert!(
+            configured <= 86_400,
+            "configured deadline must clamp to one day, got {configured}"
+        );
+        // The clamped ceiling must stay panic-free in deadline arithmetic.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(configured.max(1));
+        assert!(deadline > std::time::Instant::now());
     }
 }
 

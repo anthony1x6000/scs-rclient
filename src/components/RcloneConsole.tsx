@@ -1,18 +1,20 @@
 import { useEffect, useRef, useState, useLayoutEffect } from "react";
 import ExcludeFolders from "./ExcludeFolders";
 import ExtensionFilterPanel from "./ExtensionFilterPanel";
+import ExcludeFolderSelect from "./ExcludeFolderSelect";
 
 interface RcloneConsoleProps {
   logs: string;
   onClear?: () => void;
   onOpenFolder?: () => void;
-  selectedSubdir: string;
+  /** Live remote selection; exclusion panels remount when it changes. */
+  selectedSubdir?: string;
 }
 
 /** Which inline editor panel is open under the button row (one at a time). */
-type OpenPanel = "exclude" | "whitelist" | "blacklist" | null;
+type OpenPanel = "exclude" | "excludeSelect" | "whitelist" | "blacklist" | null;
 
-export function RcloneConsole({ logs, onClear, onOpenFolder, selectedSubdir }: RcloneConsoleProps) {
+export function RcloneConsole({ logs, onClear, onOpenFolder, selectedSubdir = "" }: RcloneConsoleProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [follow, setFollow] = useState(true);
@@ -115,6 +117,15 @@ export function RcloneConsole({ logs, onClear, onOpenFolder, selectedSubdir }: R
         >
           Exclude folder
         </button>
+        <button
+          type="button"
+          onClick={() => setOpenPanel((open) => (open === "excludeSelect" ? null : "excludeSelect"))}
+          aria-expanded={openPanel === "excludeSelect"}
+          aria-controls="scs-exclude-folder-select"
+          className={`px-2 py-1 border bg-transparent text-white cursor-pointer transition-all duration-150 ${openPanel === "excludeSelect" ? "border-white/60" : "border-white/20 hover:border-white/50"}`}
+        >
+          Exclude folder select
+        </button>
         {(["whitelist", "blacklist"] as const).map((mode) => (
           <button
             key={mode}
@@ -128,7 +139,10 @@ export function RcloneConsole({ logs, onClear, onOpenFolder, selectedSubdir }: R
           </button>
         ))}
       </div>
-      {openPanel === "exclude" && <ExcludeFolders />}
+      {openPanel === "exclude" && <ExcludeFolders key={selectedSubdir} subdir={selectedSubdir} />}
+      {openPanel === "excludeSelect" && (
+        <ExcludeFolderSelect key={selectedSubdir} subdir={selectedSubdir} />
+      )}
       {openPanel === "whitelist" && (
         <ExtensionFilterPanel key={selectedSubdir} mode="whitelist" selectedSubdir={selectedSubdir} />
       )}

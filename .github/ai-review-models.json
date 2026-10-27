@@ -1,8 +1,8 @@
 [
   {
-    "id": "opencode-go-longcat",
-    "model": "longcat-2.5-preview-free",
-    "endpoint": "https://opencode.ai/zen/go/v1/chat/completions",
+    "id": "opencode-go-beam",
+    "model": "beam-free",
+    "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions",
     "apiKeyEnv": "OCG_KEY",
     "sessionHeader": true,
     "reasoningEffort": "high",
