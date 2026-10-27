@@ -95,6 +95,7 @@ fn test_cancel_interrupts_dripping_download_body() {
         None,
         None,
         &[],
+        None,
         |m: &str| logs.push(m.to_string()),
     );
     let elapsed = test_started.elapsed();
@@ -141,6 +142,7 @@ fn test_body_deadline_stops_dripping_download() {
         None,
         None,
         &[],
+        None,
         |m: &str| logs.push(m.to_string()),
     );
     let elapsed = started.elapsed();

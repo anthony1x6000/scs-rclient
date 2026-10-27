@@ -128,6 +128,7 @@ fn test_sync_never_deletes_out_of_collection_hrefs() {
         None,
         None,
         &[],
+        None,
         |msg: &str| logs.push(msg.to_string()),
     );
 
