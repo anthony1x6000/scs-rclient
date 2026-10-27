@@ -4931,8 +4931,13 @@ mod tests {
             cache_key("https://h.example/dav?share=a", Some("u")),
             cache_key("https://h.example/dav?share=b", Some("u"))
         );
-        assert_eq!(
+        assert_ne!(
             cache_key("https://h.example/dav/?share=a", Some("u")),
+            cache_key("https://h.example/dav?share=a", Some("u")),
+            "the trailing slash is part of the collection identity"
+        );
+        assert_eq!(
+            cache_key("https://h.example/dav?share=a", Some("u")),
             cache_key("https://h.example/dav?share=a", Some("u"))
         );
     }
