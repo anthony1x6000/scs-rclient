@@ -11,13 +11,17 @@ on:
     types:
       - published
 
-# Cancel the push-twin when a pull_request run for the same head exists:
-# both fire per push, the push twin gets cancelled, and GitHub's merge box
-# can then show the cancelled run as the latest check even though the
-# pull_request twin's checks are all green — blocking the auto-merge.
+# Every push reports twice: once as `push`, once as `pull_request`. Both runs
+# execute the same jobs, and GitHub's merge box takes the LATEST result per
+# check name — so when the push twin's e2e job is cancelled (or fails) after
+# the pull_request twin's green run, the PR is blocked even though every
+# reviewed check passed. Keying the group by event name keeps the twins in
+# separate groups so neither can cancel the other; `cancel-in-progress` then
+# only deduplicates re-runs of the same event. `pull_request.number` (not the
+# branch name) keeps unrelated forks that reuse a branch name apart.
 concurrency:
-  group: tauri-build-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: false
+  group: tauri-build-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   audit-glib:
