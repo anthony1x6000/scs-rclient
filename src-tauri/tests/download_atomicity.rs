@@ -143,6 +143,7 @@ fn run_get_action(port: u16, local_dir: &std::path::Path, logs: &mut Vec<String>
         None,
         None,
         &[],
+        None,
         |m: &str| logs.push(m.to_string()),
     );
 }
