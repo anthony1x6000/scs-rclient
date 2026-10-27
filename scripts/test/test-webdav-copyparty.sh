@@ -131,6 +131,6 @@ echo "=== Running WebDAV lib unit tests ==="
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --nocapture --test-threads=1
 
 echo "=== Running WebDAV integration, roundtrip, and live concurrency tests against simulated D2L endpoint ==="
-cargo test --manifest-path src-tauri/Cargo.toml --test webdav_e2e --test live_concurrency --test insecure_mode_env --test download_cancel_deadline --test download_atomicity -- --nocapture --test-threads=1
+cargo test --manifest-path src-tauri/Cargo.toml --test webdav_e2e --test live_concurrency --test insecure_mode_env --test download_cancel_deadline --test download_atomicity --test listing_item_cap -- --nocapture --test-threads=1
 
 echo "✓ All WebDAV tests passed successfully against D2L simulation setup!"
