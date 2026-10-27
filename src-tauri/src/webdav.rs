@@ -1137,6 +1137,118 @@ pub fn is_safe_relative_path(path: &str) -> bool {
     true
 }
 
+/// Creates the hidden, unpredictable temporary sibling a streamed download
+/// writes into before it replaces the destination. The name is fixed-form
+/// and target-independent (`.scs-part-<noise>`): the noise mixes OS-seeded
+/// randomness (`RandomState`), the clock, the pid, and a process-wide
+/// counter, and the file is opened with `create_new`, so the path is
+/// guaranteed not to exist before this call: no other file — a sibling the
+/// server listed, the destination itself, or another worker's temp — can be
+/// truncated by opening it, and cleanup only ever removes a file this call
+/// created. Creating the temp also requires write permission on the parent
+/// directory (the rename does too): a writable file inside a non-writable
+/// or sticky directory, which the old in-place truncate could write, now
+/// fails loudly before any byte is fetched.
+fn create_unique_part_file(target: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
+    use std::hash::{BuildHasher, Hasher};
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    // The replace must not widen what the old truncate path allowed: a
+    // read-only (or otherwise unwritable) destination failed loudly with
+    // File::create, and an atomic rename over it would silently succeed on
+    // a writable directory — so write access is probed up front. Non-regular
+    // destinations (directories, symlinks) are refused outright: the temp
+    // scheme replaces the name itself, not what it points at.
+    if let Ok(meta) = std::fs::symlink_metadata(target) {
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("download destination exists and is not a regular file: {}", target.display()),
+            ));
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(target)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "download destination {} is not writable: {e}",
+                        target.display()
+                    ),
+                )
+            })?;
+    }
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for attempt in 0..64u64 {
+        let mut noise = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        noise ^= noise << 13;
+        noise ^= noise >> 7;
+        noise ^= noise << 17;
+        noise ^= std::process::id() as u64;
+        noise ^= std::collections::hash_map::RandomState::new().build_hasher().finish();
+        noise ^= COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (attempt << 32);
+        // Fixed-form, target-independent name: embedding the target name
+        // would push long (valid) targets past the filesystem component
+        // limit, and the noise alone is both the uniqueness and the
+        // unguessability.
+        let candidate = dir.join(format!(".scs-part-{noise:016x}"));
+        // 0o600 at creation on Unix: there is no default-mode window at
+        // all, so no other local process can hold the partial body open.
+        // The prior target's mode is applied just before the rename below.
+        #[cfg(unix)]
+        let mut options = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true).mode(0o600);
+            o
+        };
+        #[cfg(not(unix))]
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(not(unix))]
+        options.write(true).create_new(true);
+        let file = match options.open(&candidate) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        return Ok((file, candidate));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no unique temporary sibling available after 64 attempts",
+    ))
+}
+
+/// Removes a partial temp file this call created, coping with a temp that
+/// ended up read-only. Clearing the read-only bit is a Windows-only
+/// fallback: on Unix, std's set_readonly(false) ORs the writable bits into
+/// the mode, which would widen a 0600 partial to group/other-writable just
+/// to delete it — a Unix removal failure is simply reported by doing
+/// nothing further (the hidden temp stays for the user, never the data).
+fn remove_part_file(temp: &Path) {
+    if std::fs::remove_file(temp).is_err() {
+        #[cfg(windows)]
+        {
+            let mut perms = std::fs::metadata(temp).map(|m| m.permissions());
+            if let Ok(p) = &mut perms {
+                p.set_readonly(false);
+                let _ = std::fs::set_permissions(temp, p.clone());
+                let _ = std::fs::remove_file(temp);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = temp;
+        }
+    }
+}
+
 /// Safely joins a relative path to a base directory, rejecting any path traversal attempts.
 pub fn safe_join_path(base: &Path, rel: &str) -> Result<PathBuf, String> {
     if !is_safe_relative_path(rel) {
@@ -3544,15 +3656,25 @@ where
                                 "GET {download_url} returned HTTP {status}"
                             )));
                         }
-                        // Recreate the file on every attempt so a retried download never appends
-                        // to bytes left behind by a timed-out body stream.
-                        let mut dest_file = std::fs::File::create(&target_file).map_err(|e| {
-                            AttemptError::Fatal(format!(
-                                "Failed to create {}: {}",
-                                target_file.display(),
-                                e
-                            ))
-                        })?;
+                        // Stream to a hidden, unpredictable temporary sibling
+                        // and replace the destination only after the body
+                        // completed: File::create would truncate the user's
+                        // existing copy before the first body byte arrives,
+                        // and a PREDICTABLE temp name could collide with a
+                        // real sibling file (a hostile listing can contain
+                        // `foo.scs-part-<pid>`) and truncate/delete that
+                        // instead. create_new guarantees the path did not
+                        // exist, so cleanup only ever removes this call's own
+                        // file — every failure exit below does exactly that,
+                        // because the random name cannot be recomputed later.
+                        let (mut dest_file, temp_file) = create_unique_part_file(&target_file)
+                            .map_err(|e| {
+                                AttemptError::Fatal(format!(
+                                    "Failed to create a temporary sibling of {}: {}",
+                                    target_file.display(),
+                                    e
+                                ))
+                            })?;
                         let mut limited_reader = std::io::Read::take(get_res, max_size + 1);
                         // Manual copy loop: io::copy neither observes the
                         // cancel flag nor any whole-body deadline, and each
@@ -3567,14 +3689,18 @@ where
                         let mut written: u64 = 0;
                         loop {
                             if cancel_flag.load(Ordering::SeqCst) {
-                                // The outer error path checks the flag again,
-                                // cleans the partial, and ends the operation
-                                // as a user cancellation.
+                                // The outer error path checks the flag again
+                                // and ends the operation as a user
+                                // cancellation; this exit owns the temp file.
+                                drop(dest_file);
+                                remove_part_file(&temp_file);
                                 return Err(AttemptError::Fatal(
                                     "Operation canceled by user.".to_string(),
                                 ));
                             }
                             if std::time::Instant::now() >= body_deadline {
+                                drop(dest_file);
+                                remove_part_file(&temp_file);
                                 return Err(AttemptError::Fatal(format!(
                                     "Download body exceeded the {}s time limit",
                                     get_download_body_timeout_secs()
@@ -3584,14 +3710,16 @@ where
                             match limited_reader.read(&mut buffer) {
                                 Ok(0) => break,
                                 Ok(n) => {
-                                    dest_file
-                                        .write_all(&buffer[..n])
-                                        .map_err(|e| {
-                                            classify_io_error(
-                                                &format!("writing GET {download_url}"),
-                                                &e,
-                                            )
-                                        })?;
+                                    if let Err(e) = dest_file.write_all(&buffer[..n]) {
+                                        // Close before remove so Windows can
+                                        // delete this call's own temp file.
+                                        drop(dest_file);
+                                        remove_part_file(&temp_file);
+                                        return Err(classify_io_error(
+                                            &format!("writing GET {download_url}"),
+                                            &e,
+                                        ));
+                                    }
                                     written += n as u64;
                                     if written > max_size {
                                         break;
@@ -3602,40 +3730,106 @@ where
                                 // otherwise healthy transfer.
                                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                                 Err(e) => {
+                                    drop(dest_file);
+                                    remove_part_file(&temp_file);
                                     return Err(classify_io_error(
                                         &format!("streaming GET {download_url}"),
                                         &e,
-                                    ))
+                                    ));
                                 }
                             }
                         }
                         use std::io::Write as _;
                         if written > max_size {
                             drop(dest_file);
-                            let _ = std::fs::remove_file(&target_file);
+                            remove_part_file(&temp_file);
                             return Err(AttemptError::Fatal(format!(
                                 "Downloaded file exceeded the maximum size limit ({} bytes > {} bytes)",
                                 written, max_size
                             )));
                         }
+                        // The listing advertised a length: a body that ends
+                        // cleanly but SHORT (a hostile chunked response does
+                        // exactly that) must not replace the prior file with
+                        // truncated content. A LONGER body is accepted — the
+                        // remote file may legitimately have grown since the
+                        // listing — and an unknown/zero advertised size skips
+                        // the comparison entirely.
+                        if item.size > 0 && written < item.size as u64 {
+                            drop(dest_file);
+                            remove_part_file(&temp_file);
+                            return Err(AttemptError::Fatal(format!(
+                                "Downloaded {} bytes but the listing advertised {} for {download_url}",
+                                written, item.size
+                            )));
+                        }
+                        // The replaced file keeps the prior file's Unix
+                        // OWNER mode bits, applied only now, after the body
+                        // is fully written, so a read-only mode can never
+                        // block the stream. Known regression vs the
+                        // old truncate-in-place path, documented in the PR:
+                        // an atomic rename swaps the inode, so owner/group,
+                        // xattrs, POSIX ACLs, and Windows security
+                        // descriptors are NOT carried over (the old
+                        // File::create wrote into the SAME inode and kept
+                        // them). Mode bits are what std can preserve without
+                        // platform-specific metadata APIs. New downloads
+                        // (no prior file) intentionally land 0600: private
+                        // by default, instead of the umask default.
+                        #[cfg(unix)]
+                        if let Ok(prior) = std::fs::symlink_metadata(&target_file) {
+                            // Only a still-regular destination contributes a
+                            // mode: anything swapped in mid-flight (a symlink
+                            // would carry 0777) must not widen the temp.
+                            if prior.is_file() {
+                                let mode = {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    // Owner bits only: the replace loses the
+                                    // original group/owner, so keeping
+                                    // group/other bits would grant them to
+                                    // whoever the new group happens to be.
+                                    std::fs::Permissions::from_mode(
+                                        prior.permissions().mode() & 0o700,
+                                    )
+                                };
+                                // Handle-based: a path-based chmod would
+                                // follow a symlink swapped onto the temp
+                                // path; the open handle cannot be swapped.
+                                dest_file.set_permissions(mode).map_err(
+                                    |e| {
+                                        remove_part_file(&temp_file);
+                                        AttemptError::Fatal(format!(
+                                            "Failed to apply the prior file's permissions to {}: {e}",
+                                            temp_file.display()
+                                        ))
+                                    },
+                                )?;
+                            }
+                        }
+                        // Atomic replace: the destination is only ever touched
+                        // with a complete, size-checked body. std's rename
+                        // replaces an existing destination file on Windows as
+                        // well (MoveFileExW with MOVEFILE_REPLACE_EXISTING).
+                        drop(dest_file);
+                        std::fs::rename(&temp_file, &target_file).map_err(|e| {
+                            remove_part_file(&temp_file);
+                            AttemptError::Fatal(format!(
+                                "Failed to finalize {}: {}",
+                                target_file.display(),
+                                e
+                            ))
+                        })?;
                         Ok(written)
                     },
                 );
                 let downloaded_len = match download_result {
                     Ok(len) => len,
                     Err(e) => {
-                        // Never leave a truncated partial behind after the final attempt.
-                        if let Err(remove_err) = std::fs::remove_file(&target_file) {
-                            if remove_err.kind() != std::io::ErrorKind::NotFound {
-                                log(&format!(
-                                    "[{}/{}] WARNING: Could not remove partial download {}: {}\n",
-                                    current_num,
-                                    total_files,
-                                    target_file.display(),
-                                    remove_err
-                                ));
-                            }
-                        }
+                        // Never leave a partial behind after the final
+                        // attempt: every attempt already removed its own
+                        // temp sibling on failure, and the destination was
+                        // never touched, so the prior local file survives a
+                        // failed download as-is.
                         if cancel_flag.load(Ordering::SeqCst) {
                             log("Operation canceled by user.\n");
                             return Ok(());
@@ -4746,6 +4940,32 @@ mod tests {
     }
 
     #[test]
+    fn test_create_unique_part_file_name_is_short_and_hidden() {
+        // The temp sibling's name must not embed the target filename: a
+        // long (valid) target name would push the temp past the filesystem
+        // component limit (ENAMETOOLONG). Fixed prefix + fixed-width noise
+        // only, hidden, and unique per call.
+        let dir = std::env::temp_dir();
+        let long_name = "x".repeat(200);
+        let target = dir.join(&long_name);
+        let (_f1, t1) = create_unique_part_file(&target).expect("temp creation must succeed");
+        let (_f2, t2) = create_unique_part_file(&target).expect("second temp creation must succeed");
+        let name1 = t1.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(name1.starts_with('.'), "temp must be hidden: {name1}");
+        assert!(
+            name1.starts_with(".scs-part-"),
+            "temp name is fixed-form, target-independent: {name1}"
+        );
+        assert!(
+            name1.len() <= ".scs-part-".len() + 16,
+            "temp name must be bounded by the noise width, got {name1}"
+        );
+        assert_ne!(t1, t2, "consecutive temps must not collide");
+        let _ = std::fs::remove_file(&t1);
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    #[test]
     fn test_validate_webdav_url_ipv6_literals_and_mapped_ranges() {
         // Bracketed IPv6 literals reach the IP check (host_str returns them
         // bracketed, which the old bare host.parse() never matched).
@@ -4932,7 +5152,7 @@ mod tests {
         let computed = compute_file_sha256(&temp_file).unwrap();
         let direct = compute_sha256(b"test payload for streaming sha256");
         assert_eq!(computed, direct);
-        let _ = std::fs::remove_file(&temp_file);
+        remove_part_file(&temp_file);
     }
 
     #[test]
