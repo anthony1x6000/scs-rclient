@@ -49,16 +49,17 @@ describe("normalizeSubdir traversal scope", () => {
     expect(() => normalizeSubdir("notes/x%2fy")).toThrow();
   });
 
-  it("keeps encoded separators as literal names, not traversal", () => {
-    // resolveRemoteUrl re-encodes the `%`, so an encoded separator reaches
-    // the backend as a literal `%2f` inside one segment and cannot split
-    // the path or pop a parent.
-    expect(resolveRemoteUrl("https://h.example/dav", "a%2fb")).toBe(
-      "https://h.example/dav/a%252fb",
+  it("encodes percent sequences as literals and refuses encoded separators", () => {
+    // resolveRemoteUrl re-encodes the `%`, so any percent sequence reaches
+    // the backend as a literal inside one segment and cannot split the path
+    // or pop a parent.
+    expect(resolveRemoteUrl("https://h.example/dav", "a%20b")).toBe(
+      "https://h.example/dav/a%2520b",
     );
-    expect(resolveRemoteUrl("https://h.example/dav", "a%5Cb")).toBe(
-      "https://h.example/dav/a%255Cb",
-    );
+    // Encoded separators are refused outright, matching the Rust URL guard
+    // that would reject the built URL at runtime.
+    expect(() => resolveRemoteUrl("https://h.example/dav", "a%2fb")).toThrow();
+    expect(() => resolveRemoteUrl("https://h.example/dav", "a%5Cb")).toThrow();
   });
 
   it("resolveRemoteUrl keeps the segment inside the base", () => {
