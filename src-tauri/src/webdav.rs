@@ -497,19 +497,23 @@ pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
         Ok(url) => {
             let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
             let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-            let trimmed_path = url.path().trim_end_matches('/');
+            // The path is kept EXACTLY as configured, trailing slash
+            // included: it is part of the collection identity, and folding
+            // it away would let /dav/A read or mutate /dav/A/'s entry.
+            let path = url.path();
             let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
-            format!("{}://{}{}{}{}", url.scheme(), host, port, trimmed_path, query)
+            format!("{}://{}{}{}{}", url.scheme(), host, port, path, query)
         }
         Err(_) => remote_url.trim_end_matches('/').to_string(),
     };
     match auth_user {
         Some(user) if !user.trim().is_empty() => {
             // Usernames are opaque, case-sensitive tokens compared by
-            // exact bytes: "Alice"/"alice" and "alice"/"alice " are each
-            // distinct credentials, so the key keeps every byte (no trim).
+            // exact bytes, and the key LENGTH-PREFIXES the name so a
+            // username containing '@' can never collide with a different
+            // (user, url) pair that concatenates to the same string.
             // The `u1:` marker versions the user-scoped key format.
-            format!("u1:{user}@{clean_url}")
+            format!("u1:{}:{user}@{clean_url}", user.len())
         }
         _ => clean_url,
     }
@@ -727,7 +731,8 @@ fn url_same_collection(a: &str, b: &str) -> bool {
             let host_b = b.host_str().unwrap_or_default().to_ascii_lowercase();
             a.scheme() == b.scheme()
                 && host_a == host_b
-                && a.path().trim_end_matches('/') == b.path().trim_end_matches('/')
+                && a.port_or_known_default() == b.port_or_known_default()
+                && a.path() == b.path()
                 && a.query() == b.query()
         }
         // Unparseable stored entries never match a parseable request.
@@ -844,6 +849,13 @@ pub fn update_remote_cache_item(
     }
     let key = cache_key(remote_url, auth_user);
     if let Some(entry) = cache.get_mut(&key) {
+        // Key equality alone must never authorize a mutation: the stored
+        // collection and credential are rechecked exactly as load does.
+        if !url_same_collection(&entry.remote_url, remote_url)
+            || !same_auth_user(&entry.auth_user, auth_user)
+        {
+            return;
+        }
         let expected_url = build_file_url(remote_url, rel_path);
         let mut found = false;
         for item in &mut entry.items {
@@ -886,6 +898,13 @@ pub fn remove_remote_cache_item(remote_url: &str, auth_user: Option<&str>, rel_p
     }
     let key = cache_key(remote_url, auth_user);
     if let Some(entry) = cache.get_mut(&key) {
+        // Key equality alone must never authorize a mutation: the stored
+        // collection and credential are rechecked exactly as load does.
+        if !url_same_collection(&entry.remote_url, remote_url)
+            || !same_auth_user(&entry.auth_user, auth_user)
+        {
+            return;
+        }
         let expected_url = build_file_url(remote_url, rel_path);
         entry.items.retain(|item| {
             let item_rel = relative_item_path(remote_url, &item.href);
