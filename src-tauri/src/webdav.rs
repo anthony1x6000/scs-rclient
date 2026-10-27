@@ -31,6 +31,14 @@ pub const MAX_INFLIGHT_LISTING_BYTES: usize = 256 * 1024 * 1024;
 /// same bound is enforced per listing during XML item collection, so no
 /// single PROPFIND response can materialize unbounded item state either.
 pub const MAX_REMOTE_ITEMS: usize = 100_000;
+/// Hard cap on one server-advertised href: item counts alone do not bound
+/// retained bytes, and a single href could otherwise carry most of a listing
+/// body into per-item scan state past every aggregate budget.
+pub const MAX_REMOTE_HREF_BYTES: usize = 4096;
+/// Aggregate retained-bytes budget for one scan's item state (hrefs held in
+/// `all_items`/`seen_items` and the listing cache), complementing the
+/// per-listing in-flight budget with a whole-scan bound.
+pub const MAX_RETAINED_LISTING_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum number of excluded folder patterns applied to a single action.
 pub const MAX_EXCLUDE_PATTERNS: usize = 64;
 /// Maximum length (in characters) of one excluded folder pattern.
@@ -958,13 +966,6 @@ pub fn clear_remote_cache() -> Result<(), String> {
     Ok(())
 }
 
-/// Reads a server-controlled listing body with a hard byte cap and strict
-/// UTF-8 (fail closed). Unbounded buffering of a hostile response is a
-/// memory-exhaustion vector; the cap turns it into a listing failure.
-/// Non-UTF-8 bodies are rejected rather than charset-converted: XML
-/// listings default to UTF-8, and guessing a declared charset would hand
-/// the server influence over decoding, so exotic encodings fail loudly
-/// and the caller falls back (Depth: 1) or errors.
 static INFLIGHT_LISTING_BYTES: Mutex<usize> = Mutex::new(0);
 static INFLIGHT_LISTING_ROOM: Condvar = Condvar::new();
 
@@ -1035,6 +1036,13 @@ pub(crate) struct ListingBody {
     _inflight: InflightListingGuard,
 }
 
+/// Reads a server-controlled listing body with a hard byte cap and strict
+/// UTF-8 (fail closed). Unbounded buffering of a hostile response is a
+/// memory-exhaustion vector; the cap turns it into a listing failure.
+/// Non-UTF-8 bodies are rejected rather than charset-converted: XML
+/// listings default to UTF-8, and guessing a declared charset would hand
+/// the server influence over decoding, so exotic encodings fail loudly
+/// and the caller falls back (Depth: 1) or errors.
 pub(crate) fn read_listing_body<R: std::io::Read>(body: &mut R) -> Result<ListingBody, String> {
     // Hold the worst-case reservation for the whole read AND the parse that
     // follows it, so concurrent workers cannot each buffer a full body past
@@ -1243,6 +1251,11 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                     in_response = false;
                     let clean_href = current_href.trim();
                     if !clean_href.is_empty() {
+                        if clean_href.len() > MAX_REMOTE_HREF_BYTES {
+                            return Err(format!(
+                                "listing href exceeds the {MAX_REMOTE_HREF_BYTES} byte limit"
+                            ));
+                        }
                         let is_dir = current_is_dir || clean_href.ends_with('/');
                         items.push(WebdavItem {
                             href: clean_href.to_string(),
@@ -2371,6 +2384,9 @@ where
         visited: HashSet<String>,
         seen_items: HashSet<(bool, String)>,
         all_items: Vec<WebdavItem>,
+        /// Retained bytes of every accepted href: a whole-scan budget next
+        /// to the per-listing item cap.
+        retained_listing_bytes: usize,
         scanned_count: usize,
         /// Directories whose listing kept failing after every retry and were skipped.
         skipped_dirs: Vec<String>,
@@ -2462,6 +2478,7 @@ where
         visited: initial_visited,
         seen_items: HashSet::new(),
         all_items: Vec::new(),
+        retained_listing_bytes: 0,
         scanned_count: 0,
         skipped_dirs: Vec::new(),
         error: None,
@@ -2707,6 +2724,14 @@ where
                                 if state.all_items.len() >= MAX_REMOTE_ITEMS {
                                     state.error = Some(format!(
                                         "Remote listing exceeded the {MAX_REMOTE_ITEMS} item limit. Aborting for security."
+                                    ));
+                                    state.stopped = true;
+                                    return;
+                                }
+                                state.retained_listing_bytes += item.href.len();
+                                if state.retained_listing_bytes > MAX_RETAINED_LISTING_BYTES {
+                                    state.error = Some(format!(
+                                        "Remote listing retained bytes exceeded the {MAX_RETAINED_LISTING_BYTES} byte budget. Aborting for security."
                                     ));
                                     state.stopped = true;
                                     return;

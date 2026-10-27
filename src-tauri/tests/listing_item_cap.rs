@@ -7,7 +7,7 @@ use scs_rclient_lib::webdav::execute_webdav_action_with_exclusions;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Restores a process-wide env var to its previous value when dropped, so
@@ -38,8 +38,6 @@ fn test_listing_item_count_is_bounded() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let hits: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-    let hits_clone = hits.clone();
     let handle = std::thread::spawn(move || {
         for stream in listener.incoming() {
             let mut stream = stream.unwrap();
@@ -57,7 +55,6 @@ fn test_listing_item_count_is_bounded() {
                     }
                 }
             }
-            *hits_clone.lock().unwrap() += 1;
             let mut body = String::from("<?xml version=\"1.0\" encoding=\"utf-8\" ?><D:multistatus xmlns:D=\"DAV:\">");
             body.push_str("<D:response><D:href>/course/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>");
             for i in 0..150_000 {
