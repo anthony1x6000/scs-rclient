@@ -211,6 +211,29 @@ fn set_scan_concurrency(threads: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Frontend wire format for an extension filter: `{ mode: "whitelist"|"blacklist", extensions: [...] }`.
+#[derive(serde::Deserialize)]
+struct ExtensionFilterArgs {
+    mode: String,
+    extensions: Vec<String>,
+}
+
+impl ExtensionFilterArgs {
+    /// Normalizes into a backend filter, failing closed on anything malformed: an
+    /// unknown mode or a list with no valid entries is an error rather than a
+    /// silently dropped filter, so a whitelist intent can never degrade into
+    /// transferring everything.
+    fn into_filter(self) -> Result<webdav::ExtensionFilter, String> {
+        let mode = webdav::ExtensionFilterMode::parse(&self.mode)
+            .ok_or_else(|| format!("Invalid extension filter mode: \"{}\".", self.mode))?;
+        let filter = webdav::ExtensionFilter::new(mode, &self.extensions);
+        if !filter.is_active() {
+            return Err("Extension filter has no valid entries.".to_string());
+        }
+        Ok(filter)
+    }
+}
+
 /// Runs a native WebDAV action (e.g. "put", "get", "sync", "list").
 ///
 /// Parameters:
@@ -224,6 +247,9 @@ fn set_scan_concurrency(threads: usize) -> Result<(), String> {
 ///   deeper under today's date, giving each day its own `<mount>/backups/<YYYY-MM-DD>` folder.
 /// - `exclude_folders`: Relative folder patterns (e.g. `.git/`) that scanning and transfers
 ///   must skip entirely — they are never traversed, uploaded, downloaded, or deleted by sync.
+/// - `extension_filter`: Optional [`ExtensionFilterArgs`] that gates files by extension on
+///   both sides of every scan. An unknown mode or an entry list with no valid extensions
+///   fails the action instead of silently disabling the filter.
 #[tauri::command]
 async fn run_webdav_action(
     app: tauri::AppHandle,
@@ -237,12 +263,14 @@ async fn run_webdav_action(
     backup: Option<bool>,
     backup_dated: Option<bool>,
     exclude_folders: Option<Vec<String>>,
+    extension_filter: Option<ExtensionFilterArgs>,
 ) -> Result<(), String> {
     use tauri::Emitter;
 
     state.cancel_flag.store(false, Ordering::SeqCst);
     let cancel_flag = state.cancel_flag.clone();
     let exclude_folders = webdav::normalize_exclude_folders(&exclude_folders.unwrap_or_default());
+    let extension_filter = extension_filter.map(ExtensionFilterArgs::into_filter).transpose()?;
 
     let mount_dir_str = get_mount_dir(app.clone(), target_subdir)?;
     let base_mount = std::path::Path::new(&mount_dir_str);
@@ -296,6 +324,7 @@ async fn run_webdav_action(
             concurrency,
             auth_user.as_deref(),
             &exclude_folders,
+            extension_filter.as_ref(),
             emit_log,
         )
     })

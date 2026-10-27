@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { loadAppSettings, excludedFoldersFor, type ExcludedFoldersByDir } from "../settings";
 import { BULK_MIN_FOLDERS, formatBulkSummary, runBulkSequential } from "../bulk";
+import { resolveExtensionFilter, type ExtensionFilterState } from "../extensionFilter";
 
 export interface RcloneSettings {
   baseUrl: string;
@@ -12,6 +13,7 @@ export interface RcloneSettings {
   scanConcurrency: number;
   excludedFoldersByDir: ExcludedFoldersByDir;
   excludedFoldersLegacy: string[];
+  extensionFilterState: ExtensionFilterState;
 }
 
 export type RcloneActionType = 'put' | 'get' | 'get-backup' | 'get-backup-dated' | 'put-dry' | 'get-dry' | 'put-checksum' | 'get-checksum' | 'ls' | 'lsd' | 'check' | 'sync';
@@ -44,6 +46,7 @@ export async function loadSettings(): Promise<RcloneSettings> {
     scanConcurrency: s.scanConcurrency,
     excludedFoldersByDir: s.excludedFoldersByDir,
     excludedFoldersLegacy: s.excludedFoldersLegacy,
+    extensionFilterState: s.extensionFilterState,
   };
 }
 
@@ -106,7 +109,10 @@ export function useRcloneExecution(
     const isDatedBackup = action === "get-backup-dated";
     const isBackup = action === "get-backup" || isDatedBackup;
     // Exclusions are scoped to the directory this operation runs on, so one
-    // folder's patterns never leak into another folder's bulk run.
+    // folder's patterns never leak into another folder's bulk run. Each
+    // folder also resolves its own extension filter, so a bulk run applies
+    // the per-dir list of every folder it visits.
+    const extensionFilter = resolveExtensionFilter(subdir, settings.extensionFilterState);
     await invoke("run_webdav_action", {
       action: isBackup ? "get" : action,
       baseUrl: settings.baseUrl,
@@ -117,6 +123,7 @@ export function useRcloneExecution(
       backup: isBackup || undefined,
       backupDated: isDatedBackup || undefined,
       excludeFolders: excludedFoldersFor(settings.excludedFoldersByDir, subdir, settings.excludedFoldersLegacy),
+      extensionFilter: extensionFilter ?? undefined,
     });
   };
 
