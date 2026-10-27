@@ -87,6 +87,7 @@ fn test_listing_item_count_is_bounded() {
         None,
         None,
         &[],
+        None,
         |m: &str| logs.push(m.to_string()),
     );
     let _ = std::fs::remove_dir_all(&local_dir);
