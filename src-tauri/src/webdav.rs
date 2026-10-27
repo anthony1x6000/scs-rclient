@@ -5346,6 +5346,40 @@ mod tests {
     }
 
     #[test]
+    fn test_read_listing_body_decodes_bom_marked_utf16() {
+        // WebDAV/XML bodies may be UTF-16 with a BOM; the bounded reader
+        // must decode them under the same byte cap instead of failing.
+        let xml = "<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\">\
+                   <D:response><D:href>/course/a.txt</D:href></D:response>\
+                   </D:multistatus>";
+        let units: Vec<u16> = xml.encode_utf16().collect();
+        let mut le = vec![0xFF, 0xFE];
+        for u in units {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        let listing = read_listing_body(&mut std::io::Cursor::new(le))
+            .expect("UTF-16LE with BOM must decode");
+        assert!(parse_propfind_xml(&listing.body).is_ok());
+        let mut be = vec![0xFE, 0xFF];
+        for u in units {
+            be.extend_from_slice(&u.to_be_bytes());
+        }
+        let listing = read_listing_body(&mut std::io::Cursor::new(be))
+            .expect("UTF-16BE with BOM must decode");
+        assert!(parse_propfind_xml(&listing.body).is_ok());
+        // A UTF-8 BOM is accepted and stripped.
+        let mut utf8bom = vec![0xEF, 0xBB, 0xBF];
+        utf8bom.extend_from_slice(xml.as_bytes());
+        let listing = read_listing_body(&mut std::io::Cursor::new(utf8bom))
+            .expect("UTF-8 BOM must be accepted");
+        assert!(parse_propfind_xml(&listing.body).is_ok());
+        // A truncated (odd-length) UTF-16 body fails closed.
+        let mut odd = vec![0xFF, 0xFE, b'x'];
+        let _ = &mut odd;
+        assert!(read_listing_body(&mut std::io::Cursor::new(odd)).is_err());
+    }
+
+    #[test]
     fn test_parse_propfind_xml_rejects_oversized_hrefs() {
         // Item counts alone do not bound retained bytes: without a per-href
         // cap, one href can carry most of a listing body into per-item scan
