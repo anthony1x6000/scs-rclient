@@ -5464,18 +5464,22 @@ mod tests {
         assert!(!has_traversal_sequence("subdir/.hidden_file"));
 
         // Query-scoped collections are distinct listings: a different
-        // share token must never read another token's entry, and the same
-        // token spelled with or without the trailing slash is one
-        // collection and must still hit its entry.
+        // share token must never read another token's entry, and the path
+        // is identity exactly as configured — the trailing slash included —
+        // so the unslashed spelling is a different collection.
         let query_url = "https://example.com/remote/files/?share=token1";
         save_remote_cache(query_url, alice_user, &items);
         assert!(
             load_remote_cache("https://example.com/remote/files?share=token2", alice_user).is_none(),
             "a different share token must not read another token's cached listing"
         );
+        assert!(
+            load_remote_cache("https://example.com/remote/files?share=token1", alice_user).is_none(),
+            "the unslashed path is a different collection and must not read the slashed one's entry"
+        );
         assert_eq!(
-            load_remote_cache("https://example.com/remote/files?share=token1", alice_user)
-                .expect("trailing-slash variant of the same collection must hit its entry")
+            load_remote_cache(query_url, alice_user)
+                .expect("the exact configured spelling must hit its entry")
                 .len(),
             items.len()
         );
