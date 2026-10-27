@@ -10,6 +10,13 @@ import {
   MAX_EXCLUDED_FOLDERS,
   type ExcludedFoldersByDir,
 } from "./exclusions";
+import {
+  normalizeExtensionList,
+  sanitizeExtensionMap,
+  subdirKey,
+  type ExtensionFilterMode,
+  type ExtensionFilterState,
+} from "./extensionFilter";
 
 // Re-exported for existing consumers; the logic lives in the pure `exclusions` module.
 export {
@@ -35,6 +42,10 @@ export const STORE_KEYS = {
   bulkPresets: "bulk_presets",
   scanConcurrency: "scan_concurrency",
   excludedFolders: "excluded_folders",
+  extensionWhitelist: "extension_whitelist",
+  extensionBlacklist: "extension_blacklist",
+  extensionWhitelistBySubdir: "extension_whitelist_by_subdir",
+  extensionBlacklistBySubdir: "extension_blacklist_by_subdir",
   excludedFoldersLegacy: "excluded_folders_legacy",
 } as const;
 
@@ -318,6 +329,53 @@ export async function removeExcludedFolder(subdir: string, folder: string): Prom
   });
 }
 
+
+/** Loads every persisted extension filter; each read is sanitized independently. */
+export async function getExtensionFilterState(): Promise<ExtensionFilterState> {
+  const [globalWhitelist, globalBlacklist, perDirWhitelist, perDirBlacklist] = await Promise.all([
+    getWrapped<unknown>(STORE_KEYS.extensionWhitelist),
+    getWrapped<unknown>(STORE_KEYS.extensionBlacklist),
+    getWrapped<unknown>(STORE_KEYS.extensionWhitelistBySubdir),
+    getWrapped<unknown>(STORE_KEYS.extensionBlacklistBySubdir),
+  ]);
+  return {
+    globalWhitelist: normalizeExtensionList(Array.isArray(globalWhitelist) ? globalWhitelist : []),
+    globalBlacklist: normalizeExtensionList(Array.isArray(globalBlacklist) ? globalBlacklist : []),
+    perDirWhitelist: sanitizeExtensionMap(perDirWhitelist),
+    perDirBlacklist: sanitizeExtensionMap(perDirBlacklist),
+  };
+}
+
+/** Saves (or clears, with an empty list) the global filter for one mode. */
+export async function setGlobalExtensionFilter(
+  mode: ExtensionFilterMode,
+  extensions: readonly string[],
+): Promise<void> {
+  const key =
+    mode === "whitelist" ? STORE_KEYS.extensionWhitelist : STORE_KEYS.extensionBlacklist;
+  await setWrapped(key, normalizeExtensionList(extensions));
+}
+
+/** Saves (or clears, with an empty list) the per-dir filter for one mode. */
+export async function setSubdirExtensionFilter(
+  mode: ExtensionFilterMode,
+  subdir: string,
+  extensions: readonly string[],
+): Promise<void> {
+  const storeKey =
+    mode === "whitelist"
+      ? STORE_KEYS.extensionWhitelistBySubdir
+      : STORE_KEYS.extensionBlacklistBySubdir;
+  const dirKey = subdirKey(subdir);
+  if (!dirKey) throw new Error("Enter a subdirectory first.");
+  const state = await getExtensionFilterState();
+  const map = mode === "whitelist" ? state.perDirWhitelist : state.perDirBlacklist;
+  const list = normalizeExtensionList(extensions);
+  if (list.length > 0) map[dirKey] = list;
+  else delete map[dirKey];
+  await setWrapped(storeKey, map);
+}
+
 /** Load the independent settings reads in parallel (no sequential waterfall). */
 export async function loadAppSettings(): Promise<{
   baseUrl: string;
@@ -327,6 +385,7 @@ export async function loadAppSettings(): Promise<{
   scanConcurrency: number;
   excludedFoldersByDir: ExcludedFoldersByDir;
   excludedFoldersLegacy: string[];
+  extensionFilterState: ExtensionFilterState;
 }> {
   const [baseUrl, selectedSubdir, targetSubdir, username, scanConcurrency] = await Promise.all([
     getWebDAVBase(),
@@ -338,6 +397,7 @@ export async function loadAppSettings(): Promise<{
   // The exclusion state read depends on the selected dir (legacy migration target).
   const { byDir: excludedFoldersByDir, legacy: excludedFoldersLegacy } =
     await getExcludedFoldersState(selectedSubdir);
+  const extensionFilterState = await getExtensionFilterState();
   return {
     baseUrl,
     selectedSubdir,
@@ -346,6 +406,7 @@ export async function loadAppSettings(): Promise<{
     scanConcurrency,
     excludedFoldersByDir,
     excludedFoldersLegacy,
+    extensionFilterState,
   };
 }
 

@@ -50,6 +50,10 @@ pub const MAX_PROCESSED_LISTING_ITEMS: usize = 1_000_000;
 pub const MAX_EXCLUDE_PATTERNS: usize = 64;
 /// Maximum length (in characters) of one excluded folder pattern.
 pub const MAX_EXCLUDE_PATTERN_CHARS: usize = 256;
+/// Maximum number of extension filter entries applied to a single action.
+pub const MAX_EXTENSION_PATTERNS: usize = 64;
+/// Maximum length (in characters) of one extension filter entry.
+pub const MAX_EXTENSION_PATTERN_CHARS: usize = 64;
 /// Default number of attempts for a single WebDAV request before it is treated as failed.
 /// Retrying absorbs transient transport failures (timeouts, connection resets, truncated
 /// bodies) so one flaky request cannot abort an entire multi-file transfer.
@@ -324,6 +328,111 @@ pub fn is_excluded_path(rel_path: &str, is_dir: bool, exclude_folders: &[String]
             })
         }
     })
+}
+
+/// Which side of an extension filter a transfer sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionFilterMode {
+    Whitelist,
+    Blacklist,
+}
+
+impl ExtensionFilterMode {
+    /// Parses the wire format sent by the frontend ("whitelist"/"blacklist"), case-insensitively.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "whitelist" => Some(Self::Whitelist),
+            "blacklist" => Some(Self::Blacklist),
+            _ => None,
+        }
+    }
+}
+
+/// Extension filter applied to every scan: a whitelist passes only listed
+/// extensions, a blacklist drops listed ones. Directories always pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionFilter {
+    pub mode: ExtensionFilterMode,
+    pub extensions: Vec<String>,
+}
+
+impl ExtensionFilter {
+    /// Builds a filter from raw user entries (dots optional, any casing); entries
+    /// that fail normalization are dropped.
+    pub fn new(mode: ExtensionFilterMode, raw: &[String]) -> Self {
+        Self {
+            mode,
+            extensions: normalize_extensions(raw),
+        }
+    }
+
+    /// A filter with no valid entries is inert and allows everything.
+    pub fn is_active(&self) -> bool {
+        !self.extensions.is_empty()
+    }
+
+    /// True when `rel_path` (scan-root relative, any separator style) may transfer.
+    pub fn allows(&self, rel_path: &str) -> bool {
+        if !self.is_active() {
+            return true;
+        }
+        match file_extension(rel_path) {
+            Some(ext) => match self.mode {
+                ExtensionFilterMode::Whitelist => self.extensions.contains(&ext),
+                ExtensionFilterMode::Blacklist => !self.extensions.contains(&ext),
+            },
+            // Files without an extension never pass a whitelist and never match a blacklist.
+            None => self.mode == ExtensionFilterMode::Blacklist,
+        }
+    }
+}
+
+/// Normalizes one user-supplied extension entry: trimmed, leading dots dropped,
+/// lowercased. Only plain alphanumeric entries survive, so an extension can never
+/// smuggle path separators, glob syntax, or whitespace.
+pub fn normalize_extension(raw: &str) -> Option<String> {
+    let stripped = raw.trim().trim_start_matches('.');
+    if stripped.is_empty() || stripped.chars().count() > MAX_EXTENSION_PATTERN_CHARS {
+        return None;
+    }
+    let lowered = stripped.to_lowercase();
+    if !lowered.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(lowered)
+}
+
+/// Normalizes, drops invalid entries, and deduplicates extension entries in order.
+pub fn normalize_extensions(raw: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for entry in raw {
+        if normalized.len() >= MAX_EXTENSION_PATTERNS {
+            break;
+        }
+        if let Some(extension) = normalize_extension(entry) {
+            if seen.insert(extension.clone()) {
+                normalized.push(extension);
+            }
+        }
+    }
+    normalized
+}
+
+/// Returns a file's extension (lowercased) using `Path::extension` semantics:
+/// `"docs/Report.HTML"` → `html`, `"archive.tar.gz"` → `gz`, and `None` for
+/// `"LICENSE"` or a dotfile like `".gitignore"`.
+pub fn file_extension(rel_path: &str) -> Option<String> {
+    Path::new(rel_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase())
+}
+
+/// True when the extension filter admits `rel_path`; directories always pass and
+/// an absent or inert filter allows everything.
+fn extension_allowed(rel_path: &str, is_dir: bool, filter: Option<&ExtensionFilter>) -> bool {
+    is_dir || filter.map_or(true, |f| f.allows(rel_path))
 }
 
 /// Returns the environment-configured default concurrency limit.
@@ -2309,6 +2418,7 @@ where
         auth_user,
         use_cache,
         &[],
+        None,
         log,
     )
 }
@@ -2321,8 +2431,10 @@ where
 ///
 /// Parameters:
 /// - `exclude_folders`: Normalized patterns (see [`normalize_exclude_folders`]).
-/// - `use_cache`: Listing cache is bypassed while exclusions are active, because a cached
-///   listing cannot be reconciled with patterns added or removed since it was saved.
+/// - `extension_filter`: Optional per-file extension filter (see [`ExtensionFilter`]);
+///   files it rejects are dropped from the listing, so they are never transferred.
+/// - `use_cache`: Listing cache is bypassed while any filter is active, because a cached
+///   listing cannot be reconciled with filters added or removed since it was saved.
 pub fn list_remote_recursive_with_exclusions_and_log<F>(
     client: &Client,
     remote_url: &str,
@@ -2331,6 +2443,7 @@ pub fn list_remote_recursive_with_exclusions_and_log<F>(
     auth_user: Option<&str>,
     use_cache: bool,
     exclude_folders: &[String],
+    extension_filter: Option<&ExtensionFilter>,
     mut log: F,
 ) -> Result<Vec<WebdavItem>, String>
 where
@@ -2341,11 +2454,13 @@ where
         return Err("Operation canceled by user.".to_string());
     }
     let cache_requested = use_cache && is_cache_enabled();
-    // A cached listing cannot be reconciled with patterns added or removed since it was
-    // saved, so only reuse the cache when no exclusions are active.
-    let use_cache = use_cache && exclude_folders.is_empty();
+    // A cached listing cannot be reconciled with filters added or removed since it
+    // was saved, so only reuse the cache when no filter is active.
+    let filters_active =
+        !exclude_folders.is_empty() || extension_filter.is_some_and(|f| f.is_active());
+    let use_cache = use_cache && !filters_active;
     if cache_requested && !use_cache {
-        log("Remote listing cache bypassed while folder exclusions are active.\n");
+        log("Remote listing cache bypassed while folder or extension filters are active.\n");
     }
 
     if use_cache && is_cache_enabled() {
@@ -2406,13 +2521,12 @@ where
                 }
                 .into_iter()
                     // A Depth: infinity response is expanded server-side, so drop excluded
-                    // folders and everything under them before they can be cached or used.
+                    // folders, everything under them, and filtered files before they can be
+                    // cached or used.
                     .filter(|item| {
-                        !is_excluded_path(
-                            &relative_item_path(remote_url, &item.href),
-                            item.is_dir,
-                            exclude_folders,
-                        )
+                        let rel = relative_item_path(remote_url, &item.href);
+                        !is_excluded_path(&rel, item.is_dir, exclude_folders)
+                            && extension_allowed(&rel, item.is_dir, extension_filter)
                     })
                     .collect();
                 // Per-listing item caps are enforced by the parser itself:
@@ -2604,6 +2718,7 @@ where
         state_ref: &'env Mutex<ScanState>,
         cvar_ref: &'env Condvar,
         exclude_folders: &'env [String],
+        extension_filter: Option<&'env ExtensionFilter>,
         log_tx: mpsc::Sender<String>,
     ) {
         let worker_log_tx = log_tx;
@@ -2805,6 +2920,11 @@ where
                             continue;
                         }
 
+                        // The extension filter is per-file; directories always pass.
+                        if !extension_allowed(&rel_from_root, item.is_dir, extension_filter) {
+                            continue;
+                        }
+
                         children_in_dir += 1;
                         if item.is_dir {
                             new_dirs += 1;
@@ -2927,6 +3047,7 @@ where
                         state_ref,
                         cvar_ref,
                         exclude_folders,
+                        extension_filter,
                         log_tx.clone(),
                     );
                     continue;
@@ -3055,6 +3176,7 @@ where
         auth_user,
         true,
         &[],
+        None,
         log,
     )?;
     Ok(aggregate_remote_folders(remote_url, &items))
@@ -3072,16 +3194,18 @@ pub fn get_metadata_mtime(metadata: &std::fs::Metadata) -> Option<u64> {
 /// Walks a local directory recursively and returns (path, rel_path, size, mtime).
 /// Skips symlinks to prevent directory traversal and arbitrary file disclosure.
 pub fn collect_local_files_with_mtime(dir: &Path) -> Vec<(PathBuf, String, u64, Option<u64>)> {
-    collect_local_files_with_mtime_excluding(dir, &[])
+    collect_local_files_with_mtime_excluding(dir, &[], None)
 }
 
-/// Walks a local directory recursively, pruning excluded folders before descending.
+/// Walks a local directory recursively, pruning excluded folders and files the
+/// extension filter rejects.
 ///
 /// An excluded directory is never read, so files inside it cannot be uploaded, mirrored,
 /// or reported as missing by comparison actions. Symlinks are skipped as before.
 pub fn collect_local_files_with_mtime_excluding(
     dir: &Path,
     exclude_folders: &[String],
+    extension_filter: Option<&ExtensionFilter>,
 ) -> Vec<(PathBuf, String, u64, Option<u64>)> {
     let mut files = Vec::new();
     if !dir.exists() || !dir.is_dir() {
@@ -3125,6 +3249,9 @@ pub fn collect_local_files_with_mtime_excluding(
                         if is_excluded_path(&rel_str, false, exclude_folders) {
                             continue;
                         }
+                        if !extension_allowed(&rel_str, false, extension_filter) {
+                            continue;
+                        }
                         let meta = entry.metadata().ok();
                         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
                         let mtime = meta.as_ref().and_then(get_metadata_mtime);
@@ -3140,15 +3267,17 @@ pub fn collect_local_files_with_mtime_excluding(
 
 /// Walks a local directory recursively and returns (path, rel_path, size).
 pub fn collect_local_files(dir: &Path) -> Vec<(PathBuf, String, u64)> {
-    collect_local_files_excluding(dir, &[])
+    collect_local_files_excluding(dir, &[], None)
 }
 
-/// Walks a local directory recursively while pruning excluded folders.
+/// Walks a local directory recursively while pruning excluded folders and files the
+/// extension filter rejects.
 pub fn collect_local_files_excluding(
     dir: &Path,
     exclude_folders: &[String],
+    extension_filter: Option<&ExtensionFilter>,
 ) -> Vec<(PathBuf, String, u64)> {
-    collect_local_files_with_mtime_excluding(dir, exclude_folders)
+    collect_local_files_with_mtime_excluding(dir, exclude_folders, extension_filter)
         .into_iter()
         .map(|(p, r, s, _)| (p, r, s))
         .collect()
@@ -3680,15 +3809,19 @@ where
         concurrency,
         auth_user,
         &[],
+        None,
         log,
     )
 }
 
-/// Executes a native WebDAV action, pruning `exclude_folders` from every scan.
+/// Executes a native WebDAV action, pruning `exclude_folders` from every scan and
+/// dropping files the `extension_filter` rejects.
 ///
 /// Excluded folders are skipped on both sides of an operation: the local walk never
 /// descends into them and the remote traversal never requests them. As a result they
-/// are never uploaded, downloaded, compared, or deleted by a mirror (`sync`).
+/// are never uploaded, downloaded, compared, or deleted by a mirror (`sync`). Filtered
+/// extensions behave the same way: the local walk skips those files and the remote
+/// listing drops them, so they never transfer in either direction.
 pub fn execute_webdav_action_with_exclusions<F>(
     client: &Client,
     action: &str,
@@ -3698,6 +3831,7 @@ pub fn execute_webdav_action_with_exclusions<F>(
     concurrency: Option<usize>,
     auth_user: Option<&str>,
     exclude_folders: &[String],
+    extension_filter: Option<&ExtensionFilter>,
     mut log: F,
 ) -> Result<(), String>
 where
@@ -3715,6 +3849,19 @@ where
             exclude_folders.join(", ")
         ));
     }
+    if let Some(filter) = extension_filter {
+        if filter.is_active() {
+            let label = match filter.mode {
+                ExtensionFilterMode::Whitelist => "whitelist",
+                ExtensionFilterMode::Blacklist => "blacklist",
+            };
+            log(&format!(
+                "Extension {}: {}\n",
+                label,
+                filter.extensions.join(", ")
+            ));
+        }
+    }
     match action {
         "ls" => {
             log(&format!(
@@ -3729,6 +3876,7 @@ where
                 auth_user,
                 true,
                 exclude_folders,
+                extension_filter,
                 &mut log,
             )?;
             let mut file_count = 0;
@@ -3801,7 +3949,7 @@ where
             let is_dry = action == "put-dry";
             let with_checksum = action == "put-checksum";
             log(&format!("Reading local files in {}...\n", local_dir.display()));
-            let local_files = collect_local_files_with_mtime_excluding(local_dir, exclude_folders);
+            let local_files = collect_local_files_with_mtime_excluding(local_dir, exclude_folders, extension_filter);
             if local_files.is_empty() {
                 log("No local files found to copy.\n");
                 return Ok(());
@@ -3820,6 +3968,7 @@ where
                 auth_user,
                 true,
                 exclude_folders,
+                extension_filter,
                 &mut log,
             )?;
             let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
@@ -3932,6 +4081,7 @@ where
                 auth_user,
                 false,
                 exclude_folders,
+                extension_filter,
                 &mut log,
             )?;
             let remote_files: Vec<(&WebdavItem, String)> = items
@@ -3948,7 +4098,7 @@ where
                 .collect();
 
             log(&format!("Scanning local files in {}...\n", local_dir.display()));
-            let local_files = collect_local_files_with_mtime_excluding(local_dir, exclude_folders);
+            let local_files = collect_local_files_with_mtime_excluding(local_dir, exclude_folders, extension_filter);
             let mut local_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
             for (_, rel, size, mtime) in local_files {
                 local_map.insert(rel, (size, mtime));
@@ -4309,6 +4459,7 @@ where
                 auth_user,
                 true,
                 exclude_folders,
+                extension_filter,
                 &mut log,
             )?;
             let mut remote_map: HashMap<String, u64> = HashMap::new();
@@ -4321,7 +4472,7 @@ where
                     remote_map.insert(rel, item.size);
                 }
             }
-            let local_files = collect_local_files_excluding(local_dir, exclude_folders);
+            let local_files = collect_local_files_excluding(local_dir, exclude_folders, extension_filter);
             let mut matching = 0;
             let mut differences = 0;
             for (_, rel, local_size) in &local_files {
@@ -4359,7 +4510,7 @@ where
                 local_dir.display(),
                 remote_url
             ));
-            let local_files = collect_local_files_with_mtime_excluding(local_dir, exclude_folders);
+            let local_files = collect_local_files_with_mtime_excluding(local_dir, exclude_folders, extension_filter);
             let mut local_set: HashSet<String> = HashSet::new();
 
             log(&format!("Querying remote files in {} to detect changes...\n", remote_url));
@@ -4371,6 +4522,7 @@ where
                 auth_user,
                 true,
                 exclude_folders,
+                extension_filter,
                 &mut log,
             )?;
             let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
@@ -6065,7 +6217,7 @@ mod tests {
             "assets/cache".to_string(),
             "logs".to_string(),
         ]);
-        let mut collected: Vec<String> = collect_local_files_excluding(&temp_dir, &patterns)
+        let mut collected: Vec<String> = collect_local_files_excluding(&temp_dir, &patterns, None)
             .into_iter()
             .map(|(_, rel, _)| rel)
             .collect();
@@ -6077,6 +6229,170 @@ mod tests {
                 "assets/keep.txt".to_string(),
                 "keep.txt".to_string(),
                 "logs".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_normalize_extension_entries() {
+        assert_eq!(normalize_extension(".HTML"), Some("html".to_string()));
+        assert_eq!(normalize_extension(" Docx "), Some("docx".to_string()));
+        assert_eq!(normalize_extension("txt"), Some("txt".to_string()));
+        assert_eq!(normalize_extension("7Z"), Some("7z".to_string()));
+        assert_eq!(normalize_extension(""), None);
+        assert_eq!(normalize_extension("   "), None);
+        assert_eq!(normalize_extension("a b"), None);
+        assert_eq!(normalize_extension("h/t/ml"), None);
+        assert_eq!(normalize_extension("h\\t"), None);
+        // Only leading dots are decoration; inner dots make it not an extension.
+        assert_eq!(normalize_extension("tar.gz"), None);
+        assert_eq!(
+            normalize_extension(&"x".repeat(MAX_EXTENSION_PATTERN_CHARS + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_normalize_extensions_dedupes_and_caps() {
+        let raw = vec![
+            ".html".to_string(),
+            "HTML".to_string(),
+            " txt ".to_string(),
+            "a b".to_string(),
+            "txt".to_string(),
+        ];
+        assert_eq!(
+            normalize_extensions(&raw),
+            vec!["html".to_string(), "txt".to_string()]
+        );
+        let many: Vec<String> = (0..(MAX_EXTENSION_PATTERNS + 10) as i32)
+            .map(|i| format!("e{i}"))
+            .collect();
+        assert_eq!(normalize_extensions(&many).len(), MAX_EXTENSION_PATTERNS);
+    }
+
+    #[test]
+    fn test_file_extension_std_path_semantics() {
+        assert_eq!(file_extension("docs/Report.HTML"), Some("html".to_string()));
+        assert_eq!(file_extension("archive.tar.gz"), Some("gz".to_string()));
+        assert_eq!(file_extension("LICENSE"), None);
+        // A leading dot alone marks a hidden file, not an extension.
+        assert_eq!(file_extension(".gitignore"), None);
+        assert_eq!(file_extension("dir/"), None);
+    }
+
+    #[test]
+    fn test_extension_filter_allows() {
+        let whitelist = ExtensionFilter::new(
+            ExtensionFilterMode::Whitelist,
+            &[".HTML".to_string(), "txt".to_string()],
+        );
+        assert!(whitelist.is_active());
+        assert!(whitelist.allows("page.HTML"));
+        assert!(whitelist.allows("notes.txt"));
+        assert!(whitelist.allows("docs/page.html"));
+        assert!(!whitelist.allows("data.bin"));
+        // Files without an extension never pass a whitelist.
+        assert!(!whitelist.allows("LICENSE"));
+        // Only the full extension counts: "gz" is listed, "tar.gz" is not.
+        assert!(!whitelist.allows("archive.tar.gz"));
+
+        let blacklist =
+            ExtensionFilter::new(ExtensionFilterMode::Blacklist, &["bin".to_string()]);
+        assert!(!blacklist.allows("blob.BIN"));
+        assert!(blacklist.allows("notes.txt"));
+        // Files without an extension never match a blacklist.
+        assert!(blacklist.allows("LICENSE"));
+
+        // A filter whose entries all normalize away is inactive and allows everything.
+        let inactive = ExtensionFilter::new(
+            ExtensionFilterMode::Whitelist,
+            &["".to_string(), "a b".to_string()],
+        );
+        assert!(!inactive.is_active());
+        assert!(inactive.allows("anything.bin"));
+
+        assert_eq!(
+            ExtensionFilterMode::parse("WHITELIST"),
+            Some(ExtensionFilterMode::Whitelist)
+        );
+        assert_eq!(
+            ExtensionFilterMode::parse("Blacklist"),
+            Some(ExtensionFilterMode::Blacklist)
+        );
+        assert_eq!(ExtensionFilterMode::parse("allowlist"), None);
+    }
+
+    #[test]
+    fn test_collect_local_files_filters_extensions() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "scs_extfilter_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let write = |rel: &str| {
+            let path = temp_dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"data").unwrap();
+        };
+        write("index.html");
+        write("notes.TXT");
+        write("data.bin");
+        write("LICENSE");
+        write("sub/page.html");
+        write("sub/keep.txt");
+
+        let rels = |filter: Option<&ExtensionFilter>| {
+            let mut collected: Vec<String> =
+                collect_local_files_excluding(&temp_dir, &[], filter)
+                    .into_iter()
+                    .map(|(_, rel, _)| rel)
+                    .collect();
+            collected.sort();
+            collected
+        };
+
+        let whitelist = ExtensionFilter::new(
+            ExtensionFilterMode::Whitelist,
+            &[".html".to_string(), "txt".to_string()],
+        );
+        assert_eq!(
+            rels(Some(&whitelist)),
+            vec![
+                "index.html".to_string(),
+                "notes.TXT".to_string(),
+                "sub/keep.txt".to_string(),
+                "sub/page.html".to_string(),
+            ]
+        );
+
+        let blacklist = ExtensionFilter::new(ExtensionFilterMode::Blacklist, &["bin".to_string()]);
+        assert_eq!(
+            rels(Some(&blacklist)),
+            vec![
+                "LICENSE".to_string(),
+                "index.html".to_string(),
+                "notes.TXT".to_string(),
+                "sub/keep.txt".to_string(),
+                "sub/page.html".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            rels(None),
+            vec![
+                "LICENSE".to_string(),
+                "data.bin".to_string(),
+                "index.html".to_string(),
+                "notes.TXT".to_string(),
+                "sub/keep.txt".to_string(),
+                "sub/page.html".to_string(),
             ]
         );
 

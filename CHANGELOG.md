@@ -1,5 +1,12 @@
 # Changelog
 
+## Extension Whitelist / Blacklist
+
+- **Filter by File Type**: Two new buttons in the console toolbar — "Whitelist extension" and "Blacklist extension" — open an editor where you type a comma-separated list (`.html,.txt`; the dot is optional and matching is case-insensitive). A whitelist transfers only the listed file types; a blacklist skips them. Files without an extension (e.g. `LICENSE`) never pass a whitelist and never match a blacklist.
+- **Per-Dir or Global**: Each editor has "Confirm for this dir" (saves a list for the currently selected subdirectory only) and "Confirm for all dirs" (saves the default for every subdirectory). Confirming an empty box clears that scope. A per-dir list replaces the global one for that folder, and a whitelist beats a blacklist in the same scope; the panel shows both scopes plus which mode is actually in effect.
+- **Applies Everywhere, Both Sides**: The filter gates every action (upload, download, previews, backup, compare, list, overwrite) on the local walk and the remote scan alike, so filtered files are never transferred in either direction, and the remote listing cache is bypassed while a filter is active. Bulk runs resolve each ticked folder's own list, so they stay compatible with multi-folder selection.
+- **Tests**: Rust unit tests cover normalization and verdicts, live Copyparty e2e tests prove whitelist/blacklist put/get behavior against the simulated D2L endpoint, and a Vitest suite pins CSV parsing and the per-dir/global resolution rules.
+
 ## Bulk Folder Presets
 
 - **Auto-Saved Bulk Presets**: Every bulk action run saves the ticked folder set as a preset. Identical sets dedupe (the run just refreshes that preset as most recent), the list stays ordered most-recent-first, and it is capped at 20 presets, evicting the oldest past the cap.

@@ -1,11 +1,12 @@
 use scs_rclient_lib::dav_client::Client;
 use scs_rclient_lib::webdav::{
-    build_file_url, collect_local_files, collect_local_files_excluding, compute_sha256,
-    ensure_remote_parent_dirs, execute_webdav_action, execute_webdav_action_with_exclusions,
-    list_remote_folders, list_remote_recursive, list_remote_recursive_with_exclusions_and_log,
-    list_remote_recursive_with_options_and_log, normalize_exclude_folders, parse_propfind_xml,
-    parse_webdav_date, relative_item_path, resolve_item_url, should_download_file,
-    should_upload_file, verify_webdav_auth,
+    ExtensionFilter, ExtensionFilterMode, build_file_url, collect_local_files,
+    collect_local_files_excluding, compute_sha256, ensure_remote_parent_dirs,
+    execute_webdav_action, execute_webdav_action_with_exclusions, list_remote_folders,
+    list_remote_recursive, list_remote_recursive_with_exclusions_and_log,
+    list_remote_recursive_with_options_and_log, normalize_exclude_folders,
+    parse_propfind_xml, parse_webdav_date, relative_item_path, resolve_item_url,
+    should_download_file, should_upload_file, verify_webdav_auth,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -1494,6 +1495,7 @@ fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(put_res.is_ok(), "PUT with exclusions failed: {:?}", put_res);
@@ -1563,6 +1565,7 @@ fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(get_res.is_ok(), "GET with exclusions failed: {:?}", get_res);
@@ -1594,7 +1597,8 @@ fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
         !download_dir.join("build").join("cache").exists(),
         "build/cache must not be created locally"
     );
-    let mut downloaded: Vec<String> = collect_local_files_excluding(&download_dir, &exclusions)
+    let mut downloaded: Vec<String> =
+        collect_local_files_excluding(&download_dir, &exclusions, None)
         .into_iter()
         .map(|(_, rel, _)| rel)
         .collect();
@@ -1616,6 +1620,7 @@ fn test_live_copyparty_excluded_folders_are_not_scanned_or_transferred() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(sync_res.is_ok(), "SYNC with exclusions failed: {:?}", sync_res);
@@ -1787,6 +1792,7 @@ fn test_live_copyparty_excluded_folders_nested_and_path_patterns() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(put_res.is_ok(), "PUT with exclusions failed: {:?}", put_res);
@@ -1870,6 +1876,7 @@ fn test_live_copyparty_excluded_folders_nested_and_path_patterns() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(get_res.is_ok(), "GET with exclusions failed: {:?}", get_res);
@@ -1923,6 +1930,7 @@ fn test_live_copyparty_excluded_folders_nested_and_path_patterns() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(sync_res.is_ok(), "SYNC with exclusions failed: {:?}", sync_res);
@@ -2055,6 +2063,7 @@ fn test_live_copyparty_excluded_folder_above_scan_root_is_untouched() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(put_res.is_ok(), "PUT above-root test failed: {:?}", put_res);
@@ -2117,6 +2126,7 @@ fn test_live_copyparty_excluded_folder_above_scan_root_is_untouched() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(get_res.is_ok(), "GET above-root test failed: {:?}", get_res);
@@ -2160,6 +2170,7 @@ fn test_live_copyparty_excluded_folder_above_scan_root_is_untouched() {
         None,
         None,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     );
     assert!(sync_res.is_ok(), "SYNC above-root test failed: {:?}", sync_res);
@@ -2417,6 +2428,7 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
         None,
         true,
         &exclusions,
+        None,
         |msg| log_output.push_str(msg),
     )
     .expect("scan with exclusions failed");
@@ -2504,6 +2516,344 @@ fn test_scan_prunes_excluded_folders_without_requesting_them() {
     is_running.store(false, Ordering::SeqCst);
     let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
     let _ = server_handle.join();
+}
+
+/// End-to-end coverage for the extension whitelist filter.
+///
+/// A project tree with mixed file types is uploaded and downloaded with a
+/// whitelist of `.HTML` (dot + casing on purpose) and `txt`; only listed
+/// extensions may transfer in either direction. Files without an extension and
+/// files whose full extension is not listed (`.tar.gz` vs `gz`) must stay out.
+#[test]
+fn test_live_copyparty_extension_whitelist_only_listed_extensions_transfer() {
+    let base_url = match live_base_url() {
+        Some(url) => url,
+        None => {
+            eprintln!(
+                "SKIPPED: TEST_WEBDAV_URL not set; skipping live extension whitelist test."
+            );
+            return;
+        }
+    };
+    let client = live_client();
+    let cancel_flag = AtomicBool::new(false);
+    let mut log_output = String::new();
+
+    // Dedicated collection so the test never disturbs the other live tests.
+    let test_url = format!("{}/extension_whitelist_test/", base_url.trim_end_matches('/'));
+    let _ = client.delete(&test_url);
+    let _ = client.mkcol(&test_url);
+
+    let temp_root = std::env::temp_dir().join(format!(
+        "scs_extwl_e2e_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let project_dir = temp_root.join("project");
+    let download_dir = temp_root.join("download");
+
+    let write = |root: &std::path::Path, rel: &str, contents: &[u8]| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    };
+
+    write(&project_dir, "index.html", b"<html>index</html>");
+    write(&project_dir, "docs/notes.TXT", b"notes");
+    write(&project_dir, "data.bin", b"binary-data");
+    write(&project_dir, "LICENSE", b"license");
+    write(&project_dir, "docs/archive.tar.gz", b"gz-bytes");
+
+    let filter = ExtensionFilter::new(
+        ExtensionFilterMode::Whitelist,
+        &[".HTML".to_string(), "txt".to_string()],
+    );
+
+    // 1. Upload: only .html/.txt files are copied, whatever their casing.
+    log_output.clear();
+    let put_res = execute_webdav_action_with_exclusions(
+        &client,
+        "put",
+        &test_url,
+        &project_dir,
+        &cancel_flag,
+        None,
+        None,
+        &[],
+        Some(&filter),
+        |msg| log_output.push_str(msg),
+    );
+    assert!(
+        put_res.is_ok(),
+        "PUT with extension whitelist failed: {:?}",
+        put_res
+    );
+    assert!(
+        log_output.contains("Copied: index.html"),
+        "index.html must upload: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("Copied: docs/notes.TXT"),
+        "docs/notes.TXT must upload (case-insensitive extension match): {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Copied: data.bin"),
+        "data.bin must not upload: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Copied: LICENSE"),
+        "extensionless LICENSE must not upload: {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Copied: docs/archive.tar.gz"),
+        "archive.tar.gz must not upload (full extension not whitelisted): {}",
+        log_output
+    );
+
+    let remote = remote_file_paths(&client, &test_url, &cancel_flag);
+    assert!(remote.contains("index.html"), "remote must hold index.html: {:?}", remote);
+    assert!(
+        remote.contains("docs/notes.TXT"),
+        "remote must hold docs/notes.TXT: {:?}",
+        remote
+    );
+    assert!(!remote.contains("data.bin"), "remote must not hold data.bin: {:?}", remote);
+    assert!(!remote.contains("LICENSE"), "remote must not hold LICENSE: {:?}", remote);
+    assert!(
+        !remote.contains("docs/archive.tar.gz"),
+        "remote must not hold docs/archive.tar.gz: {:?}",
+        remote
+    );
+
+    // 2. Seed a disallowed remote file directly, so the download side must filter it
+    //    itself instead of merely receiving what the filtered upload left behind.
+    let seed_url = build_file_url(&test_url, "seeded/extra.bin");
+    let seed_res = client.put(b"seeded-bin".to_vec(), &seed_url).expect("seed PUT failed");
+    assert!(
+        seed_res.status().is_success(),
+        "seeding extra.bin failed with HTTP {}",
+        seed_res.status()
+    );
+
+    // 3. Download into an empty directory: only whitelisted extensions come down.
+    fs::create_dir_all(&download_dir).unwrap();
+    log_output.clear();
+    let get_res = execute_webdav_action_with_exclusions(
+        &client,
+        "get",
+        &test_url,
+        &download_dir,
+        &cancel_flag,
+        None,
+        None,
+        &[],
+        Some(&filter),
+        |msg| log_output.push_str(msg),
+    );
+    assert!(
+        get_res.is_ok(),
+        "GET with extension whitelist failed: {:?}",
+        get_res
+    );
+    let mut downloaded: Vec<String> = collect_local_files(&download_dir)
+        .into_iter()
+        .map(|(_, rel, _)| rel)
+        .collect();
+    downloaded.sort();
+    assert_eq!(
+        downloaded,
+        vec!["docs/notes.TXT".to_string(), "index.html".to_string()],
+        "only whitelisted extensions may download"
+    );
+    // The seeded disallowed file was filtered from the download, not deleted remotely.
+    let remote_after_get = remote_file_paths(&client, &test_url, &cancel_flag);
+    assert!(
+        remote_after_get.contains("seeded/extra.bin"),
+        "seeded extra.bin must stay remote after a filtered download: {:?}",
+        remote_after_get
+    );
+
+    // Cleanup: remove the dedicated remote collection and local temp tree.
+    if let Ok(items) = list_remote_recursive(&client, &test_url, &cancel_flag) {
+        for item in items {
+            let rel = relative_item_path(&test_url, &item.href);
+            if !rel.is_empty() {
+                let _ = client.delete(&resolve_item_url(&test_url, &item.href));
+            }
+        }
+    }
+    let _ = client.delete(&test_url);
+    let _ = fs::remove_dir_all(&temp_root);
+}
+
+/// End-to-end coverage for the extension blacklist filter.
+///
+/// With `BIN` blacklisted (casing on purpose), uploads and downloads keep every
+/// other file — including files without an extension, which never match.
+#[test]
+fn test_live_copyparty_extension_blacklist_drops_listed_extensions() {
+    let base_url = match live_base_url() {
+        Some(url) => url,
+        None => {
+            eprintln!(
+                "SKIPPED: TEST_WEBDAV_URL not set; skipping live extension blacklist test."
+            );
+            return;
+        }
+    };
+    let client = live_client();
+    let cancel_flag = AtomicBool::new(false);
+    let mut log_output = String::new();
+
+    let test_url = format!("{}/extension_blacklist_test/", base_url.trim_end_matches('/'));
+    let _ = client.delete(&test_url);
+    let _ = client.mkcol(&test_url);
+
+    let temp_root = std::env::temp_dir().join(format!(
+        "scs_extbl_e2e_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let project_dir = temp_root.join("project");
+    let download_dir = temp_root.join("download");
+
+    let write = |root: &std::path::Path, rel: &str, contents: &[u8]| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    };
+
+    write(&project_dir, "page.html", b"<html>page</html>");
+    write(&project_dir, "src/main.rs", b"fn main() {}");
+    write(&project_dir, "blob.BIN", b"blob-bytes");
+    write(&project_dir, "LICENSE", b"license");
+
+    let filter =
+        ExtensionFilter::new(ExtensionFilterMode::Blacklist, &["BIN".to_string()]);
+
+    // 1. Upload: everything except the blacklisted extension.
+    log_output.clear();
+    let put_res = execute_webdav_action_with_exclusions(
+        &client,
+        "put",
+        &test_url,
+        &project_dir,
+        &cancel_flag,
+        None,
+        None,
+        &[],
+        Some(&filter),
+        |msg| log_output.push_str(msg),
+    );
+    assert!(
+        put_res.is_ok(),
+        "PUT with extension blacklist failed: {:?}",
+        put_res
+    );
+    assert!(
+        log_output.contains("Copied: page.html"),
+        "page.html must upload: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("Copied: src/main.rs"),
+        "src/main.rs must upload: {}",
+        log_output
+    );
+    assert!(
+        log_output.contains("Copied: LICENSE"),
+        "extensionless LICENSE must upload (never matches a blacklist): {}",
+        log_output
+    );
+    assert!(
+        !log_output.contains("Copied: blob.BIN"),
+        "blob.BIN must not upload: {}",
+        log_output
+    );
+
+    let remote = remote_file_paths(&client, &test_url, &cancel_flag);
+    assert!(remote.contains("page.html"), "remote must hold page.html: {:?}", remote);
+    assert!(
+        remote.contains("src/main.rs"),
+        "remote must hold src/main.rs: {:?}",
+        remote
+    );
+    assert!(remote.contains("LICENSE"), "remote must hold LICENSE: {:?}", remote);
+    assert!(!remote.contains("blob.BIN"), "remote must not hold blob.BIN: {:?}", remote);
+
+    // 2. Seed the blacklisted remote file directly, so the download side must filter
+    //    it itself instead of merely never having received it.
+    let seed_url = build_file_url(&test_url, "seeded/blob.BIN");
+    let seed_res = client.put(b"seeded-bin".to_vec(), &seed_url).expect("seed PUT failed");
+    assert!(
+        seed_res.status().is_success(),
+        "seeding blob.BIN failed with HTTP {}",
+        seed_res.status()
+    );
+
+    // 3. Download into an empty directory: the blacklisted extension stays remote.
+    fs::create_dir_all(&download_dir).unwrap();
+    log_output.clear();
+    let get_res = execute_webdav_action_with_exclusions(
+        &client,
+        "get",
+        &test_url,
+        &download_dir,
+        &cancel_flag,
+        None,
+        None,
+        &[],
+        Some(&filter),
+        |msg| log_output.push_str(msg),
+    );
+    assert!(
+        get_res.is_ok(),
+        "GET with extension blacklist failed: {:?}",
+        get_res
+    );
+    let mut downloaded: Vec<String> = collect_local_files(&download_dir)
+        .into_iter()
+        .map(|(_, rel, _)| rel)
+        .collect();
+    downloaded.sort();
+    assert_eq!(
+        downloaded,
+        vec![
+            "LICENSE".to_string(),
+            "page.html".to_string(),
+            "src/main.rs".to_string(),
+        ],
+        "only non-blacklisted extensions may download"
+    );
+    // The seeded blacklisted file was filtered from the download, not deleted remotely.
+    let remote_after_get = remote_file_paths(&client, &test_url, &cancel_flag);
+    assert!(
+        remote_after_get.contains("seeded/blob.BIN"),
+        "seeded blob.BIN must stay remote after a filtered download: {:?}",
+        remote_after_get
+    );
+
+    // Cleanup: remove the dedicated remote collection and local temp tree.
+    if let Ok(items) = list_remote_recursive(&client, &test_url, &cancel_flag) {
+        for item in items {
+            let rel = relative_item_path(&test_url, &item.href);
+            if !rel.is_empty() {
+                let _ = client.delete(&resolve_item_url(&test_url, &item.href));
+            }
+        }
+    }
+    let _ = client.delete(&test_url);
+    let _ = fs::remove_dir_all(&temp_root);
 }
 
 /// The folder picker must surface every remote folder with the total size of the

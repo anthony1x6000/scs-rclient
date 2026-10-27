@@ -156,6 +156,7 @@ fn test_credentials_reach_only_validated_origin_never_attacker() {
             None,
             Some(TEST_USER),
             &[],
+            None,
             &mut log,
         )
     };
