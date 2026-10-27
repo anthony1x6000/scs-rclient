@@ -5386,6 +5386,19 @@ mod tests {
             "an ambiguous credential must not poison the anonymous entry"
         );
 
+        // Trailing slashes are part of the collection path: /files and
+        // /files/ are distinct collections and must not share a key or an
+        // entry (a shared entry steers the sync delete set at the wrong
+        // collection).
+        let slashed = "https://example.com/remote/files/";
+        let unslashed = "https://example.com/remote/files";
+        assert_ne!(cache_key(slashed, alice_user), cache_key(unslashed, alice_user));
+        save_remote_cache(slashed, alice_user, &items);
+        assert!(
+            load_remote_cache(unslashed, alice_user).is_none(),
+            "the unslashed collection must not read the slashed one's entry"
+        );
+
         // Update item in alice's cache
         update_remote_cache_item(test_url, alice_user, "doc.pdf", 8192, Some(12345678));
         let updated = load_remote_cache(test_url, alice_user).unwrap();
