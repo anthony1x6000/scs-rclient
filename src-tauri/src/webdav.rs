@@ -482,16 +482,56 @@ pub fn has_traversal_sequence(s: &str) -> bool {
 /// Computes a normalized cache key partitioned by authenticated credential context.
 ///
 /// Multi-Account Isolation:
-/// Cache keys include the authenticated username when available (`username@clean_url`) to prevent
-/// cache collisions across different user credentials accessing the same WebDAV host (CWE-287 / CWE-384).
+/// Cache keys include the authenticated username when available (`u1:username@clean_url`, username
+/// at its exact case) to prevent cache collisions across different user credentials accessing the
+/// same WebDAV host (CWE-287 / CWE-384).
 pub fn cache_key(remote_url: &str, auth_user: Option<&str>) -> String {
-    let clean_url = remote_url.trim_end_matches('/').to_ascii_lowercase();
+    // Fold case only where the URL grammar is case-insensitive (scheme,
+    // host); the path selects the collection and is case-sensitive
+    // (RFC 3986 6.2.2.1), so /dav/A/ and /dav/a/ must keep distinct keys.
+    // The query selects the collection on query-aware endpoints (share
+    // tokens, tenants), so it partitions the key exactly as sent. URL
+    // userinfo never reaches here: validate_webdav_url_internal rejects
+    // credentials embedded in the URL before any client exists.
+    let clean_url = match reqwest::Url::parse(remote_url) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+            // host_str() returns IPv6 literals WITHOUT brackets; re-wrap
+            // them or [::1]:8080 and ::1 (or a different v6 host) collide.
+            let host_display = if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            };
+            let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+            // The path is kept EXACTLY as configured, trailing slash
+            // included: it is part of the collection identity, and folding
+            // it away would let /dav/A read or mutate /dav/A/'s entry.
+            let path = url.path();
+            let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+            format!("{}://{}{}{}{}", url.scheme(), host_display, port, path, query)
+        }
+        Err(_) => remote_url.trim_end_matches('/').to_string(),
+    };
     match auth_user {
         Some(user) if !user.trim().is_empty() => {
-            format!("{}@{}", user.trim().to_ascii_lowercase(), clean_url)
+            // Usernames are opaque, case-sensitive tokens compared by
+            // exact bytes, and the key LENGTH-PREFIXES the name so a
+            // username containing '@' can never collide with a different
+            // (user, url) pair that concatenates to the same string.
+            // The `u1:` marker versions the user-scoped key format.
+            format!("u1:{}:{user}@{clean_url}", user.len())
         }
         _ => clean_url,
     }
+}
+
+/// True when a presented username names no account yet is not anonymous
+/// either (empty or nothing but whitespace). Cache entry points refuse it
+/// outright: an entry under it could be scoped to no credential at all, and
+/// conflating it with anonymous would let one read the other's listings.
+fn ambiguous_username(auth_user: Option<&str>) -> bool {
+    auth_user.is_some_and(|u| u.trim().is_empty())
 }
 
 /// Represents a cached remote WebDAV directory listing.
@@ -670,11 +710,59 @@ fn write_cache_map(path: &Path, cache: &HashMap<String, CachedRemoteListing>) {
 /// - Validates that hrefs and relative paths do not contain directory traversal sequences (`has_traversal_sequence`).
 /// - Legitimate hidden files (e.g. `.gitignore`, `.env`) are preserved.
 /// - Does not rely on rigid prefix matching, correctly supporting root-relative hrefs returned by WebDAV servers.
+/// Equality modulo the case-insensitive parts of the URL grammar: scheme and
+/// host compare case-insensitively; path (exactly as configured) and query
+/// compare exactly. Ports compare via port_or_known_default, so an omitted
+/// default port and its explicit spelling are the same collection here even
+/// though the cache KEY keeps them distinct — key over-partitioning is
+/// harmless (a miss), while comparator under-matching would cross-serve.
+fn url_same_collection(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            let host_a = a.host_str().unwrap_or_default().to_ascii_lowercase();
+            let host_b = b.host_str().unwrap_or_default().to_ascii_lowercase();
+            a.scheme() == b.scheme()
+                && host_a == host_b
+                && a.port_or_known_default() == b.port_or_known_default()
+                && a.path() == b.path()
+                && a.query() == b.query()
+        }
+        // Unparseable stored entries never match a parseable request.
+        (Err(_), Err(_)) => a.trim_end_matches('/') == b.trim_end_matches('/'),
+        _ => false,
+    }
+}
+
+/// Equality for the cached credential: usernames are opaque tokens compared
+/// by exact bytes — case and surrounding whitespace distinguish accounts on
+/// case-sensitive WebDAV servers, and an absent credential (anonymous) is
+/// distinct from any username, empty included.
+fn same_auth_user(stored: &Option<String>, requested: Option<&str>) -> bool {
+    match (stored.as_deref(), requested) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Vec<WebdavItem>> {
     let path = get_cache_file_path()?;
     let cache = read_cache_map(&path);
+    if ambiguous_username(auth_user) {
+        return None;
+    }
     let key = cache_key(remote_url, auth_user);
-    let entry = cache.get(&key)?;
+    let entry = cache.get(&key).filter(|entry| {
+        // Key equality is necessary but not sufficient: the stored URL must
+        // match the requested collection as well — scheme and host
+        // case-insensitively (per URL grammar), the path exactly — and the
+        // stored credential must equal the requested username exactly, so
+        // no entry can ever be served for a different collection or a
+        // case-variant credential.
+        url_same_collection(&entry.remote_url, remote_url)
+            && same_auth_user(&entry.auth_user, auth_user)
+    })?;
+
 
     let ttl = get_cache_ttl_secs();
     if ttl > 0 {
@@ -730,12 +818,15 @@ pub fn save_remote_cache(remote_url: &str, auth_user: Option<&str>, items: &[Web
         safe_items.push(item.clone());
     }
 
+    if ambiguous_username(auth_user) {
+        return;
+    }
     let key = cache_key(remote_url, auth_user);
     cache.insert(
         key,
         CachedRemoteListing {
             remote_url: remote_url.to_string(),
-            auth_user: auth_user.map(|u| u.trim().to_ascii_lowercase()),
+            auth_user: auth_user.map(|u| u.to_string()),
             timestamp: now,
             items: safe_items,
         },
@@ -764,8 +855,18 @@ pub fn update_remote_cache_item(
         return;
     }
 
+    if ambiguous_username(auth_user) {
+        return;
+    }
     let key = cache_key(remote_url, auth_user);
     if let Some(entry) = cache.get_mut(&key) {
+        // Key equality alone must never authorize a mutation: the stored
+        // collection and credential are rechecked exactly as load does.
+        if !url_same_collection(&entry.remote_url, remote_url)
+            || !same_auth_user(&entry.auth_user, auth_user)
+        {
+            return;
+        }
         let expected_url = build_file_url(remote_url, rel_path);
         let mut found = false;
         for item in &mut entry.items {
@@ -803,8 +904,18 @@ pub fn remove_remote_cache_item(remote_url: &str, auth_user: Option<&str>, rel_p
         return;
     }
 
+    if ambiguous_username(auth_user) {
+        return;
+    }
     let key = cache_key(remote_url, auth_user);
     if let Some(entry) = cache.get_mut(&key) {
+        // Key equality alone must never authorize a mutation: the stored
+        // collection and credential are rechecked exactly as load does.
+        if !url_same_collection(&entry.remote_url, remote_url)
+            || !same_auth_user(&entry.auth_user, auth_user)
+        {
+            return;
+        }
         let expected_url = build_file_url(remote_url, rel_path);
         entry.items.retain(|item| {
             let item_rel = relative_item_path(remote_url, &item.href);
@@ -4565,6 +4676,28 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_key_does_not_fold_url_path_case() {
+        // URL paths are case-sensitive (RFC 3986 6.2.2.1): two collections
+        // differing only in path case are distinct remotes and must never
+        // share a listing-cache entry (a shared entry steers sync's
+        // delete set at the wrong collection).
+        assert_ne!(
+            cache_key("https://h.example/dav/A/", Some("u")),
+            cache_key("https://h.example/dav/a/", Some("u"))
+        );
+        // Scheme and host remain case-insensitive by URL grammar.
+        assert_eq!(
+            cache_key("https://H.EXAMPLE/dav/A/", Some("u")),
+            cache_key("https://h.example/dav/A/", Some("u"))
+        );
+        // Host case folding must not leak into the path.
+        assert_ne!(
+            cache_key("https://h.example/dav/A/", Some("u")),
+            cache_key("https://H.example/dav/a/", Some("u"))
+        );
+    }
+
+    #[test]
     fn test_validate_webdav_url_rejects_parser_normalized_traversal() {
         // Url::parse trims C0 control/space at both ends and drops ASCII
         // tab/LF/CR anywhere, so these raw spellings reach the parser as a
@@ -4797,6 +4930,26 @@ mod tests {
             )
             .is_err(),
             "a second root after the closed multistatus must be an error"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_keeps_query_distinct() {
+        // Queries select distinct collections on query-aware WebDAV
+        // endpoints (share tokens, tenants), so they must partition the
+        // key; the path's insignificant trailing slash must not.
+        assert_ne!(
+            cache_key("https://h.example/dav?share=a", Some("u")),
+            cache_key("https://h.example/dav?share=b", Some("u"))
+        );
+        assert_ne!(
+            cache_key("https://h.example/dav/?share=a", Some("u")),
+            cache_key("https://h.example/dav?share=a", Some("u")),
+            "the trailing slash is part of the collection identity"
+        );
+        assert_eq!(
+            cache_key("https://h.example/dav?share=a", Some("u")),
+            cache_key("https://h.example/dav?share=a", Some("u"))
         );
     }
 
@@ -5225,6 +5378,62 @@ mod tests {
         let loaded_bob = load_remote_cache(test_url, bob_user);
         assert!(loaded_bob.is_none(), "Bob should not see Alice's cached items");
 
+        // Case-variant usernames are distinct credentials: WebDAV usernames
+        // are opaque, case-sensitive tokens, so "Alice" is not "alice" and
+        // must neither read her listing nor share her key; an anonymous
+        // request must not read it either.
+        let case_variant_alice = Some("Alice");
+        assert_ne!(cache_key(test_url, alice_user), cache_key(test_url, case_variant_alice));
+        assert!(
+            load_remote_cache(test_url, case_variant_alice).is_none(),
+            "Alice (case variant) should not see alice's cached items"
+        );
+        assert!(
+            load_remote_cache(test_url, None).is_none(),
+            "an anonymous request should not see alice's cached items"
+        );
+
+        // Exact usernames: trailing whitespace distinguishes credentials,
+        // and an ambiguous (empty/whitespace-only) username is neither
+        // anonymous nor any account — cache entry points refuse it entirely
+        // instead of conflating it with either.
+        let spaced_alice = Some("alice ");
+        assert_ne!(cache_key(test_url, alice_user), cache_key(test_url, spaced_alice));
+        assert!(
+            load_remote_cache(test_url, spaced_alice).is_none(),
+            "a trailing-space username is a different credential"
+        );
+        assert!(
+            load_remote_cache(test_url, Some("")).is_none(),
+            "an empty username is not anonymous and must read nothing"
+        );
+        // Anonymous and empty-string are distinct credentials: alice's
+        // stored entry answers neither (behavioral check — the comparator
+        // itself is exercised through load).
+        assert!(load_remote_cache(test_url, None).is_none());
+        save_remote_cache(test_url, Some(""), &items);
+        assert!(
+            load_remote_cache(test_url, Some("")).is_none(),
+            "ambiguous credentials are never cached"
+        );
+        assert!(
+            load_remote_cache(test_url, None).is_none(),
+            "an ambiguous credential must not poison the anonymous entry"
+        );
+
+        // Trailing slashes are part of the collection path: /files and
+        // /files/ are distinct collections and must not share a key or an
+        // entry (a shared entry steers the sync delete set at the wrong
+        // collection).
+        let slashed = "https://example.com/remote/files/";
+        let unslashed = "https://example.com/remote/files";
+        assert_ne!(cache_key(slashed, alice_user), cache_key(unslashed, alice_user));
+        save_remote_cache(slashed, alice_user, &items);
+        assert!(
+            load_remote_cache(unslashed, alice_user).is_none(),
+            "the unslashed collection must not read the slashed one's entry"
+        );
+
         // Update item in alice's cache
         update_remote_cache_item(test_url, alice_user, "doc.pdf", 8192, Some(12345678));
         let updated = load_remote_cache(test_url, alice_user).unwrap();
@@ -5263,6 +5472,27 @@ mod tests {
         assert!(!has_traversal_sequence(".gitignore"));
         assert!(!has_traversal_sequence(".env"));
         assert!(!has_traversal_sequence("subdir/.hidden_file"));
+
+        // Query-scoped collections are distinct listings: a different
+        // share token must never read another token's entry, and the path
+        // is identity exactly as configured — the trailing slash included —
+        // so the unslashed spelling is a different collection.
+        let query_url = "https://example.com/remote/files/?share=token1";
+        save_remote_cache(query_url, alice_user, &items);
+        assert!(
+            load_remote_cache("https://example.com/remote/files?share=token2", alice_user).is_none(),
+            "a different share token must not read another token's cached listing"
+        );
+        assert!(
+            load_remote_cache("https://example.com/remote/files?share=token1", alice_user).is_none(),
+            "the unslashed path is a different collection and must not read the slashed one's entry"
+        );
+        assert_eq!(
+            load_remote_cache(query_url, alice_user)
+                .expect("the exact configured spelling must hit its entry")
+                .len(),
+            items.len()
+        );
 
         clear_remote_cache().unwrap();
         assert!(!temp_cache.exists());
