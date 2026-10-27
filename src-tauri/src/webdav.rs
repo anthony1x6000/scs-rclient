@@ -1138,13 +1138,17 @@ pub fn is_safe_relative_path(path: &str) -> bool {
 }
 
 /// Creates the hidden, unpredictable temporary sibling a streamed download
-/// writes into before it replaces the destination. The name mixes the target
-/// name with OS-seeded randomness (`RandomState`), the clock, the pid, and a
-/// process-wide counter, and the file is opened with `create_new`, so the
-/// path is guaranteed not to exist before this call: no other file — a
-/// sibling the server listed, the destination itself, or another worker's
-/// temp — can be truncated by opening it, and cleanup only ever removes a
-/// file this call created.
+/// writes into before it replaces the destination. The name is fixed-form
+/// and target-independent (`.scs-part-<noise>`): the noise mixes OS-seeded
+/// randomness (`RandomState`), the clock, the pid, and a process-wide
+/// counter, and the file is opened with `create_new`, so the path is
+/// guaranteed not to exist before this call: no other file — a sibling the
+/// server listed, the destination itself, or another worker's temp — can be
+/// truncated by opening it, and cleanup only ever removes a file this call
+/// created. Creating the temp also requires write permission on the parent
+/// directory (the rename does too): a writable file inside a non-writable
+/// or sticky directory, which the old in-place truncate could write, now
+/// fails loudly before any byte is fetched.
 fn create_unique_part_file(target: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
     use std::hash::{BuildHasher, Hasher};
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
@@ -3734,10 +3738,9 @@ where
                             )));
                         }
                         // The replaced file keeps the prior file's Unix
-                        // mode bits (setuid/setgid stripped: the new content
-                        // is not the old owner's), applied only now, after
-                        // the body is fully written, so a read-only mode can
-                        // never block the stream. Known regression vs the
+                        // OWNER mode bits, applied only now, after the body
+                        // is fully written, so a read-only mode can never
+                        // block the stream. Known regression vs the
                         // old truncate-in-place path, documented in the PR:
                         // an atomic rename swaps the inode, so owner/group,
                         // xattrs, POSIX ACLs, and Windows security
@@ -3749,19 +3752,30 @@ where
                         // by default, instead of the umask default.
                         #[cfg(unix)]
                         if let Ok(prior) = std::fs::symlink_metadata(&target_file) {
-                            let mode = {
-                                use std::os::unix::fs::PermissionsExt;
-                                std::fs::Permissions::from_mode(prior.permissions().mode() & !0o6000)
-                            };
-                            std::fs::set_permissions(&temp_file, mode).map_err(
-                                |e| {
-                                    remove_part_file(&temp_file);
-                                    AttemptError::Fatal(format!(
-                                        "Failed to apply the prior file's permissions to {}: {e}",
-                                        temp_file.display()
-                                    ))
-                                },
-                            )?;
+                            // Only a still-regular destination contributes a
+                            // mode: anything swapped in mid-flight (a symlink
+                            // would carry 0777) must not widen the temp.
+                            if prior.is_file() {
+                                let mode = {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    // Owner bits only: the replace loses the
+                                    // original group/owner, so keeping
+                                    // group/other bits would grant them to
+                                    // whoever the new group happens to be.
+                                    std::fs::Permissions::from_mode(
+                                        prior.permissions().mode() & 0o700,
+                                    )
+                                };
+                                std::fs::set_permissions(&temp_file, mode).map_err(
+                                    |e| {
+                                        remove_part_file(&temp_file);
+                                        AttemptError::Fatal(format!(
+                                            "Failed to apply the prior file's permissions to {}: {e}",
+                                            temp_file.display()
+                                        ))
+                                    },
+                                )?;
+                            }
                         }
                         // Atomic replace: the destination is only ever touched
                         // with a complete, size-checked body. std's rename

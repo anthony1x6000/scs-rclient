@@ -250,8 +250,8 @@ fn test_successful_download_preserves_target_permissions() {
     assert_eq!(after, b"xxxxxxxx", "the full body must land (logs: {logs:?})");
     assert_eq!(
         mode & 0o777,
-        0o644,
-        "replacing the target must keep the prior file's distinct mode (logs: {logs:?})"
+        0o600,
+        "the replace keeps the prior file's OWNER bits only — group/other are dropped with the inode (logs: {logs:?})"
     );
 }
 
@@ -287,6 +287,8 @@ fn test_read_only_target_is_refused_not_replaced() {
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&local_dir);
+        std::env::remove_var("ALLOW_INSECURE_WEBDAV");
+        std::env::remove_var("WEBDAV_CACHE_DISABLED");
         return; // running with DAC override: nothing to assert
     }
     let mut logs = Vec::new();
@@ -318,5 +320,40 @@ fn test_read_only_target_is_refused_not_replaced() {
     assert!(
         logs.iter().any(|l| l.to_ascii_lowercase().contains("permission") || l.to_ascii_lowercase().contains("not writable")),
         "the refusal must say why (logs: {logs:?})"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_non_writable_directory_fails_loudly() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env_guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var("ALLOW_INSECURE_WEBDAV", "1");
+    std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let port = spawn_server(vec![("a.txt".to_string(), 8)], true, stop.clone()).unwrap();
+    let local_dir = std::env::temp_dir().join(format!("scs-atomic-rodir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&local_dir);
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let original = b"PRIOR CONTENT";
+    std::fs::write(local_dir.join("a.txt"), original).unwrap();
+    // Read-only DIRECTORY: the old in-place truncate could still write the
+    // (writable) file inside it; the atomic replace needs to create a temp
+    // sibling there and must fail loudly instead, leaving the file intact.
+    std::fs::set_permissions(&local_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let mut logs = Vec::new();
+    run_get_action(port, &local_dir, &mut logs);
+    stop.store(true, Ordering::SeqCst);
+
+    let after = std::fs::read(local_dir.join("a.txt")).unwrap_or_default();
+    std::fs::set_permissions(&local_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_dir_all(&local_dir);
+    std::env::remove_var("ALLOW_INSECURE_WEBDAV");
+    std::env::remove_var("WEBDAV_CACHE_DISABLED");
+
+    assert_eq!(
+        after, original,
+        "a read-only directory must keep the prior file — the replace refuses loudly (logs: {logs:?})"
     );
 }
