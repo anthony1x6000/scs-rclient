@@ -5426,14 +5426,14 @@ mod tests {
                    </D:multistatus>";
         let units: Vec<u16> = xml.encode_utf16().collect();
         let mut le = vec![0xFF, 0xFE];
-        for u in units {
+        for u in &units {
             le.extend_from_slice(&u.to_le_bytes());
         }
         let listing = read_listing_body(&mut std::io::Cursor::new(le))
             .expect("UTF-16LE with BOM must decode");
         assert!(parse_propfind_xml(&listing.body).is_ok());
         let mut be = vec![0xFE, 0xFF];
-        for u in units {
+        for u in &units {
             be.extend_from_slice(&u.to_be_bytes());
         }
         let listing = read_listing_body(&mut std::io::Cursor::new(be))
