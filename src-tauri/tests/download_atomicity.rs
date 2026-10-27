@@ -19,9 +19,12 @@ static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// that either deliver the full advertised body or truncate it to 4 bytes and
 /// drop the connection. Accept loop polls `stop`, so the thread terminates
 /// when the action finishes and join() can never hang CI.
+/// Body policy per GET: `None` truncates mid-stream and drops the
+/// connection; `Some(n)` sends exactly `n` bytes as a cleanly terminated
+/// body (which may legitimately differ from the advertised size in tests).
 fn spawn_server(
     listing: Vec<(String, u64)>,
-    full_bodies: bool,
+    full_bodies: Option<u64>,
     stop: Arc<AtomicBool>,
 ) -> std::io::Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -96,18 +99,21 @@ fn spawn_server(
                     "HTTP/1.1 200 OK\r\nContent-Length: {advertised}\r\nConnection: close\r\n\r\n"
                 );
                 let _ = stream.write_all(headers.as_bytes());
-                if full_bodies {
-                    let mut remaining = advertised;
-                    while remaining > 0 {
-                        let n = remaining.min(4096) as usize;
-                        let _ = stream.write_all(&vec![b'x'; n]);
-                        remaining -= n as u64;
+                match full_bodies {
+                    Some(exact) => {
+                        let mut remaining = exact;
+                        while remaining > 0 {
+                            let n = remaining.min(4096) as usize;
+                            let _ = stream.write_all(&vec![b'x'; n]);
+                            remaining -= n as u64;
+                        }
                     }
-                } else {
-                    let _ = stream.write_all(b"abcd");
-                    let _ = stream.flush();
-                    std::thread::sleep(Duration::from_millis(100));
-                    drop(stream);
+                    None => {
+                        let _ = stream.write_all(b"abcd");
+                        let _ = stream.flush();
+                        std::thread::sleep(Duration::from_millis(100));
+                        drop(stream);
+                    }
                 }
             }
         }
@@ -139,7 +145,7 @@ fn test_failed_download_preserves_existing_local_file() {
     std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
 
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_server(vec![("a.txt".to_string(), 4096)], false, stop.clone()).unwrap();
+    let port = spawn_server(vec![("a.txt".to_string(), 4096)], None, stop.clone()).unwrap();
     let local_dir = std::env::temp_dir().join(format!("scs-atomic-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&local_dir);
     std::fs::create_dir_all(&local_dir).unwrap();
@@ -182,7 +188,7 @@ fn test_temp_name_collision_cannot_destroy_sibling_file() {
             (collide.clone(), 4096),
             (hidden.clone(), 4096),
         ],
-        false,
+        None,
         stop.clone(),
     )
     .unwrap();
@@ -226,7 +232,7 @@ fn test_successful_download_preserves_target_permissions() {
     std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
 
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_server(vec![("a.txt".to_string(), 8)], true, stop.clone()).unwrap();
+    let port = spawn_server(vec![("a.txt".to_string(), 8)], Some(8), stop.clone()).unwrap();
     let local_dir = std::env::temp_dir().join(format!("scs-atomic-mode-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&local_dir);
     std::fs::create_dir_all(&local_dir).unwrap();
@@ -264,7 +270,7 @@ fn test_read_only_target_is_refused_not_replaced() {
     std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
 
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_server(vec![("a.txt".to_string(), 8)], true, stop.clone()).unwrap();
+    let port = spawn_server(vec![("a.txt".to_string(), 8)], Some(8), stop.clone()).unwrap();
     let local_dir = std::env::temp_dir().join(format!("scs-atomic-ro-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&local_dir);
     std::fs::create_dir_all(&local_dir).unwrap();
@@ -332,7 +338,7 @@ fn test_non_writable_directory_fails_loudly() {
     std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
 
     let stop = Arc::new(AtomicBool::new(false));
-    let port = spawn_server(vec![("a.txt".to_string(), 8)], true, stop.clone()).unwrap();
+    let port = spawn_server(vec![("a.txt".to_string(), 8)], Some(8), stop.clone()).unwrap();
     let local_dir = std::env::temp_dir().join(format!("scs-atomic-rodir-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&local_dir);
     std::fs::create_dir_all(&local_dir).unwrap();
@@ -355,5 +361,48 @@ fn test_non_writable_directory_fails_loudly() {
     assert_eq!(
         after, original,
         "a read-only directory must keep the prior file — the replace refuses loudly (logs: {logs:?})"
+    );
+}
+
+#[test]
+fn test_short_clean_body_does_not_replace_prior_file() {
+    let _env_guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var("ALLOW_INSECURE_WEBDAV", "1");
+    std::env::set_var("WEBDAV_CACHE_DISABLED", "1");
+
+    // The listing advertises 16 bytes; the GET returns a CLEANLY terminated
+    // 8-byte body (as a hostile chunked response would). A truncated body
+    // that ends without error must not replace the prior local file.
+    let stop = Arc::new(AtomicBool::new(false));
+    let port = spawn_server(vec![("a.txt".to_string(), 16)], Some(8), stop.clone()).unwrap();
+    let local_dir = std::env::temp_dir().join(format!("scs-atomic-short-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&local_dir);
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let original = b"PRIOR FULL CONTENT";
+    std::fs::write(local_dir.join("a.txt"), original).unwrap();
+    let mut logs = Vec::new();
+    run_get_action(port, &local_dir, &mut logs);
+    stop.store(true, Ordering::SeqCst);
+
+    let after = std::fs::read(local_dir.join("a.txt")).unwrap_or_default();
+    let temps: Vec<_> = std::fs::read_dir(&local_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".scs-part-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&local_dir);
+    std::env::remove_var("ALLOW_INSECURE_WEBDAV");
+    std::env::remove_var("WEBDAV_CACHE_DISABLED");
+
+    assert_eq!(
+        after, original,
+        "a cleanly short body must not replace the prior file (logs: {logs:?})"
+    );
+    assert!(temps.is_empty(), "no temp may survive a size-mismatch refusal (logs: {logs:?})");
+    assert!(
+        logs.iter().any(|l| l.contains("advertised")),
+        "the refusal must name the advertised size (logs: {logs:?})"
     );
 }
