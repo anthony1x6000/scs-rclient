@@ -3792,7 +3792,10 @@ where
                                         prior.permissions().mode() & 0o700,
                                     )
                                 };
-                                std::fs::set_permissions(&temp_file, mode).map_err(
+                                // Handle-based: a path-based chmod would
+                                // follow a symlink swapped onto the temp
+                                // path; the open handle cannot be swapped.
+                                dest_file.set_permissions(mode).map_err(
                                     |e| {
                                         remove_part_file(&temp_file);
                                         AttemptError::Fatal(format!(
