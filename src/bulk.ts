@@ -39,6 +39,36 @@ export function addFolderFromInput(
   return { ok: true, items: nextItems, ticks: normalizeBulkSelection(nextItems, nextTicks), added: name };
 }
 
+export type CommitSubdirResult =
+  | { ok: true; name: string; items: string[]; created: boolean }
+  | { ok: false; error: string };
+
+/**
+ * Big-box Enter semantics: the typed name is the target. An existing saved
+ * folder is selected as-is; a new name is created (appended) instead of being
+ * rejected. The caller selects `name` and clears any bulk ticks, so one commit
+ * overrides both the current single subdir and the ticked set.
+ */
+export function commitSubdirFromSearch(
+  items: readonly string[],
+  raw: string,
+): CommitSubdirResult {
+  let name: string;
+  try {
+    name = normalizeSubdir(raw);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  if (!name) return { ok: false, error: "Enter a subdirectory name." };
+  const exists = items.includes(name);
+  return {
+    ok: true,
+    name,
+    items: exists ? [...items] : [...items, name],
+    created: !exists,
+  };
+}
+
 export interface BulkOutcome {
   succeeded: string[];
   failed: string[];

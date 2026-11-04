@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   addFolderFromInput,
+  commitSubdirFromSearch,
   formatBulkSummary,
   normalizeBulkSelection,
   runBulkSequential,
@@ -56,6 +57,45 @@ describe("addFolderFromInput", () => {
   it("rejects whitespace-only input with an error", () => {
     const result = addFolderFromInput(["css"], [], "   ");
     expect(result.ok).toBe(false);
+  });
+});
+
+describe("commitSubdirFromSearch", () => {
+  it("appends and selects a folder that does not exist yet", () => {
+    expect(commitSubdirFromSearch(["css"], "new")).toEqual({
+      ok: true,
+      name: "new",
+      items: ["css", "new"],
+      created: true,
+    });
+  });
+
+  it("selects an existing folder without duplicating the list entry", () => {
+    expect(commitSubdirFromSearch(["css", "js"], "js")).toEqual({
+      ok: true,
+      name: "js",
+      items: ["css", "js"],
+      created: false,
+    });
+  });
+
+  it("normalizes backslashes and surrounding slashes before committing", () => {
+    expect(commitSubdirFromSearch(["css"], "/new\\site\\/")).toEqual({
+      ok: true,
+      name: "new/site",
+      items: ["css", "new/site"],
+      created: true,
+    });
+  });
+
+  it("rejects traversal segments with an error and no state change", () => {
+    const result = commitSubdirFromSearch(["css"], "../up");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/\.\./);
+  });
+
+  it("rejects whitespace-only input with an error", () => {
+    expect(commitSubdirFromSearch(["css"], "   ").ok).toBe(false);
   });
 });
 
