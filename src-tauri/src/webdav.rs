@@ -4084,6 +4084,20 @@ where
                 extension_filter,
                 &mut log,
             )?;
+            // An empty remote folder still owns its local counterpart: the local
+            // mirror is keyed by folder name, so copying nothing must not leave
+            // <mount>/<SUBDIR> missing. Dry runs stay disk-free by contract.
+            if !is_dry && items.iter().all(|item| item.is_dir) {
+                std::fs::create_dir_all(local_dir).map_err(|e| {
+                    format!("Failed to create directory {}: {}", local_dir.display(), e)
+                })?;
+                log(&format!(
+                    "Remote folder has no files; created empty local folder {}.\n\n\
+                     Get operation finished: 0 file(s) downloaded (0 bytes), 0 file(s) skipped (remote folder is empty).\n",
+                    local_dir.display()
+                ));
+                return Ok(());
+            }
             let remote_files: Vec<(&WebdavItem, String)> = items
                 .iter()
                 .filter(|item| !item.is_dir)
