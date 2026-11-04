@@ -1,5 +1,11 @@
 # Changelog
 
+## Empty Remote Folder Downloads
+
+- **An Empty Folder Still Arrives as a Folder**: Downloading a subdirectory that exists on the drive but holds no files now creates the matching `<mount>/<SUBDIR>` folder locally, empty, and says so in the console (`Remote folder has no files; created empty local folder …`). Previously the scan found nothing to copy and created nothing, so an emptied or brand-new remote folder looked like the download had never run.
+- **Real Transfers Only**: Applies to Download, both Backup variants (under `backups/<date>/<SUBDIR>`), checksum downloads, and every folder of a bulk run. Preview Download (dry run) still writes nothing to disk and only reports that there are no files.
+- **Tests**: A new integration test (`empty_remote_download`) serves a WebDAV collection that exists with no files and asserts the local subdirectory appears empty, and that the dry run leaves the disk untouched.
+
 ## Scrollable Subdir Dropdown
 
 - **Native Scrollbar Instead of Paging**: The ‹ / › pager buttons and page dots are gone. The folder list is one native scrollable list with a thin themed scrollbar, so the wheel, trackpad, touch, and the scrollbar thumb all move the same list.
