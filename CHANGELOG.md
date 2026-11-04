@@ -1,5 +1,11 @@
 # Changelog
 
+## Scrollable Subdir Dropdown
+
+- **Native Scrollbar Instead of Paging**: The ‹ / › pager buttons and page dots are gone. The folder list is one native scrollable list with a thin themed scrollbar, so the wheel, trackpad, touch, and the scrollbar thumb all move the same list.
+- **Arrow Keys Scroll Into View**: ↑/↓ move the row highlight and scroll the highlighted row into view, so the list actually follows keyboard navigation. PgUp/PgDn move roughly a viewport of rows (with one row of overlap), and Ctrl+Home/Ctrl+End jump to the first/last match. Typing a new filter restarts the list at the top.
+- **Dead Paging Removed**: The wheel/touch paging handlers, auto page-jump effect, and off-page "jump there" hint are deleted. The footer now shows just the item count and a scroll hint.
+
 ## Committing a Subdirectory From the Top Field
 
 - **Enter Commits the Typed Name**: The big field above the dropdown is no longer just a filter. Press Enter and the typed folder becomes the current working subdirectory: an exact match in the saved list is selected, and a name that does not exist yet is appended to the list and selected. The commit overrides both the previous single subdirectory and any ticked bulk selection, clearing the ticks.
