@@ -25,6 +25,24 @@ body {
   .no-scrollbar::-webkit-scrollbar {
     display: none;
   }
+  /* Thin themed scrollbar for the subdir dropdown list. */
+  .scs-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+  }
+  .scs-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scs-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scs-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.25);
+  }
+  .scs-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.45);
+  }
   .fade-top {
     mask-image: linear-gradient(to bottom, transparent, black 18px);
     -webkit-mask-image: linear-gradient(to bottom, transparent, black 18px);

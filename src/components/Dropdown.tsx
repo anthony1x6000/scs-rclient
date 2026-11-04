@@ -10,6 +10,7 @@ import {
   setBulkPresets,
 } from "../settings";
 import { addFolderFromInput, commitSubdirFromSearch, normalizeBulkSelection, toggleBulkTick, BULK_MIN_FOLDERS } from "../bulk";
+import { moveHighlight } from "../listNavigation";
 import {
   type BulkPreset,
   livePresetFolders,
@@ -21,15 +22,11 @@ import {
 interface DropdownProps {
   onSelect?: (item: string) => void;
   onBulkChange?: (ticks: string[]) => void;
-  variant?: "pocket" | "marquee" | "palette";
 }
 
 const ROW_H = 34; // px approx per row (py5 + text-sm)
-const MIN_PAGE = 3;
-const MAX_PAGE_SIZE = 9;
-const DEFAULT_PAGE = 7;
 
-function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps) {
+function Dropdown({ onSelect, onBulkChange }: DropdownProps) {
   const [items, setItems] = useState<string[]>([]);
   const [bulkTicks, setBulkTicks] = useState<string[]>([]);
   const [presets, setPresets] = useState<BulkPreset[]>([]);
@@ -40,14 +37,13 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
   const [addError, setAddError] = useState<string>("");
   const [searchError, setSearchError] = useState<string>("");
   const [saveError, setSaveError] = useState<string>("");
-  const [page, setPage] = useState(0);
   const [highlight, setHighlight] = useState(-1);
   const [availableHeight, setAvailableHeight] = useState(280);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const addInputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const listWrapRef = useRef<HTMLDivElement>(null);
+  const listScrollRef = useRef<HTMLDivElement>(null);
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
   const onBulkChangeRef = useRef(onBulkChange);
@@ -152,7 +148,6 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
     setAddText("");
     setAddError("");
     setSearchError("");
-    setPage(0);
     setHighlight(-1);
     void saveSettings(nextItems, item, []);
   };
@@ -198,7 +193,6 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
     setAddText("");
     setAddError("");
     setSearchError("");
-    setPage(0);
     setHighlight(-1);
   };
 
@@ -247,108 +241,42 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
   const visiblePresets = useMemo(() => filterBulkPresets(presets, searchText), [presets, searchText]);
   const presetLabels = useMemo(() => buildPresetLabels(visiblePresets), [visiblePresets]);
 
-  // Derive paging
-  const pageSize = useMemo(() => {
-    if (variant === "marquee") return 12; // horizontal variant not paged same way
-    const computed = Math.floor(availableHeight / ROW_H);
-    return Math.max(MIN_PAGE, Math.min(MAX_PAGE_SIZE, computed || DEFAULT_PAGE));
-  }, [availableHeight, variant]);
-
-  const pageCount = Math.max(1, Math.ceil(filteredItems.length / pageSize));
-  const clampedPage = Math.min(page, pageCount - 1);
-  const visibleItems = useMemo(
-    () => filteredItems.slice(clampedPage * pageSize, (clampedPage + 1) * pageSize),
-    [filteredItems, clampedPage, pageSize]
-  );
-
-  // Reset page/highlight when filter changes
+  // A new filter starts the scan from the top of the list.
   useEffect(() => {
-    setPage(0);
     setHighlight(-1);
+    if (listScrollRef.current) listScrollRef.current.scrollTop = 0;
   }, [searchText]);
 
-  // Keep page in bounds when items change (delete etc.)
-  useEffect(() => {
-    if (page >= pageCount) setPage(pageCount - 1);
-  }, [page, pageCount]);
-
-  // If highlighted item is off current page, auto-jump page to show it
+  // Keep the keyboard-highlighted row visible inside the scroll viewport.
   useEffect(() => {
     if (highlight < 0) return;
-    const targetPage = Math.floor(highlight / pageSize);
-    if (targetPage !== clampedPage) setPage(targetPage);
-  }, [highlight, pageSize, clampedPage]);
+    document.getElementById(`scs-opt-${highlight}`)?.scrollIntoView({ block: "nearest" });
+  }, [highlight]);
 
-  // Wheel -> page (hidden scrollbar alternative)
-  const wheelLock = useRef(0);
-  const onWheel = (e: React.WheelEvent) => {
-    if (filteredItems.length <= pageSize) return;
-    const now = Date.now();
-    if (now - wheelLock.current < 180) return;
-    if (Math.abs(e.deltaY) < 8 && Math.abs(e.deltaX) < 8) return;
-    // Prefer vertical, but also treat horizontal wheel as paging
-    const delta = Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
-    if (delta > 0 && clampedPage < pageCount - 1) {
-      wheelLock.current = now;
-      e.preventDefault();
-      setPage((p) => Math.min(p + 1, pageCount - 1));
-    } else if (delta < 0 && clampedPage > 0) {
-      wheelLock.current = now;
-      e.preventDefault();
-      setPage((p) => Math.max(p - 1, 0));
-    }
-  };
-
-  // Touch swipe for page
-  const touchStart = useRef<number | null>(null);
-  const onTouchStart = (e: React.TouchEvent) => {
-    touchStart.current = e.touches[0]?.clientY ?? null;
-  };
-  const onTouchEnd = (e: React.TouchEvent) => {
-    if (touchStart.current == null) return;
-    const end = e.changedTouches[0]?.clientY ?? touchStart.current;
-    const dy = touchStart.current - end;
-    touchStart.current = null;
-    if (Math.abs(dy) < 24) return;
-    if (dy > 0 && clampedPage < pageCount - 1) setPage((p) => p + 1);
-    else if (dy < 0 && clampedPage > 0) setPage((p) => p - 1);
+  // PageUp/PageDown move roughly one viewport of rows, keeping one row of overlap.
+  const pageRows = () => {
+    const height = listScrollRef.current?.clientHeight ?? 0;
+    return Math.max(1, Math.floor(height / ROW_H) - 1);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     const total = filteredItems.length;
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      if (total === 0) return;
-      setHighlight((h) => {
-        const next = h < 0 ? 0 : Math.min(h + 1, total - 1);
-        return next;
-      });
+      setHighlight((h) => moveHighlight(h, 1, total));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      if (total === 0) return;
-      setHighlight((h) => {
-        const next = h < 0 ? total - 1 : Math.max(h - 1, 0);
-        return next;
-      });
-    } else if (e.key === "PageDown") {
+      setHighlight((h) => moveHighlight(h, -1, total));
+    } else if (e.key === "PageDown" || e.key === "PageUp") {
       e.preventDefault();
-      setPage((p) => Math.min(p + 1, pageCount - 1));
-      setHighlight((h) => {
-        const base = clampedPage * pageSize;
-        return h < 0 ? base : Math.min(total - 1, h + pageSize);
-      });
-    } else if (e.key === "PageUp") {
-      e.preventDefault();
-      setPage((p) => Math.max(p - 1, 0));
-      setHighlight((h) => (h < 0 ? 0 : Math.max(0, h - pageSize)));
+      const delta = e.key === "PageDown" ? pageRows() : -pageRows();
+      setHighlight((h) => moveHighlight(h, delta, total));
     } else if (e.key === "Home" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      setPage(0);
-      setHighlight(0);
+      setHighlight(total > 0 ? 0 : -1);
     } else if (e.key === "End" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      setPage(pageCount - 1);
-      setHighlight(total - 1);
+      setHighlight(total > 0 ? total - 1 : -1);
     } else if (e.key === "Enter") {
       e.preventDefault();
       commitSearchText();
@@ -358,7 +286,6 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
       setAddText("");
       setAddError("");
       setSearchError("");
-      setPage(0);
       setHighlight(-1);
     }
   };
@@ -371,21 +298,8 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
       setAddError("");
       setSearchError("");
       setHighlight(-1);
-      // keep page at 0 for next open
-      setPage(0);
     }
   };
-
-  const hasOverflow = filteredItems.length > pageSize;
-  const showTopFade = hasOverflow && clampedPage > 0;
-  const showBottomFade = hasOverflow && clampedPage < pageCount - 1;
-  const startIdx = filteredItems.length === 0 ? 0 : clampedPage * pageSize + 1;
-  const endIdx = Math.min((clampedPage + 1) * pageSize, filteredItems.length);
-
-  // Selected item may live off current page — offer jump hint
-  const selectedOffPage =
-    selectedItem && filteredItems.includes(selectedItem) && !visibleItems.includes(selectedItem);
-  const selectedPage = selectedItem ? Math.floor(filteredItems.indexOf(selectedItem) / pageSize) : -1;
 
   // Bulk (2+ ticks) shows a count; a single tick is that folder's name.
   const isBulk = bulkTicks.length >= BULK_MIN_FOLDERS;
@@ -459,22 +373,12 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
           // keep dropdown width reasonable, not full viewport
           style={{ width: "min(360px, 86vw)" }}
         >
-          <div
-            ref={listWrapRef}
-            onWheel={onWheel}
-            onTouchStart={onTouchStart}
-            onTouchEnd={onTouchEnd}
-            className="relative bg-black/85 backdrop-blur-md border border-white/15 shadow-[0_12px_40px_rgba(0,0,0,0.6)] overflow-hidden"
-          >
-            {/* Top fade */}
+          <div className="relative bg-black/85 backdrop-blur-md border border-white/15 shadow-[0_12px_40px_rgba(0,0,0,0.6)] overflow-hidden">
+            {/* Scroll viewport — native scrollbar, no paging */}
             <div
-              aria-hidden
-              className={`pointer-events-none absolute inset-x-0 top-0 h-6 bg-gradient-to-b from-black/70 to-transparent transition-opacity duration-200 z-10 ${showTopFade ? "opacity-100" : "opacity-0"}`}
-            />
-            {/* Scroll viewport — hidden scrollbar, but still scrollable programmatically */}
-            <div
-              className="no-scrollbar overflow-y-auto overflow-x-hidden overscroll-contain scroll-smooth"
-              style={{ maxHeight: pageSize * ROW_H + 2 }}
+              ref={listScrollRef}
+              className="scs-scrollbar overflow-y-auto overflow-x-hidden overscroll-contain"
+              style={{ maxHeight: availableHeight }}
               tabIndex={-1}
             >
               <ul
@@ -483,8 +387,7 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
                 role="listbox"
                 aria-label="Sync subdirectories"
               >
-                {visibleItems.map((item) => {
-                  const globalIdx = filteredItems.indexOf(item);
+                {filteredItems.map((item, globalIdx) => {
                   const isSelected = item === selectedItem;
                   const isHighlighted = globalIdx === highlight;
                   const isTicked = bulkTicks.includes(item);
@@ -534,25 +437,8 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
                       : "Type to filter, or press Enter to add…"}
                   </li>
                 )}
-                {/* Off-page selected hint */}
-                {selectedOffPage && filteredItems.length > 0 && (
-                  <li className="mt-1 py-1.5 px-2 text-[11px] text-amber-200/80 bg-amber-950/20 border border-amber-500/20">
-                    Selected “{selectedItem}” is on page {selectedPage + 1} ·{" "}
-                    <button
-                      type="button"
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => {
-                        setPage(selectedPage);
-                        setHighlight(filteredItems.indexOf(selectedItem));
-                      }}
-                      className="underline underline-offset-2 hover:text-amber-100 cursor-pointer"
-                    >
-                      jump there
-                    </button>
-                  </li>
-                )}
               </ul>
-              {/* Saved bulk presets — act like ticking, not selecting; outside the paging index */}
+              {/* Saved bulk presets — act like ticking, not selecting; outside the folder list */}
               {visiblePresets.length > 0 && (
                 <>
                   <div aria-hidden className="border-t border-white/10 mx-1.5" />
@@ -588,67 +474,12 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
                 </>
               )}
             </div>
-            {/* Bottom fade */}
-            <div
-              aria-hidden
-              className={`pointer-events-none absolute inset-x-0 bottom-[34px] h-6 bg-gradient-to-t from-black/70 to-transparent transition-opacity duration-200 z-10 ${showBottomFade ? "opacity-100" : "opacity-0"}`}
-            />
-            {/* Footer — pagination + hint (never scrolls) */}
+            {/* Footer — item count + scroll hint (never scrolls) */}
             <div className="flex items-center justify-between gap-2 px-2 py-1.5 border-t border-white/10 bg-black/40 text-[11px] leading-none">
               <span className="text-gray-400 tabular-nums" aria-live="polite">
-                {filteredItems.length === 0
-                  ? "0 items"
-                  : filteredItems.length <= pageSize
-                    ? `${filteredItems.length} ${filteredItems.length === 1 ? "item" : "items"}`
-                    : `${startIdx}–${endIdx} of ${filteredItems.length}`}
-                {hasOverflow && filteredItems.length > pageSize * 1.5 && (
-                  <span className="ml-1.5 text-gray-500 hidden sm:inline">· keep typing to filter</span>
-                )}
+                {filteredItems.length} {filteredItems.length === 1 ? "item" : "items"}
               </span>
-              {pageCount > 1 ? (
-                <span className="flex items-center gap-1 shrink-0" role="navigation" aria-label="Pagination">
-                  <button
-                    type="button"
-                    aria-label="Previous page"
-                    disabled={clampedPage === 0}
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => setPage((p) => Math.max(0, p - 1))}
-                    className="w-6 h-6 grid place-items-center border border-white/15 hover:border-white/50 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer bg-transparent transition-all duration-150"
-                  >
-                    ‹
-                  </button>
-                  <span className="flex items-center gap-1 px-1" aria-hidden>
-                    {Array.from({ length: Math.min(pageCount, 7) }).map((_, i) => {
-                      // windowed dots when many pages
-                      let pageIdx = i;
-                      if (pageCount > 7) {
-                        const start = Math.max(0, Math.min(pageCount - 7, clampedPage - 3));
-                        pageIdx = start + i;
-                      }
-                      const active = pageIdx === clampedPage;
-                      return (
-                        <span
-                          key={pageIdx}
-                          className={`h-1.5 transition-all ${active ? "w-4 bg-white" : "w-1.5 bg-white/30"}`}
-                        />
-                      );
-                    })}
-                    {pageCount > 7 && <span className="text-gray-500 text-[10px] ml-0.5">·{pageCount}</span>}
-                  </span>
-                  <button
-                    type="button"
-                    aria-label="Next page"
-                    disabled={clampedPage >= pageCount - 1}
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
-                    className="w-6 h-6 grid place-items-center border border-white/15 hover:border-white/50 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer bg-transparent transition-all duration-150"
-                  >
-                    ›
-                  </button>
-                </span>
-              ) : (
-                <span className="text-gray-500 italic">scroll · swipe · arrows</span>
-              )}
+              <span className="text-gray-500 italic">scroll · ↑↓</span>
             </div>
             {/* Add-input — Enter appends (or finds) the folder, ticks it for bulk, clears */}
             <div className="flex items-center gap-2 px-2 py-1.5 border-t border-white/10 bg-black/40">
@@ -674,7 +505,6 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
                     setAddText("");
                     setAddError("");
                     setSearchError("");
-                    setPage(0);
                     setHighlight(-1);
                   }
                 }}
@@ -690,8 +520,8 @@ function Dropdown({ onSelect, onBulkChange, variant = "pocket" }: DropdownProps)
           </div>
           {/* Keyboard hint */}
           <div className="mt-1.5 text-[10px] leading-none text-gray-500 px-1">
-            <span className="hidden sm:inline">↑↓ highlight · PgUp/PgDn page · Enter select/add · tick ☑ for bulk</span>
-            <span className="sm:hidden">tap · swipe to page · ☑ = bulk</span>
+            <span className="hidden sm:inline">↑↓ move · PgUp/PgDn scroll · Enter select/add · tick ☑ for bulk</span>
+            <span className="sm:hidden">swipe · tap · ☑ = bulk</span>
           </div>
         </div>
       )}
