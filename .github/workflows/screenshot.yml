@@ -179,14 +179,14 @@ jobs:
           fi
           captured="$(find capture -name screenshot.png -print -quit)"
           cp "$captured" docs/screenshot.png
-          if git diff --quiet -- docs/screenshot.png; then
+          git add docs/screenshot.png
+          if git diff --cached --quiet -- docs/screenshot.png; then
             echo "Screenshot is unchanged; nothing to publish."
             exit 0
           fi
           git config user.name "scs-rclient screenshot bot"
           git config user.email "screenshot-bot@users.noreply.github.com"
           git checkout -B chore/readme-screenshot
-          git add docs/screenshot.png
           git commit -m "docs: refresh README screenshot"
           git push --force \
             "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
