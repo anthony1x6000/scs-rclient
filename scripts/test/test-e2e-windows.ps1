@@ -1,12 +1,10 @@
 # E2E test for Windows release binaries:
 # 1. NSIS installer: silent install -> launch smoke -> silent uninstall
-# 2. Portable EXE (+ no-icon): existence check -> zip check -> launch smoke
+# 2. Portable EXEs (+ no-icon): existence check -> launch smoke
 param(
   [string]$InstallerPath = "dist-win/scs-rclient-win-installer.exe",
   [string]$PortablePath = "dist-win/scs-rclient-win-portable.exe",
-  [string]$PortableZip = "dist-win/scs-rclient-win-portable.zip",
-  [string]$NoIconPath = "dist-win-noicon/scs-rclient-win-noicon.exe",
-  [string]$NoIconZip = "dist-win-noicon/scs-rclient-win-noicon.zip"
+  [string]$NoIconPath = "dist-win-noicon/scs-rclient-win-portable-noicon.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,12 +62,11 @@ Write-Host "✓ NSIS E2E passed"
 
 # --- Portable builds test ---
 $PortableBuilds = @(
-  @{ Exe = $PortablePath; Zip = $PortableZip; Name = "portable" },
-  @{ Exe = $NoIconPath; Zip = $NoIconZip; Name = "no-icon portable" }
+  @{ Exe = $PortablePath; Name = "portable" },
+  @{ Exe = $NoIconPath; Name = "no-icon portable" }
 )
 foreach ($build in $PortableBuilds) {
   Assert-File $build.Exe $build.Name
-  Assert-File $build.Zip "$($build.Name) distributable zip"
   Write-Host "=== Testing $($build.Name): $($build.Exe) ==="
   Invoke-LaunchSmoke (Resolve-Path $build.Exe).Path $build.Name
 }
