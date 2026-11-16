@@ -39,8 +39,8 @@ importers:
         specifier: ^4.6.0
         version: 4.7.0(vite@7.3.7(jiti@2.7.0)(lightningcss@1.33.0))
       tailwindcss:
-        specifier: ^4.3.0
-        version: 4.3.0
+        specifier: ^4.3.5
+        version: 4.3.5
       typescript:
         specifier: ~5.8.3
         version: 5.8.3
@@ -923,9 +923,6 @@ packages:
   std-env@4.3.0:
     resolution: {integrity: sha512-OtU/EgQ1kIm5KwqQpBC6ZEMXrZRui11w8zgfTWp8cdO9B8OaPsbA8bTHO2P+HNo1VlUTGMVBwPhydu6poeXiag==}
 
-  tailwindcss@4.3.0:
-    resolution: {integrity: sha512-y6nxMGB1nMW9R6k96e5gdIFzcfL/gTJRNaqGes1YvkLnPVXzWgbqFF2yLC0T8G774n24cx3Pe8XrKoniCOAH+Q==}
-
   tailwindcss@4.3.5:
     resolution: {integrity: sha512-FcQk9BuffmEHJP2G0XmB2SplU1aLTI7j07Kunk+U74Ny+XiWOtzXz9aujFZ/avntw1e2cOv/3PkgzflQ7gX2vQ==}
 
@@ -1732,8 +1729,6 @@ snapshots:
   source-map-js@1.2.2: {}
 
   std-env@4.3.0: {}
-
-  tailwindcss@4.3.0: {}
 
   tailwindcss@4.3.5: {}
 
