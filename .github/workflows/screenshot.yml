@@ -154,7 +154,7 @@ jobs:
 
           # Open the subdir dropdown (bottom-left). If the click misses, the
           # closed-state capture above is still a valid screenshot.
-          xdotool mousemove --window "$wid" $((WIDTH / 8)) $((HEIGHT - 120)) click 1
+          xdotool mousemove --window "$wid" $((WIDTH / 10)) $((HEIGHT - 60)) click 1
           sleep 1
           import -window "$wid" /tmp/shot-open.png 2>/dev/null || cp /tmp/shot-closed.png /tmp/shot-open.png
           diff_pixels=$(compare -metric AE /tmp/shot-closed.png /tmp/shot-open.png null: 2>&1 | head -1 | cut -d' ' -f1 || true)
