@@ -1,0 +1,201 @@
+name: README Screenshot
+
+# Captures the real Tauri window under Xvfb with a seeded demo profile and
+# refreshes docs/screenshot.png. The capture is uploaded as an artifact; on
+# main it is committed to chore/readme-screenshot and opened as a PR, which the
+# normal review gate then merges. Pushing straight to main is impossible: main
+# requires status checks and enforces them for admins.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "12 6 * * 1" # weekly freshness even when the UI stops changing
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "src-tauri/src/**"
+      - "src-tauri/tauri.conf.json"
+      - "index.html"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: readme-screenshot
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    name: Capture app screenshot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-env
+        with:
+          rust-cache-key: readme-screenshot
+
+      - name: Install Linux and capture dependencies
+        run: |
+          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf xvfb xdotool imagemagick
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Seed a demo profile
+        run: |
+          settings_dir="$HOME/.config/online.anthonyis.scs-rclient"
+          mkdir -p "$settings_dir"
+          cat > "$settings_dir/settings.json" <<'JSON'
+          {
+            "webdav_url": { "value": "https://webdav.example.com/remote.php/dav/files/demo" },
+            "saved_username": { "value": "demo" },
+            "selected_subdirectory": { "value": "assets" },
+            "subdirectories": { "value": ["assets", "css", "img", "js", "js/vendor"] },
+            "bulk_presets": { "value": [{ "folders": ["css", "img", "js"] }] },
+            "scan_concurrency": { "value": 6 }
+          }
+          JSON
+
+      - name: Build application
+        run: pnpm tauri build --no-bundle
+
+      - name: Capture screenshot
+        env:
+          DISPLAY: ":99"
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+
+          Xvfb :99 -screen 0 1024x768x24 > /tmp/xvfb.log 2>&1 &
+          for _ in $(seq 1 50); do
+            [ -S /tmp/.X11-unix/X99 ] && break
+            sleep 0.2
+          done
+          if [ ! -S /tmp/.X11-unix/X99 ]; then
+            echo "::error::Xvfb did not start"; cat /tmp/xvfb.log; exit 1
+          fi
+
+          ./src-tauri/target/release/scs-rclient > /tmp/scs-rclient.log 2>&1 &
+          wid="$(timeout 60 xdotool search --sync --name '^scs-rclient$' | head -1 || true)"
+          if [ -z "$wid" ]; then
+            echo "::error::app window never appeared"; cat /tmp/scs-rclient.log; exit 1
+          fi
+          eval "$(xdotool getwindowgeometry --shell "$wid")"
+          xdotool windowmove "$wid" 0 0
+          echo "window $wid at ${X}x${Y}, ${WIDTH}x${HEIGHT}"
+
+          # Wait for the webview to actually paint: a blank window is near-uniform.
+          painted=""
+          for i in $(seq 1 60); do
+            if import -window "$wid" "/tmp/shot-$i.png" 2>/dev/null; then
+              size=$(stat -c%s "/tmp/shot-$i.png")
+              std=$(identify -format '%[fx:standard_deviation]' "/tmp/shot-$i.png" 2>/dev/null || echo 0)
+              if [ "$size" -gt 12000 ] && awk "BEGIN { exit !($std > 0.02) }"; then
+                painted="/tmp/shot-$i.png"; break
+              fi
+            fi
+            sleep 0.5
+          done
+          if [ -z "$painted" ]; then
+            echo "::error::app window never painted"; cat /tmp/scs-rclient.log; exit 1
+          fi
+          cp "$painted" /tmp/shot-closed.png
+
+          # Open the subdir dropdown (bottom-left). If the click misses, the
+          # closed-state capture above is still a valid screenshot.
+          xdotool mousemove --window "$wid" $((WIDTH / 8)) $((HEIGHT - 120)) click 1
+          sleep 1
+          import -window "$wid" /tmp/shot-open.png 2>/dev/null || cp /tmp/shot-closed.png /tmp/shot-open.png
+          diff_pixels=$(compare -metric AE /tmp/shot-closed.png /tmp/shot-open.png null: 2>&1 | head -1 | cut -d' ' -f1 || true)
+          if awk "BEGIN { exit !(${diff_pixels:-0} > 500) }"; then
+            echo "dropdown opened (${diff_pixels} changed pixels)"
+            cp /tmp/shot-open.png docs/screenshot.png
+          else
+            echo "::warning::dropdown click did not change the frame; keeping closed-state capture"
+            cp /tmp/shot-closed.png docs/screenshot.png
+          fi
+
+          identify docs/screenshot.png
+          read -r w h < <(identify -format '%w %h' docs/screenshot.png)
+          if [ "$w" -lt 700 ] || [ "$h" -lt 500 ]; then
+            echo "::error::screenshot is unexpectedly small (${w}x${h})"; exit 1
+          fi
+
+      - name: Upload screenshot
+        uses: actions/upload-artifact@v7
+        with:
+          name: readme-screenshot
+          path: docs/screenshot.png
+          if-no-files-found: error
+
+      - name: Upload capture logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: screenshot-capture-logs
+          path: |
+            /tmp/scs-rclient.log
+            /tmp/xvfb.log
+          if-no-files-found: ignore
+
+  publish:
+    name: Commit refreshed screenshot
+    needs: capture
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Download captured screenshot
+        uses: actions/download-artifact@v8
+        with:
+          name: readme-screenshot
+          path: capture
+
+      - name: Commit and open the refresh PR
+        env:
+          GH_TOKEN: ${{ secrets.SCREENSHOT_TOKEN }}
+          TOKEN: ${{ secrets.SCREENSHOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::warning::SCREENSHOT_TOKEN is not configured; the screenshot stays artifact-only."
+            exit 0
+          fi
+          captured="$(find capture -name screenshot.png -print -quit)"
+          cp "$captured" docs/screenshot.png
+          if git diff --quiet -- docs/screenshot.png; then
+            echo "Screenshot is unchanged; nothing to publish."
+            exit 0
+          fi
+          git config user.name "scs-rclient screenshot bot"
+          git config user.email "screenshot-bot@users.noreply.github.com"
+          git checkout -B chore/readme-screenshot
+          git add docs/screenshot.png
+          git commit -m "docs: refresh README screenshot"
+          git push --force \
+            "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            HEAD:chore/readme-screenshot
+          existing="$(gh pr list --head chore/readme-screenshot --state open --json number --jq '.[0].number')"
+          if [ -z "$existing" ]; then
+            gh pr create --base main --head chore/readme-screenshot \
+              --title "docs: refresh README screenshot" \
+              --body "Automated refresh of \`docs/screenshot.png\` from [run ${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+          else
+            echo "Refresh PR #${existing} updated."
+          fi

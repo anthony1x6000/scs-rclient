@@ -6,6 +6,8 @@ folders on a remote WebDAV server. It replaces Dreamweaver's WebDAV workflow.
 No rclone installation, configuration, or bundled binary is required: the app talks
 WebDAV directly.
 
+![scs-rclient main window](docs/screenshot.png)
+
 ![scs-rclient Icon](src-tauri/icons/128x128@2x.png)
 
 ## Installation
