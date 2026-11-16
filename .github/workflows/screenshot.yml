@@ -43,7 +43,7 @@ jobs:
           sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
           sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
             libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
-            patchelf xvfb xdotool imagemagick
+            patchelf xvfb xdotool imagemagick x11-utils
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -73,40 +73,81 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
           set -euo pipefail
-          mkdir -p docs
+          mkdir -p docs /tmp/shots
 
-          Xvfb :99 -screen 0 1024x768x24 > /tmp/xvfb.log 2>&1 &
-          for _ in $(seq 1 50); do
+          Xvfb :99 -screen 0 1280x800x24 > /tmp/xvfb.log 2>&1 &
+          for _ in $(seq 1 100); do
             [ -S /tmp/.X11-unix/X99 ] && break
-            sleep 0.2
+            sleep 0.1
           done
           if [ ! -S /tmp/.X11-unix/X99 ]; then
             echo "::error::Xvfb did not start"; cat /tmp/xvfb.log; exit 1
           fi
 
           ./src-tauri/target/release/scs-rclient > /tmp/scs-rclient.log 2>&1 &
-          wid="$(timeout 60 xdotool search --sync --name '^scs-rclient$' | head -1 || true)"
+
+          # Pick the LARGEST visible app window: GTK also creates small hidden
+          # helper windows whose title matches, and `import` on those captures
+          # a uniform 1x1 frame that never passes the paint check.
+          wid=""
+          best=0
+          for _ in $(seq 1 120); do
+            for id in $(xdotool search --onlyvisible --name 'scs-rclient' 2>/dev/null || true); do
+              eval "$(xdotool getwindowgeometry --shell "$id" 2>/dev/null || true)"
+              area=$(( ${WIDTH:-0} * ${HEIGHT:-0} ))
+              if [ "$area" -gt "$best" ]; then
+                best=$area
+                wid=$id
+              fi
+            done
+            [ -n "$wid" ] && break
+            sleep 0.5
+          done
           if [ -z "$wid" ]; then
-            echo "::error::app window never appeared"; cat /tmp/scs-rclient.log; exit 1
+            echo "::error::no visible app window appeared"
+            xwininfo -root -tree > /tmp/xwininfo.txt 2>&1 || true
+            cat /tmp/scs-rclient.log
+            exit 1
           fi
+
           eval "$(xdotool getwindowgeometry --shell "$wid")"
           xdotool windowmove "$wid" 0 0
-          echo "window $wid at ${X}x${Y}, ${WIDTH}x${HEIGHT}"
+          echo "selected window $wid (${WIDTH}x${HEIGHT})"
+          xwininfo -root -tree > /tmp/xwininfo.txt 2>&1 || true
 
-          # Wait for the webview to actually paint: a blank window is near-uniform.
+          # Wait for the webview to paint: a blank frame is near-uniform.
+          # Prefer the window itself, and fall back to cropping the root.
           painted=""
           for i in $(seq 1 60); do
-            if import -window "$wid" "/tmp/shot-$i.png" 2>/dev/null; then
-              size=$(stat -c%s "/tmp/shot-$i.png")
-              std=$(identify -format '%[fx:standard_deviation]' "/tmp/shot-$i.png" 2>/dev/null || echo 0)
-              if [ "$size" -gt 12000 ] && awk "BEGIN { exit !($std > 0.02) }"; then
-                painted="/tmp/shot-$i.png"; break
+            if import -window "$wid" "/tmp/shots/window-$i.png" 2>/dev/null; then
+              size=$(stat -c%s "/tmp/shots/window-$i.png")
+              std=$(identify -format '%[fx:standard_deviation]' "/tmp/shots/window-$i.png" 2>/dev/null || echo 0)
+              mean=$(identify -format '%[fx:mean]' "/tmp/shots/window-$i.png" 2>/dev/null || echo 0)
+              echo "attempt $i window size=$size std=$std mean=$mean"
+              if [ "$size" -gt 12000 ] && awk "BEGIN { exit !($std > 0.015 && $mean > 0.02) }"; then
+                painted="/tmp/shots/window-$i.png"
+                break
+              fi
+            fi
+            if import -window root "/tmp/shots/root-$i.png" 2>/dev/null; then
+              convert "/tmp/shots/root-$i.png" -crop "${WIDTH}x${HEIGHT}+${X}+${Y}" +repage "/tmp/shots/crop-$i.png" 2>/dev/null || true
+              if [ -f "/tmp/shots/crop-$i.png" ]; then
+                size=$(stat -c%s "/tmp/shots/crop-$i.png")
+                std=$(identify -format '%[fx:standard_deviation]' "/tmp/shots/crop-$i.png" 2>/dev/null || echo 0)
+                mean=$(identify -format '%[fx:mean]' "/tmp/shots/crop-$i.png" 2>/dev/null || echo 0)
+                echo "attempt $i crop size=$size std=$std mean=$mean"
+                if [ "$size" -gt 12000 ] && awk "BEGIN { exit !($std > 0.015 && $mean > 0.02) }"; then
+                  painted="/tmp/shots/crop-$i.png"
+                  break
+                fi
               fi
             fi
             sleep 0.5
           done
           if [ -z "$painted" ]; then
-            echo "::error::app window never painted"; cat /tmp/scs-rclient.log; exit 1
+            echo "::error::app window never painted"
+            tail -80 /tmp/scs-rclient.log || true
+            exit 1
           fi
           cp "$painted" /tmp/shot-closed.png
 
@@ -131,20 +172,15 @@ jobs:
           fi
 
       - name: Upload screenshot
-        uses: actions/upload-artifact@v7
-        with:
-          name: readme-screenshot
-          path: docs/screenshot.png
-          if-no-files-found: error
-
-      - name: Upload capture logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: screenshot-capture-logs
+          name: readme-screenshot
           path: |
+            docs/screenshot.png
+            /tmp/shots/
+            /tmp/xwininfo.txt
             /tmp/scs-rclient.log
-            /tmp/xvfb.log
           if-no-files-found: ignore
 
   publish:
