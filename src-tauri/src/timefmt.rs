@@ -176,7 +176,7 @@ fn parse_rfc850(input: &str) -> Option<u64> {
         return None;
     }
     let (date_token, time_index) = if tokens[0].ends_with(',') {
-        (tokens.get(1)?, 2)
+        (tokens.get(1).copied()?, 2)
     } else {
         (tokens[0], 1)
     };
@@ -249,7 +249,7 @@ fn local_ymd() -> (i32, u32, u32) {
     // SAFETY: GetLocalTime only writes into the SYSTEMTIME we own.
     unsafe {
         let mut local: windows_sys::Win32::Foundation::SYSTEMTIME = std::mem::zeroed();
-        windows_sys::Win32::System::Time::GetLocalTime(&mut local);
+        windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut local);
         (local.wYear as i32, local.wMonth as u32, local.wDay as u32)
     }
 }
