@@ -1,8 +1,10 @@
-# scs-rclient 
+# scs-rclient
 
-GUI wrapper for rclone. Rclone is bundled. 
+Native WebDAV desktop client for uploading, downloading, comparing, and backing up
+folders on a remote WebDAV server. It replaces Dreamweaver's WebDAV workflow.
 
-To replace dreamweaver webdav functionality.
+No rclone installation, configuration, or bundled binary is required: the app talks
+WebDAV directly.
 
 ![scs-rclient Icon](src-tauri/icons/128x128@2x.png)
 
@@ -52,7 +54,6 @@ flatpak run online.anthonyis.scs-rclient
 > below (AppImage, DEB, RPM, NSIS/portable EXE) run with full user privileges.
 
 - `~/Documents/scs-rclient` (create)
-- `~/.config/rclone` (read-only)
 - Secret Service / Keyring (`org.freedesktop.secrets`, `org.freedesktop.portal.Secret`, `org.kde.kwalletd5/6`)
 - Network access (`--share=network`)
 - Display server access (X11 & Wayland), GPU (`--device=dri`) + IPC (`--share=ipc`)
