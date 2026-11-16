@@ -6714,7 +6714,8 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let mut reader = CancelingReader { cancel: &cancel, reads: 0, flip_at: 3 };
         let err = read_listing_body_bounded(&cancel, &mut reader, Duration::from_secs(3600))
-            .expect_err("a canceled listing read must not run to completion");
+            .err()
+            .expect("a canceled listing read must not run to completion");
         assert!(err.contains("canceled"), "unexpected error: {err}");
         assert!(reader.reads < 100, "read kept going after cancel: {} reads", reader.reads);
     }
@@ -6725,7 +6726,8 @@ mod tests {
         let mut reader = EndlessByteReader;
         let started = Instant::now();
         let err = read_listing_body_bounded(&cancel, &mut reader, Duration::from_millis(50))
-            .expect_err("a slow-drip listing body must hit the deadline");
+            .err()
+            .expect("a slow-drip listing body must hit the deadline");
         assert!(err.contains("time limit"), "unexpected error: {err}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
