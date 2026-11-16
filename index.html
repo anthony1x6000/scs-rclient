@@ -58,6 +58,9 @@ directory to the app. Prefer per-folder grants.</p>
 <li><strong>Linux</strong>: AppImage, DEB, RPM, Flatpak</li>
 <li><strong>Windows</strong>: Portable EXE, Icon-free portable EXE, Installer EXE</li>
 </ul>
+<h2 dir="auto">Security</h2>
+<p dir="auto">This project is audited with the <a href="https://github.com/cloudflare/security-audit-skill">Cloudflare security-audit skill</a>. Confirmed findings are fixed before the release that ships them; the current pass hardened WebDAV listing and download handling against hostile or compromised servers (cancel- and deadline-bounded listing bodies, bounded derived folder state, and capped local path depth).</p>
+<p dir="auto">To report a vulnerability, use <a href="https://github.com/anthony1x6000/scs-rclient/security/advisories/new">GitHub security advisories</a> instead of a public issue.</p>
   </main>
 </body>
 </html>
