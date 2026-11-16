@@ -74,3 +74,9 @@ flatpak override --user --filesystem=~/Documents online.anthonyis.scs-rclient
 Standalone release binaries are also available from [GitHub Releases](https://github.com/anthony1x6000/scs-rclient/releases/latest):
 - **Linux**: AppImage, DEB, RPM, Flatpak
 - **Windows**: Portable EXE, Installer EXE
+
+## Security
+
+This project is audited with the [Cloudflare security-audit skill](https://github.com/cloudflare/security-audit-skill). Confirmed findings are fixed before the release that ships them; the current pass hardened WebDAV listing and download handling against hostile or compromised servers (cancel- and deadline-bounded listing bodies, bounded derived folder state, and capped local path depth).
+
+To report a vulnerability, use [GitHub security advisories](https://github.com/anthony1x6000/scs-rclient/security/advisories/new) instead of a public issue.

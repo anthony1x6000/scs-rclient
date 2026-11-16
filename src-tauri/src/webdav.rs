@@ -42,6 +42,12 @@ pub const MAX_RETAINED_LISTING_BYTES: usize = 256 * 1024 * 1024;
 /// Per-entry overhead the retained budget charges for the Vec/set nodes
 /// around each href copy.
 const RETAINED_ITEM_OVERHEAD_BYTES: usize = 128;
+/// Deepest relative path a server-derived href may carry. Course trees are
+/// shallow; the cap stops a bounded listing from amplifying deep hrefs into
+/// unbounded derived folder state and unbounded local directory creation.
+pub const MAX_REMOTE_PATH_SEGMENTS: usize = 64;
+/// Per-folder-key overhead charged when aggregating derived folder sizes.
+const FOLDER_KEY_OVERHEAD_BYTES: usize = 64;
 /// Whole-scan budget on items PROCESSED (duplicates included): dedup means
 /// duplicates never reach the retained budget, but the parse work they
 /// force is bounded here instead.
@@ -518,6 +524,21 @@ pub fn get_download_body_timeout_secs() -> u64 {
         .filter(|v| *v > 0)
         .unwrap_or(600)
         .min(DOWNLOAD_BODY_TIMEOUT_MAX_SECS)
+}
+
+/// End-to-end deadline for one server-controlled listing body. reqwest's
+/// blocking client applies its 30s timeout per individual `read()`, so a body
+/// dripped at one byte per 29 seconds never times out; this ceiling bounds the
+/// whole read, and the read loop also observes the cancel flag every chunk.
+pub const LISTING_BODY_TIMEOUT_MAX_SECS: u64 = 86_400;
+
+pub fn get_listing_body_timeout_secs() -> u64 {
+    std::env::var("WEBDAV_LISTING_BODY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(120)
+        .min(LISTING_BODY_TIMEOUT_MAX_SECS)
 }
 
 /// Computes SHA256 checksum of a file on disk by streaming chunks to avoid buffering large files in RAM.
@@ -1216,6 +1237,23 @@ pub(crate) fn read_listing_body<R: std::io::Read>(
     cancel: &AtomicBool,
     body: &mut R,
 ) -> Result<ListingBody, String> {
+    read_listing_body_bounded(
+        cancel,
+        body,
+        Duration::from_secs(get_listing_body_timeout_secs()),
+    )
+}
+
+/// Bounded reader behind [`read_listing_body`]: a whole-body deadline and a
+/// per-chunk cancel check, mirroring the streamed GET loop. Without them a
+/// server dripping one byte per reqwest read window pins the action (and its
+/// in-flight listing reservation) forever, because reqwest's 30s timeout is
+/// per read(), not end to end.
+fn read_listing_body_bounded<R: std::io::Read>(
+    cancel: &AtomicBool,
+    body: &mut R,
+    timeout: Duration,
+) -> Result<ListingBody, String> {
     // Hold the worst-case reservation for the whole read AND the parse that
     // follows it, so concurrent workers cannot each buffer a full body past
     // the shared ceiling.
@@ -1225,9 +1263,29 @@ pub(crate) fn read_listing_body<R: std::io::Read>(
     // (a temporary String copy next to the internal Vec), briefly allocating
     // ~2x the body while the reservation covers only 1x.
     let mut bytes = Vec::new();
-    limited
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("listing body read failed: {e}"))?;
+    let mut buffer = [0u8; 65536];
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("listing body read canceled by user".to_string());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "listing body exceeded the {}s time limit",
+                timeout.as_secs()
+            ));
+        }
+        match limited.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes.extend_from_slice(&buffer[..n]);
+                if bytes.len() as u64 > MAX_LISTING_BODY_BYTES {
+                    break;
+                }
+            }
+            Err(e) => return Err(format!("listing body read failed: {e}")),
+        }
+    }
     if bytes.len() as u64 > MAX_LISTING_BODY_BYTES {
         return Err(format!(
             "listing body exceeds the {MAX_LISTING_BODY_BYTES} byte limit"
@@ -3107,20 +3165,70 @@ pub struct RemoteFolder {
     pub size: u64,
 }
 
+/// Server-derived download paths must stay shallow: a bounded listing would
+/// otherwise amplify into unbounded local directory creation, since one
+/// 4096-byte href can legally carry about 2000 path segments.
+fn download_rel_path_within_segments(rel: &str) -> bool {
+    rel.split('/').filter(|segment| !segment.is_empty()).count() <= MAX_REMOTE_PATH_SEGMENTS
+}
+
 /// Aggregates a recursive listing of `remote_url` into one [`RemoteFolder`] per
 /// folder, sorted by path with the root first.
 ///
 /// Each file's size is credited to the root and to every folder it is nested in;
 /// empty folders still appear with size 0; files themselves never appear.
-pub fn aggregate_remote_folders(remote_url: &str, items: &[WebdavItem]) -> Vec<RemoteFolder> {
+pub fn aggregate_remote_folders(
+    remote_url: &str,
+    items: &[WebdavItem],
+    cancel: &AtomicBool,
+) -> Result<Vec<RemoteFolder>, String> {
+    aggregate_remote_folders_with_budget(remote_url, items, cancel, MAX_RETAINED_LISTING_BYTES)
+}
+
+/// Charges one derived folder key against the retained-byte budget, then
+/// inserts it. Key length is the real derived cost: a 4096-byte href of
+/// one-character segments otherwise expands into ~2024 keys and O(depth^2)
+/// bytes per item while the raw listing stays under every href/item/body cap.
+fn charge_remote_folder<'a>(
+    sizes: &'a mut std::collections::BTreeMap<String, u64>,
+    retained: &mut usize,
+    budget: usize,
+    key: &str,
+) -> Result<&'a mut u64, String> {
+    if !sizes.contains_key(key) {
+        *retained = retained.saturating_add(key.len() + FOLDER_KEY_OVERHEAD_BYTES);
+        if *retained > budget {
+            return Err(format!(
+                "Remote folder aggregation exceeded the {budget} byte budget. Aborting for security."
+            ));
+        }
+    }
+    Ok(sizes.entry(key.to_string()).or_insert(0))
+}
+
+fn aggregate_remote_folders_with_budget(
+    remote_url: &str,
+    items: &[WebdavItem],
+    cancel: &AtomicBool,
+    budget: usize,
+) -> Result<Vec<RemoteFolder>, String> {
     // BTreeMap keeps output sorted by path, with "" (the root) first.
     let mut sizes: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut retained: usize = 0;
     sizes.entry(String::new()).or_insert(0);
     for item in items {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("Operation canceled by user.".to_string());
+        }
         let rel = relative_item_path(remote_url, &item.href);
         let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
         if segments.is_empty() {
             continue;
+        }
+        if segments.len() > MAX_REMOTE_PATH_SEGMENTS {
+            return Err(format!(
+                "Remote path exceeds the {MAX_REMOTE_PATH_SEGMENTS} segment limit. Aborting for security."
+            ));
         }
         if item.is_dir {
             // Register the folder (and, defensively, every ancestor).
@@ -3130,25 +3238,25 @@ pub fn aggregate_remote_folders(remote_url: &str, items: &[WebdavItem]) -> Vec<R
                     acc.push('/');
                 }
                 acc.push_str(segment);
-                sizes.entry(acc.clone()).or_insert(0);
+                charge_remote_folder(&mut sizes, &mut retained, budget, &acc)?;
             }
         } else {
             // Credit the root and every ancestor folder; never the file itself.
-            *sizes.entry(String::new()).or_insert(0) += item.size;
+            *charge_remote_folder(&mut sizes, &mut retained, budget, "")? += item.size;
             let mut acc = String::new();
             for segment in &segments[..segments.len() - 1] {
                 if !acc.is_empty() {
                     acc.push('/');
                 }
                 acc.push_str(segment);
-                *sizes.entry(acc.clone()).or_insert(0) += item.size;
+                *charge_remote_folder(&mut sizes, &mut retained, budget, &acc)? += item.size;
             }
         }
     }
-    sizes
+    Ok(sizes
         .into_iter()
         .map(|(path, size)| RemoteFolder { path, size })
-        .collect()
+        .collect())
 }
 
 /// Lists every folder beneath `remote_url` with its aggregated size, using the
@@ -3179,7 +3287,7 @@ where
         None,
         log,
     )?;
-    Ok(aggregate_remote_folders(remote_url, &items))
+    aggregate_remote_folders(remote_url, &items, cancel_flag)
 }
 
 /// Extracts modification time from std::fs::Metadata as UNIX timestamp (seconds).
@@ -4195,6 +4303,13 @@ where
                     ));
                     continue;
                 }
+                if !download_rel_path_within_segments(rel) {
+                    log(&format!(
+                        "[{}/{}] ERROR: Skipping {}: path exceeds the {MAX_REMOTE_PATH_SEGMENTS} segment limit.\n",
+                        current_num, total_files, rel
+                    ));
+                    continue;
+                }
                 let target_file = match safe_join_path(local_dir, rel) {
                     Ok(p) => p,
                     Err(e) => {
@@ -4205,16 +4320,6 @@ where
                         continue;
                     }
                 };
-                if let Some(parent) = target_file.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        format!("Failed to create directory {}: {}", parent.display(), e)
-                    })?;
-                    if let (Ok(c_parent), Ok(c_base)) = (parent.canonicalize(), local_dir.canonicalize()) {
-                        if !c_parent.starts_with(&c_base) {
-                            return Err(format!("Directory traversal detected for {}", rel));
-                        }
-                    }
-                }
                 let download_result = retry_webdav_operation(
                     &format!("GET {download_url}"),
                     cancel_flag,
@@ -4230,6 +4335,29 @@ where
                             return Err(AttemptError::Fatal(format!(
                                 "GET {download_url} returned HTTP {status}"
                             )));
+                        }
+                        // Create the destination tree only after a successful
+                        // status: a failing (or hostile 404) listing item then
+                        // leaves no directories behind, and the segment cap
+                        // above bounds how deep this can ever go.
+                        if let Some(parent) = target_file.parent() {
+                            std::fs::create_dir_all(parent).map_err(|e| {
+                                AttemptError::Fatal(format!(
+                                    "Failed to create directory {}: {}",
+                                    parent.display(),
+                                    e
+                                ))
+                            })?;
+                            if let (Ok(c_parent), Ok(c_base)) =
+                                (parent.canonicalize(), local_dir.canonicalize())
+                            {
+                                if !c_parent.starts_with(&c_base) {
+                                    return Err(AttemptError::Fatal(format!(
+                                        "Directory traversal detected for {}",
+                                        rel
+                                    )));
+                                }
+                            }
                         }
                         // Stream to a hidden, unpredictable temporary sibling
                         // and replace the destination only after the body
@@ -6425,7 +6553,8 @@ mod tests {
             WebdavItem::new("/docs/a/empty/", true, 0),
         ];
 
-        let folders = aggregate_remote_folders(base, &items);
+        let folders = aggregate_remote_folders(base, &items, &AtomicBool::new(false))
+            .expect("aggregation should succeed for a normal listing");
         let by_path: Vec<(String, u64)> = folders
             .into_iter()
             .map(|f| (f.path, f.size))
@@ -6449,7 +6578,8 @@ mod tests {
             WebdavItem::new("/docs/my%20dir/file%20one.txt", false, 7),
         ];
 
-        let folders = aggregate_remote_folders(base, &items);
+        let folders = aggregate_remote_folders(base, &items, &AtomicBool::new(false))
+            .expect("aggregation should succeed for a normal listing");
         let by_path: Vec<(String, u64)> = folders
             .into_iter()
             .map(|f| (f.path, f.size))
@@ -6471,7 +6601,8 @@ mod tests {
             WebdavItem::new("/docs/y/three.bin", false, 2),
         ];
 
-        let folders = aggregate_remote_folders(base, &items);
+        let folders = aggregate_remote_folders(base, &items, &AtomicBool::new(false))
+            .expect("aggregation should succeed for a normal listing");
         let by_path: Vec<(String, u64)> = folders
             .into_iter()
             .map(|f| (f.path, f.size))
@@ -6551,5 +6682,89 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(configured.max(1));
         assert!(deadline > std::time::Instant::now());
     }
-}
 
+    struct CancelingReader<'a> {
+        cancel: &'a AtomicBool,
+        reads: usize,
+        flip_at: usize,
+    }
+
+    impl std::io::Read for CancelingReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads >= self.flip_at {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+            buffer[0] = b'x';
+            Ok(1)
+        }
+    }
+
+    struct EndlessByteReader;
+
+    impl std::io::Read for EndlessByteReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            buffer[0] = b'x';
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn test_read_listing_body_observes_cancel_during_read() {
+        let cancel = AtomicBool::new(false);
+        let mut reader = CancelingReader { cancel: &cancel, reads: 0, flip_at: 3 };
+        let err = read_listing_body_bounded(&cancel, &mut reader, Duration::from_secs(3600))
+            .expect_err("a canceled listing read must not run to completion");
+        assert!(err.contains("canceled"), "unexpected error: {err}");
+        assert!(reader.reads < 100, "read kept going after cancel: {} reads", reader.reads);
+    }
+
+    #[test]
+    fn test_read_listing_body_aborts_after_body_deadline() {
+        let cancel = AtomicBool::new(false);
+        let mut reader = EndlessByteReader;
+        let started = Instant::now();
+        let err = read_listing_body_bounded(&cancel, &mut reader, Duration::from_millis(50))
+            .expect_err("a slow-drip listing body must hit the deadline");
+        assert!(err.contains("time limit"), "unexpected error: {err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_aggregate_remote_folders_rejects_oversized_path_depth() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let deep = "a/".repeat(MAX_REMOTE_PATH_SEGMENTS + 1);
+        let items = vec![WebdavItem::new(&format!("/docs/{deep}file.bin"), false, 1)];
+        let err = aggregate_remote_folders(base, &items, &AtomicBool::new(false))
+            .expect_err("a 65-segment path must be rejected");
+        assert!(err.contains("segment limit"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_aggregate_remote_folders_enforces_derived_byte_budget() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let items: Vec<WebdavItem> = (0..200)
+            .map(|i| WebdavItem::new(&format!("/docs/folder-{i}/x.bin"), false, 1))
+            .collect();
+        let err = aggregate_remote_folders_with_budget(base, &items, &AtomicBool::new(false), 1024)
+            .expect_err("derived keys must be charged against the budget");
+        assert!(err.contains("byte budget"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_aggregate_remote_folders_honors_cancel() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let cancel = AtomicBool::new(true);
+        let items = vec![WebdavItem::new("/docs/a/file.bin", false, 1)];
+        let err = aggregate_remote_folders(base, &items, &cancel)
+            .expect_err("a canceled aggregation must stop");
+        assert!(err.contains("canceled"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_download_rel_path_segment_cap() {
+        assert!(download_rel_path_within_segments("course/module/file.txt"));
+        let deep = "a/".repeat(MAX_REMOTE_PATH_SEGMENTS + 1);
+        assert!(!download_rel_path_within_segments(&format!("{deep}file.txt")));
+    }
+}
