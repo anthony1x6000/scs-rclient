@@ -12,6 +12,10 @@ WebDAV directly.
 
 ## Installation
 
+### Install on Windows
+
+Grab the installer from the [latest release](https://github.com/anthony1x6000/scs-rclient/releases/latest): download `scs-rclient-win-installer.exe` and run it.
+
 ### Install from Flatpak repository
 
 With the Flatpak repository, you get automatic updates whenever a new version is released.
