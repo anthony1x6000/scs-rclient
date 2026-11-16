@@ -50,7 +50,8 @@ jobs:
 
       - name: Seed a demo profile
         run: |
-          settings_dir="$HOME/.config/online.anthonyis.scs-rclient"
+          # tauri-plugin-store resolves under BaseDirectory::AppData, not config.
+          settings_dir="$HOME/.local/share/online.anthonyis.scs-rclient"
           mkdir -p "$settings_dir"
           cat > "$settings_dir/settings.json" <<'JSON'
           {
@@ -165,8 +166,12 @@ jobs:
             cp /tmp/shot-closed.png docs/screenshot.png
           fi
 
-          identify docs/screenshot.png
-          read -r w h < <(identify -format '%w %h' docs/screenshot.png)
+          dims=$(identify -format '%wx%h' docs/screenshot.png 2>/dev/null || true)
+          w=${dims%x*}
+          h=${dims#*x}
+          echo "captured ${dims:-unknown}"
+          case "$w" in ''|*[!0-9]*) echo "::error::could not read screenshot dimensions"; exit 1;; esac
+          case "$h" in ''|*[!0-9]*) echo "::error::could not read screenshot dimensions"; exit 1;; esac
           if [ "$w" -lt 700 ] || [ "$h" -lt 500 ]; then
             echo "::error::screenshot is unexpectedly small (${w}x${h})"; exit 1
           fi
