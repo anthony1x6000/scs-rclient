@@ -182,7 +182,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist-win | Out-Null
           Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination dist-win/scs-rclient-win-portable.exe
-          Compress-Archive -Path dist-win/scs-rclient-win-portable.exe -DestinationPath dist-win/scs-rclient-win-portable.zip -Force
 
       - name: Build NSIS Installer (currentUser)
         run: |
@@ -240,16 +239,13 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist-win-noicon | Out-Null
-          Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination dist-win-noicon/scs-rclient-win-noicon.exe -Force
-          Compress-Archive -Path dist-win-noicon/scs-rclient-win-noicon.exe -DestinationPath dist-win-noicon/scs-rclient-win-noicon.zip -Force
+          Copy-Item -Path src-tauri/target/release/scs-rclient.exe -Destination dist-win-noicon/scs-rclient-win-portable-noicon.exe -Force
 
       - name: Upload Windows Portable No-Icon Artifact
         uses: actions/upload-artifact@v7
         with:
           name: tauri-build-windows-no-icon
-          path: |
-            dist-win-noicon/scs-rclient-win-noicon.exe
-            dist-win-noicon/scs-rclient-win-noicon.zip
+          path: dist-win-noicon/scs-rclient-win-portable-noicon.exe
           if-no-files-found: error
 
   flatpak:
@@ -544,8 +540,8 @@ jobs:
             scs-rclient-linux.rpm
             scs-rclient-linux.flatpak
             scs-rclient-win-installer.exe
-            scs-rclient-win-portable.zip
-            scs-rclient-win-noicon.zip
+            scs-rclient-win-portable.exe
+            scs-rclient-win-portable-noicon.exe
           )
 
           missing=0
@@ -602,7 +598,7 @@ jobs:
           update_release_body: true
           github_token: ${{ secrets.GITHUB_TOKEN }}
           files: |
-            scs-rclient-win-portable\.zip$
-            scs-rclient-win-noicon\.zip$
+            scs-rclient-win-portable\.exe$
+            scs-rclient-win-portable-noicon\.exe$
             scs-rclient-win-installer\.exe$
           request_rate: 2

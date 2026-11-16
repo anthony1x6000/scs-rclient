@@ -79,7 +79,7 @@ flatpak override --user --filesystem=~/Documents online.anthonyis.scs-rclient
 
 Standalone release binaries are also available from [GitHub Releases](https://github.com/anthony1x6000/scs-rclient/releases/latest):
 - **Linux**: AppImage, DEB, RPM, Flatpak
-- **Windows**: Portable EXE, Installer EXE
+- **Windows**: Portable EXE, Icon-free portable EXE, Installer EXE
 
 ## Security
 
