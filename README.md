@@ -6,9 +6,15 @@ folders on a remote WebDAV server. It replaces Dreamweaver's WebDAV workflow.
 No rclone installation, configuration, or bundled binary is required: the app talks
 WebDAV directly.
 
+![scs-rclient main window](docs/screenshot.png)
+
 ![scs-rclient Icon](src-tauri/icons/128x128@2x.png)
 
 ## Installation
+
+### Install on Windows
+
+Grab the installer from the [latest release](https://github.com/anthony1x6000/scs-rclient/releases/latest): download `scs-rclient-win-installer.exe` and run it.
 
 ### Install from Flatpak repository
 
