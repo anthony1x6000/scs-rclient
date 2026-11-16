@@ -1,5 +1,7 @@
 use tauri::Manager;
 
+mod timefmt;
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
 fn validate_username(username: &str) -> Result<(), String> {
@@ -277,7 +279,7 @@ async fn run_webdav_action(
     let dest_root = if backup.unwrap_or(false) {
         let backups = join_contained(base_mount, "backups")?;
         if backup_dated.unwrap_or(false) {
-            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let today = crate::timefmt::local_date_ymd();
             join_contained(&backups, &today)?
         } else {
             backups
