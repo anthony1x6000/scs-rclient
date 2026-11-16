@@ -2,6 +2,8 @@ use crate::dav_client::{self, Client};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::io::Read;
+
+pub use crate::timefmt::parse_webdav_date;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
@@ -1300,31 +1302,6 @@ fn read_listing_body_bounded<R: std::io::Read>(
         ));
     }
     Ok(ListingBody { body: buf, _inflight: inflight })
-}
-
-/// Parses a WebDAV date string into a UNIX timestamp (seconds since epoch).
-pub fn parse_webdav_date(date_str: &str) -> Option<u64> {
-    let s = date_str.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // 1. Standard HTTP-date / RFC 2822 (e.g. "Mon, 28 Sep 2026 13:45:09 GMT")
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
-        return Some(dt.timestamp().max(0) as u64);
-    }
-    // 2. ISO 8601 / RFC 3339 (e.g. "2026-09-28T13:45:09Z")
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp().max(0) as u64);
-    }
-    // 3. RFC 850 format (e.g. "Monday, 28-Sep-26 13:45:09 GMT")
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%A, %d-%b-%y %H:%M:%S GMT") {
-        return Some(dt.and_utc().timestamp().max(0) as u64);
-    }
-    // 4. asctime format (e.g. "Mon Sep 28 13:45:09 2026")
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%a %b %e %H:%M:%S %Y") {
-        return Some(dt.and_utc().timestamp().max(0) as u64);
-    }
-    None
 }
 
 /// Parses the WebDAV PROPFIND XML response into WebdavItem records.
