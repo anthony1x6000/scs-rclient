@@ -220,6 +220,16 @@ function gateWorkflowNames() {
   return names;
 }
 
+// A workflow completion can arrive for a commit the pull request already moved
+// past: pushing again cancels the runs that were in flight, and their
+// completions still start this workflow, which then reads a cancelled run for a
+// stale sha and reports a red gate nobody can act on. A stale commit is not a
+// verdict, so the gate stops before classifying anything.
+export function isStaleCommit(pr, headSha) {
+  const current = pr && pr.head && pr.head.sha;
+  return Boolean(current) && current !== headSha;
+}
+
 // Conclusions that are not failures. `skipped` passes: a workflow whose jobs
 // all skipped still reported, and it gates nothing on this commit.
 const GATE_PASSING_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
@@ -230,6 +240,29 @@ const GATE_PASSING_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
 // which is the whole point; the poll loop this replaced occupied a self-hosted
 // runner for up to fifteen minutes and could deadlock against the very checks
 // it was waiting for.
+async function fetchPullRequest(repo, token, prNumber) {
+  let res;
+  try {
+    res = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "scs-rclient-ai-review"
+      }
+    });
+  } catch (err) {
+    console.error(`failed to fetch the pull request: ${err.message}.`);
+    process.exit(2);
+  }
+  if (!res.ok) {
+    // Fail closed: without the current head this gate cannot tell a stale
+    // commit from the reviewed one.
+    console.error(`github api pull request query returned ${res.status}.`);
+    process.exit(2);
+  }
+  return res.json();
+}
+
 async function classifyGate() {
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   const repo = process.env.REPO || process.env.GITHUB_REPOSITORY;
@@ -238,6 +271,14 @@ async function classifyGate() {
   if (!token || !repo || !headSha) {
     console.error("missing required environment variables (GITHUB_TOKEN, REPO, HEAD_SHA).");
     process.exit(2);
+  }
+
+  // The pr may have moved on since the run that triggered this one.
+  if (process.env.PR_NUMBER) {
+    const pr = await fetchPullRequest(repo, token, process.env.PR_NUMBER);
+    if (isStaleCommit(pr, headSha)) {
+      return { state: "stale", passed: [], pending: [], failed: [], headSha };
+    }
   }
 
   const watched = gateWorkflowNames();
@@ -336,6 +377,10 @@ async function gateAction() {
       `::error title=ai review skipped::other pr checks failed: ${gate.failed.join(", ")}. fix or re-run them; the next completion runs this gate again.`
     );
     process.exit(1);
+  }
+  if (gate.state === "stale") {
+    console.log(`commit ${gate.headSha} is no longer the pull request head; nothing to review.`);
+    return;
   }
   if (gate.state === "wait") {
     console.log("other pr checks are still running; this run is done, the next completion re-runs it.");
