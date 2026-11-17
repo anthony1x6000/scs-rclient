@@ -169,6 +169,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ steps.target.outputs.head_sha }}
+          # A force-push cancels the runs that were in flight and their
+          # completions still land here, so the gate checks the pr's current
+          # head before it judges a commit that may already be superseded.
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           GATE_WORKFLOWS: "Tauri Build"
         run: node scripts/ai-code-review.mjs gate
 
