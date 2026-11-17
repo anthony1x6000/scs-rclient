@@ -1,10 +1,6 @@
 # scs-rclient
 
-Native WebDAV desktop client for uploading, downloading, comparing, and backing up
-folders on a remote WebDAV server. It replaces Dreamweaver's WebDAV workflow.
-
-No rclone installation, configuration, or bundled binary is required: the app talks
-WebDAV directly.
+Native WebDAV desktop client
 
 ![scs-rclient main window](docs/screenshot.png)
 
