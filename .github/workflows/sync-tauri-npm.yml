@@ -62,8 +62,8 @@ jobs:
             exit 0
           fi
           pnpm install --lockfile-only
-          git config user.name "scs-rclient dependency bot"
-          git config user.email "dependency-bot@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B chore/tauri-npm-sync
           git add package.json pnpm-lock.yaml
           git commit -m "chore(deps): align @tauri-apps npm packages with the Rust crates"

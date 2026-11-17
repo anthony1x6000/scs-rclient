@@ -225,8 +225,8 @@ jobs:
             echo "Screenshot is unchanged; nothing to publish."
             exit 0
           fi
-          git config user.name "scs-rclient screenshot bot"
-          git config user.email "screenshot-bot@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B chore/readme-screenshot
           git commit -m "docs: refresh README screenshot"
           git push --force \
