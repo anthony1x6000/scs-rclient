@@ -606,8 +606,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Test the Report Renderer
-        run: bash scripts/test/test-virustotal-report.sh
+      - name: Test the Report Scripts
+        run: |
+          bash scripts/test/test-virustotal-report.sh
+          bash scripts/test/test-virustotal-scan.sh
 
       # One asset, one verdict: the portable build is what people double-click,
       # and the free VirusTotal tier only allows a handful of requests per
