@@ -1304,10 +1304,13 @@ fn read_listing_body_bounded<R: std::io::Read>(
     Ok(ListingBody { body: buf, _inflight: inflight })
 }
 
-/// quick-xml 0.39 split text decoding from entity resolution. PROPFIND hrefs
-/// and property values need both, so keep the pair together.
+/// Resolves one PROPFIND text event. quick-xml 0.42 hands back decoded `str`
+/// and reports entity references as their own events, so all that is left
+/// here is the unescape for references the reader left inline.
 fn decode_text_event(e: &quick_xml::events::BytesText<'_>) -> Option<String> {
-    let decoded = e.decode().ok()?;
+    // quick-xml 0.42 hands back already-decoded `str` content, so only the
+    // entity resolution is left to do here.
+    let decoded = e.xml10_content();
     quick_xml::escape::unescape(&decoded).ok().map(|s| s.into_owned())
 }
 
@@ -1316,7 +1319,7 @@ fn general_reference_text(e: &quick_xml::events::BytesRef<'_>) -> Option<String>
     if let Ok(Some(ch)) = e.resolve_char_ref() {
         return Some(ch.to_string());
     }
-    let name = e.decode().ok()?;
+    let name = e.xml10_content();
     quick_xml::escape::resolve_predefined_entity(&name).map(str::to_string)
 }
 
@@ -1345,10 +1348,8 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
     let mut depth: i64 = 0;
     let mut saw_multistatus_root = false;
 
-    let mut buf = Vec::new();
-
     loop {
-        let event = reader.read_event_into(&mut buf);
+        let event = reader.read_event();
         let text_chunk = match &event {
             Ok(quick_xml::events::Event::Text(e)) => decode_text_event(e),
             Ok(quick_xml::events::Event::GeneralRef(e)) => general_reference_text(e),
@@ -1370,7 +1371,7 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                     if !e
                         .local_name()
                         .as_ref()
-                        .eq_ignore_ascii_case(b"multistatus")
+                        .eq_ignore_ascii_case("multistatus")
                     {
                         return Err(
                             "malformed PROPFIND XML: root element is not multistatus"
@@ -1382,25 +1383,25 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                 depth += 1;
                 let local = e.local_name();
                 let name = local.as_ref();
-                if name.eq_ignore_ascii_case(b"response") {
+                if name.eq_ignore_ascii_case("response") {
                     in_response = true;
                     current_href.clear();
                     current_is_dir = false;
                     current_size = 0;
                     current_mtime = None;
-                } else if in_response && name.eq_ignore_ascii_case(b"href") {
+                } else if in_response && name.eq_ignore_ascii_case("href") {
                     in_href = true;
-                } else if in_response && name.eq_ignore_ascii_case(b"resourcetype") {
+                } else if in_response && name.eq_ignore_ascii_case("resourcetype") {
                     in_resourcetype = true;
-                } else if in_resourcetype && name.eq_ignore_ascii_case(b"collection") {
+                } else if in_resourcetype && name.eq_ignore_ascii_case("collection") {
                     current_is_dir = true;
-                } else if in_response && name.eq_ignore_ascii_case(b"getcontentlength") {
+                } else if in_response && name.eq_ignore_ascii_case("getcontentlength") {
                     in_getcontentlength = true;
-                } else if in_response && name.eq_ignore_ascii_case(b"getlastmodified") {
+                } else if in_response && name.eq_ignore_ascii_case("getlastmodified") {
                     in_getlastmodified = true;
                 } else if in_response
-                    && (name.eq_ignore_ascii_case(b"iscollection")
-                        || name.eq_ignore_ascii_case(b"isfolder"))
+                    && (name.eq_ignore_ascii_case("iscollection")
+                        || name.eq_ignore_ascii_case("isfolder"))
                 {
                     in_iscollection = true;
                 }
@@ -1419,7 +1420,7 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                     if !e
                         .local_name()
                         .as_ref()
-                        .eq_ignore_ascii_case(b"multistatus")
+                        .eq_ignore_ascii_case("multistatus")
                     {
                         return Err(
                             "malformed PROPFIND XML: root element is not multistatus"
@@ -1430,7 +1431,7 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                 }
                 let local = e.local_name();
                 let name = local.as_ref();
-                if in_resourcetype && name.eq_ignore_ascii_case(b"collection") {
+                if in_resourcetype && name.eq_ignore_ascii_case("collection") {
                     current_is_dir = true;
                 }
             }
@@ -1472,33 +1473,24 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                 }
             }
             Ok(quick_xml::events::Event::CData(ref e)) => {
+                // quick-xml 0.42 derefs CDATA to `str`, so there is no decode
+                // step left; the cap still applies before anything is kept.
+                let text: &str = &**e;
                 if in_href {
-                    if let Ok(text) = std::str::from_utf8(e.as_ref()) {
-                        if current_href
-                            .len()
-                            .saturating_add(text.len())
-                            > MAX_REMOTE_HREF_BYTES
-                        {
-                            return Err(format!(
-                                "listing href exceeds the {MAX_REMOTE_HREF_BYTES} byte limit"
-                            ));
-                        }
-                        current_href.push_str(text);
+                    if current_href.len().saturating_add(text.len()) > MAX_REMOTE_HREF_BYTES {
+                        return Err(format!(
+                            "listing href exceeds the {MAX_REMOTE_HREF_BYTES} byte limit"
+                        ));
                     }
+                    current_href.push_str(text);
                 } else if in_getcontentlength {
-                    if let Ok(text) = std::str::from_utf8(e.as_ref()) {
-                        current_size = text.trim().parse::<u64>().unwrap_or(0);
-                    }
+                    current_size = text.trim().parse::<u64>().unwrap_or(0);
                 } else if in_getlastmodified {
-                    if let Ok(text) = std::str::from_utf8(e.as_ref()) {
-                        current_mtime = parse_webdav_date(text);
-                    }
+                    current_mtime = parse_webdav_date(text);
                 } else if in_iscollection {
-                    if let Ok(text) = std::str::from_utf8(e.as_ref()) {
-                        let val = text.trim();
-                        if val == "1" || val.eq_ignore_ascii_case("true") {
-                            current_is_dir = true;
-                        }
+                    let val = text.trim();
+                    if val == "1" || val.eq_ignore_ascii_case("true") {
+                        current_is_dir = true;
                     }
                 }
             }
@@ -1506,7 +1498,7 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                 depth = depth.saturating_sub(1);
                 let local = e.local_name();
                 let name = local.as_ref();
-                if name.eq_ignore_ascii_case(b"response") {
+                if name.eq_ignore_ascii_case("response") {
                     in_response = false;
                     let clean_href = current_href.trim();
                     if !clean_href.is_empty() {
@@ -1533,16 +1525,16 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                             ));
                         }
                     }
-                } else if name.eq_ignore_ascii_case(b"href") {
+                } else if name.eq_ignore_ascii_case("href") {
                     in_href = false;
-                } else if name.eq_ignore_ascii_case(b"resourcetype") {
+                } else if name.eq_ignore_ascii_case("resourcetype") {
                     in_resourcetype = false;
-                } else if name.eq_ignore_ascii_case(b"getcontentlength") {
+                } else if name.eq_ignore_ascii_case("getcontentlength") {
                     in_getcontentlength = false;
-                } else if name.eq_ignore_ascii_case(b"getlastmodified") {
+                } else if name.eq_ignore_ascii_case("getlastmodified") {
                     in_getlastmodified = false;
-                } else if name.eq_ignore_ascii_case(b"iscollection")
-                    || name.eq_ignore_ascii_case(b"isfolder")
+                } else if name.eq_ignore_ascii_case("iscollection")
+                    || name.eq_ignore_ascii_case("isfolder")
                 {
                     in_iscollection = false;
                 }
@@ -1571,7 +1563,6 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
             }
             _ => {}
         }
-        buf.clear();
     }
 
     Ok(items)
