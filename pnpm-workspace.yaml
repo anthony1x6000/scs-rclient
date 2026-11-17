@@ -6,6 +6,14 @@ pnpmfile: .pnpmfile.cjs
 
 allowBuilds:
   esbuild: true
+
+# GHSA-fc5q-39xc-vjpf: picomatch ReDoS through repeated extglobs. Every path into
+# it is dev-only (vite -> fdir/tinyglobby globbing, plus the build tooling), so it
+# never ships in the app, and the advisory's fix (4.0.8) is not published yet.
+# Drop this entry as soon as 4.0.8 is available; Dependabot will propose it.
+auditConfig:
+  ignoreGhsas:
+    - GHSA-fc5q-39xc-vjpf
 minimumReleaseAge: 10080
 minimumReleaseAgeStrict: true
 trustPolicy: no-downgrade
