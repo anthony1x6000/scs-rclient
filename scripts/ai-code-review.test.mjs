@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { parseVerdict, validateProvider } from "./ai-code-review.mjs";
+import { isStaleCommit, parseVerdict, validateProvider } from "./ai-code-review.mjs";
 
 const fleetEntry = {
   id: "opencode-go-deepseek",
@@ -12,6 +12,14 @@ const fleetEntry = {
   endpoint: "https://opencode.ai/zen/go/v1/chat/completions",
   apiKeyEnv: "OCG_KEY"
 };
+
+test("a completion for a commit the pull request moved past is stale", () => {
+  const head = "a".repeat(40);
+  assert.equal(isStaleCommit({ head: { sha: "b".repeat(40) } }, head), true);
+  assert.equal(isStaleCommit({ head: { sha: head } }, head), false);
+  // No snapshot means no evidence of a move: never stale on a guess.
+  assert.equal(isStaleCommit(null, head), false);
+});
 
 test("accepts the fleet's own entry shape", () => {
   assert.equal(validateProvider({ ...fleetEntry, maxTokens: 393216, maxPromptBytes: 20000, timeoutMs: 480000 }), "");
