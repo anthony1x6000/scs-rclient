@@ -1304,6 +1304,22 @@ fn read_listing_body_bounded<R: std::io::Read>(
     Ok(ListingBody { body: buf, _inflight: inflight })
 }
 
+/// quick-xml 0.39 split text decoding from entity resolution. PROPFIND hrefs
+/// and property values need both, so keep the pair together.
+fn decode_text_event(e: &quick_xml::events::BytesText<'_>) -> Option<String> {
+    let decoded = e.decode().ok()?;
+    quick_xml::escape::unescape(&decoded).ok().map(|s| s.into_owned())
+}
+
+/// Resolves a standalone `&name;` / `&#n;` reference event to its text.
+fn general_reference_text(e: &quick_xml::events::BytesRef<'_>) -> Option<String> {
+    if let Ok(Some(ch)) = e.resolve_char_ref() {
+        return Some(ch.to_string());
+    }
+    let name = e.decode().ok()?;
+    quick_xml::escape::resolve_predefined_entity(&name).map(str::to_string)
+}
+
 /// Parses the WebDAV PROPFIND XML response into WebdavItem records.
 pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
     let mut items = Vec::new();
@@ -1332,7 +1348,13 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
     let mut buf = Vec::new();
 
     loop {
-        match reader.read_event_into(&mut buf) {
+        let event = reader.read_event_into(&mut buf);
+        let text_chunk = match &event {
+            Ok(quick_xml::events::Event::Text(e)) => decode_text_event(e),
+            Ok(quick_xml::events::Event::GeneralRef(e)) => general_reference_text(e),
+            _ => None,
+        };
+        match event {
             Ok(quick_xml::events::Event::Start(ref e)) => {
                 if depth == 0 {
                     // Fail closed on document shape: the first element must
@@ -1412,9 +1434,12 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                     current_is_dir = true;
                 }
             }
-            Ok(quick_xml::events::Event::Text(ref e)) => {
+            Ok(quick_xml::events::Event::Text(_)) | Ok(quick_xml::events::Event::GeneralRef(_)) => {
+                // A listing href can mix literal text with `&amp;`-style
+                // references, and quick-xml 0.39 reports the reference as its
+                // own event, so both arrive here as one text chunk.
                 if in_href {
-                    if let Ok(text) = e.unescape() {
+                    if let Some(text) = text_chunk {
                         // Cap BEFORE appending: the buffer must never
                         // allocate past the limit, or one huge text node
                         // amplifies parser state past the reservation.
@@ -1430,15 +1455,15 @@ pub fn parse_propfind_xml(xml: &str) -> Result<Vec<WebdavItem>, String> {
                         current_href.push_str(&text);
                     }
                 } else if in_getcontentlength {
-                    if let Ok(text) = e.unescape() {
+                    if let Some(text) = text_chunk {
                         current_size = text.trim().parse::<u64>().unwrap_or(0);
                     }
                 } else if in_getlastmodified {
-                    if let Ok(text) = e.unescape() {
+                    if let Some(text) = text_chunk {
                         current_mtime = parse_webdav_date(&text);
                     }
                 } else if in_iscollection {
-                    if let Ok(text) = e.unescape() {
+                    if let Some(text) = text_chunk {
                         let val = text.trim();
                         if val == "1" || val.eq_ignore_ascii_case("true") {
                             current_is_dir = true;
@@ -4908,6 +4933,29 @@ mod tests {
         assert_eq!(items[1].href, "/files/myuser/docs/notes.txt");
         assert!(!items[1].is_dir);
         assert_eq!(items[1].size, 1024);
+    }
+
+    #[test]
+    fn test_parse_propfind_unescapes_entities() {
+        // Servers percent-encode the URL but XML-escape the ampersand. Both
+        // stay as-is; only the XML entity is resolved before the href is used.
+        let sample = r#"<?xml version="1.0" encoding="utf-8"?>
+        <D:multistatus xmlns:D="DAV:">
+            <D:response>
+                <D:href>/files/myuser/%26%20a&amp;b.txt</D:href>
+                <D:propstat>
+                    <D:prop>
+                        <D:getcontentlength>7</D:getcontentlength>
+                        <D:resourcetype/>
+                    </D:prop>
+                </D:propstat>
+            </D:response>
+        </D:multistatus>"#;
+
+        let items = parse_propfind_xml(sample).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].href, "/files/myuser/%26%20a&b.txt");
+        assert_eq!(items[0].size, 7);
     }
 
     #[test]
