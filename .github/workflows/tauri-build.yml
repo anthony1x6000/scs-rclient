@@ -7,6 +7,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, edited]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to re-scan with VirusTotal (blank runs the normal build)'
+        required: false
+        type: string
   release:
     types:
       - published
@@ -584,21 +589,35 @@ jobs:
 
   virustotal:
     name: VirusTotal Release Asset Scan
-    if: github.event_name == 'release'
+    # A release scans its own asset; a dispatch with a tag re-scans an existing
+    # release, which is how a rate-limited scan gets retried without cutting a
+    # new release. `always()` is what lets the job run when the release-only
+    # publish job was skipped.
+    if: >-
+      always() && (
+        (github.event_name == 'release' && needs.publish-release.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+      )
     needs: [publish-release]
     runs-on: ubuntu-slim
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - name: Scan Release Assets via VirusTotal
-        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
-        continue-on-error: true
-        with:
-          vt_api_key: ${{ secrets.VT_KEY }}
-          update_release_body: true
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          files: |
-            scs-rclient-win-portable\.exe$
-            scs-rclient-win-portable-noicon\.exe$
-            scs-rclient-win-installer\.exe$
-          request_rate: 2
+      - uses: actions/checkout@v7
+
+      - name: Test the Report Renderer
+        run: bash scripts/test/test-virustotal-report.sh
+
+      # One asset, one verdict: the portable build is what people double-click,
+      # and the free VirusTotal tier only allows a handful of requests per
+      # minute, so scanning three assets is how the scan got rate limited and
+      # posted nothing at all. A failure here still writes the reason into the
+      # release notes, but leaves the job red so it is not silently missing.
+      - name: Scan the Windows Portable Build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VT_API_KEY: ${{ secrets.VT_KEY }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          ASSET: scs-rclient-win-portable.exe
+        run: bash scripts/virustotal-report.sh scan
