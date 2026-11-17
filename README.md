@@ -85,4 +85,6 @@ Standalone release binaries are also available from [GitHub Releases](https://gi
 
 This project is audited with the [Cloudflare security-audit skill](https://github.com/cloudflare/security-audit-skill). Confirmed findings are fixed before the release that ships them; the current pass hardened WebDAV listing and download handling against hostile or compromised servers (cancel- and deadline-bounded listing bodies, bounded derived folder state, and capped local path depth).
 
+Windows portable builds are scanned with VirusTotal before release, and the verdict is appended to the release notes.
+
 To report a vulnerability, use [GitHub security advisories](https://github.com/anthony1x6000/scs-rclient/security/advisories/new) instead of a public issue.
