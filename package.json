@@ -20,15 +20,15 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.3.0",
+    "@tailwindcss/vite": "^4.3.5",
     "@tauri-apps/cli": "^2",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.6.0",
-    "tailwindcss": "^4.3.0",
+    "tailwindcss": "^4.3.5",
     "typescript": "~5.8.3",
     "vite": "^7.3.7",
-    "vitest": "^4.1.12"
+    "vitest": "^5.1.0"
   },
   "overrides": {
     "esbuild": "^0.28.1",
