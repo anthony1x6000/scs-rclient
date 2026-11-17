@@ -89,6 +89,9 @@ lookup() { # $1=sha256 → report JSON on stdout, empty when unknown, 3 on failu
       elif [ "$code" = "000" ]; then
         VT_REASON="no response from VirusTotal"
       fi
+      # The caller reads this file: a command substitution runs the function in
+      # a subshell, so a global would not survive the return.
+      printf '%s' "$VT_REASON" > "$tmp/reason"
       echo "lookup returned HTTP $code: $(vt_body)" >&2
       [ -s "$tmp/curl.err" ] && sed 's/^/curl: /' "$tmp/curl.err" >&2
       return 3
@@ -147,7 +150,8 @@ scan() {
 
   echo "asking VirusTotal for a known sample report"
   if ! report=$(lookup "$sha" 2>"$tmp/lookup.err"); then
-    reason="${VT_REASON:-lookup failed}"
+    reason=$(cat "$tmp/reason" 2>/dev/null || true)
+    reason="${reason:-lookup failed}"
     sed 's/^/virustotal: /' "$tmp/lookup.err" >&2
     append_section "$(unavailable "$reason")"
     echo "::error::VirusTotal lookup failed: $reason"
