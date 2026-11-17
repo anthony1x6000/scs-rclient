@@ -40,14 +40,24 @@ export function desiredSpec(version) {
   return `^${major}.${minor}`;
 }
 
+// The precision of a range says nothing about which minor it selects: `^2.12.4`
+// and `^2.12` are the same alignment as far as the CLI check is concerned, so
+// comparing the literal specifier would rewrite a correct manifest every run.
+export function specMinor(spec) {
+  const match = /^[\^~]?(\d+)(?:\.(\d+))?/.exec(String(spec).trim());
+  if (!match) return null;
+  return match[2] == null ? match[1] : `${match[1]}.${match[2]}`;
+}
+
 export function planPackageJson(pkg, versions) {
   const deps = pkg.dependencies || {};
   const changes = [];
   for (const [crate, version] of Object.entries(versions)) {
     const name = crateToNpmPackage(crate);
     if (!name || !(name in deps)) continue;
-    const to = desiredSpec(version);
-    if (deps[name] !== to) changes.push({ name, from: deps[name], to });
+    const [major, minor] = String(version).split(".");
+    if (specMinor(deps[name]) === `${major}.${minor}`) continue;
+    changes.push({ name, from: deps[name], to: desiredSpec(version) });
   }
   return changes.sort((a, b) => a.name.localeCompare(b.name));
 }

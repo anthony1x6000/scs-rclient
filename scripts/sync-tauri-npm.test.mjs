@@ -4,7 +4,7 @@
 // Run with `node --test scripts/sync-tauri-npm.test.mjs`.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyChanges, crateVersions, planPackageJson } from "./sync-tauri-npm.mjs";
+import { applyChanges, crateVersions, planPackageJson, specMinor } from "./sync-tauri-npm.mjs";
 
 const lock = `version = 4
 
@@ -43,6 +43,37 @@ test("maps crate versions to the matching npm minor", () => {
   assert.deepEqual(planPackageJson(pkg, crateVersions(lock)), [
     { name: "@tauri-apps/api", from: "^2", to: "^2.12" },
     { name: "@tauri-apps/plugin-store", from: "^2", to: "^2.5" }
+  ]);
+});
+
+test("reads the major.minor out of a range, whatever its precision", () => {
+  assert.equal(specMinor("^2"), "2");
+  assert.equal(specMinor("^2.12"), "2.12");
+  assert.equal(specMinor("^2.12.4"), "2.12");
+  assert.equal(specMinor("~2.12.4"), "2.12");
+  assert.equal(specMinor("2.12.4"), "2.12");
+  assert.equal(specMinor("latest"), null);
+});
+
+test("a patch-qualified range on the right minor is already aligned", () => {
+  const pkg = {
+    dependencies: {
+      "@tauri-apps/api": "^2.12.4",
+      "@tauri-apps/plugin-store": "^2.5.0"
+    }
+  };
+  assert.deepEqual(planPackageJson(pkg, crateVersions(lock)), []);
+});
+
+test("an older minor is rewritten to the crate minor", () => {
+  const pkg = {
+    dependencies: {
+      "@tauri-apps/api": "^2.11.0",
+      "@tauri-apps/plugin-store": "^2.5.0"
+    }
+  };
+  assert.deepEqual(planPackageJson(pkg, crateVersions(lock)), [
+    { name: "@tauri-apps/api", from: "^2.11.0", to: "^2.12" }
   ]);
 });
 
