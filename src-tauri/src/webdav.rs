@@ -556,7 +556,7 @@ pub fn compute_file_sha256(path: &Path) -> Result<String, std::io::Error> {
         }
         hasher.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -3450,12 +3450,24 @@ pub fn should_download_file(
     }
 }
 
+/// Lowercase hex for a digest. digest 0.10's `GenericArray` formats as hex
+/// through `LowerHex`, but the `hybrid-array` output of digest 0.11 does not,
+/// so the encoding is explicit and works for either.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// Computes SHA256 checksum formatted as hex string.
 pub fn compute_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex_lower(&hasher.finalize())
 }
 
 /// Verifies authentication by sending PROPFIND depth 0 to the URL.
@@ -6070,6 +6082,16 @@ mod tests {
         let direct = compute_sha256(b"test payload for streaming sha256");
         assert_eq!(computed, direct);
         remove_part_file(&temp_file);
+    }
+
+    #[test]
+    fn test_compute_sha256_hex_matches_known_vector() {
+        // SHA-256("abc") is the FIPS 180-4 vector; pinning it checks the hex
+        // encoding itself, not just that two call paths agree with each other.
+        assert_eq!(
+            compute_sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
