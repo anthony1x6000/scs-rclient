@@ -9,7 +9,7 @@ import { isStaleCommit, parseVerdict, validateProvider } from "./ai-code-review.
 const fleetEntry = {
   id: "opencode-go-deepseek",
   model: "deepseek-v4.1-flash",
-  endpoint: "https://opencode.ai/zen/go/v1/chat/completions",
+  endpoint: "https://opencode.ai/inference/go/openai/v1/chat/completions",
   apiKeyEnv: "OCG_KEY"
 };
 
@@ -33,8 +33,23 @@ test("the committed fleet passes validation", () => {
   }
 });
 
+test("the committed deepseek reviewer is DeepSeek V4.1 Flash 1017 on the Go inference gateway", () => {
+  // https://opencode.ai/inference/go/v1/models: id deepseek-v4.1-flash,
+  // name "DeepSeek V4.1 Flash 1017", canonical_id deepseek/deepseek-v4.1-flash-1017,
+  // chat base_url https://opencode.ai/inference/go/openai/v1.
+  const fleet = JSON.parse(fs.readFileSync(".github/ai-review-models.json", "utf8"));
+  const deepseek = fleet.find((entry) => entry.model === "deepseek-v4.1-flash");
+  assert.ok(deepseek, "the fleet has no deepseek-v4.1-flash reviewer");
+  assert.equal(fleet.filter((entry) => entry.model === "deepseek-v4.1-flash").length, 1);
+  assert.equal(deepseek.endpoint, "https://opencode.ai/inference/go/openai/v1/chat/completions");
+});
+
 test("allows the go inference endpoint with the opencode go key", () => {
   assert.equal(validateProvider({ ...fleetEntry, endpoint: "https://opencode.ai/inference/go/openai/v1/chat/completions" }), "");
+});
+
+test("rejects the retired zen endpoint, so the reviewer stays on the Go inference gateway", () => {
+  assert.match(validateProvider({ ...fleetEntry, endpoint: "https://opencode.ai/zen/go/v1/chat/completions" }), /not in the review allowlist/);
 });
 
 test("rejects an endpoint outside the allowlist, so a poisoned fleet cannot ship the diff elsewhere", () => {
