@@ -38,9 +38,9 @@ const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "
 // read. The review fleet is a repo file, so without this a poisoned config could
 // post the diff and the key to an arbitrary endpoint or read an unrelated
 // variable out of the runner environment. Matching the whole url, not just the
-// host, also rules out a swapped path on an allowed host.
+// host, also rules out a swapped path on an allowed host. The Go catalog's chat
+// base_url is the only review gateway; the retired zen/go alias is not allowed.
 const ALLOWED_ENDPOINTS = {
-  "https://opencode.ai/zen/go/v1/chat/completions": "OCG_KEY",
   "https://opencode.ai/inference/go/openai/v1/chat/completions": "OCG_KEY"
 };
 
