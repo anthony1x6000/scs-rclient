@@ -10,7 +10,7 @@ name: Dependabot Auto-merge
 # script, or input from the branch under review reaches a shell.
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
   workflow_dispatch:
     inputs:
       pr:
@@ -27,29 +27,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  enable:
-    name: Enable auto-merge
+  configure:
+    name: Configure Dependabot auto-merge
     runs-on: ubuntu-slim
     # A manual dispatch is the escape hatch for a PR that predates this file.
-    # The label check keeps a PR parked on purpose (see the upkeep workflow)
-    # from being re-armed by an unrelated push.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.pull_request.user.login == 'dependabot[bot]' &&
-       github.event.pull_request.draft == false &&
-       !contains(github.event.pull_request.labels.*.name, 'dependabot-hold'))
+      github.event.pull_request.user.login == 'dependabot[bot]'
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+      HELD: ${{ contains(github.event.pull_request.labels.*.name, 'dependabot-hold') }}
     steps:
-      - name: Enable auto-merge for the Dependabot PR
+      - name: Honor the Dependabot hold label
         run: |
           set -euo pipefail
           # Refusals are warnings, not failures: a conflicting branch cannot arm
           # auto-merge, and the scheduled upkeep run is what resolves it. A red
           # check here would only page a human for something already handled.
-          if ! OUT=$(gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash 2>&1); then
+          if [ "$HELD" = "true" ]; then
+            if ! OUT=$(gh pr merge "$PR_NUMBER" --repo "$REPO" --disable-auto 2>&1); then
+              echo "::warning title=dependabot auto-merge not disabled::pr #$PR_NUMBER: $OUT"
+              exit 0
+            fi
+            echo "auto-merge disabled for pr #$PR_NUMBER by dependabot-hold."
+          elif ! OUT=$(gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash 2>&1); then
             echo "::warning title=dependabot auto-merge not armed::pr #$PR_NUMBER: $OUT"
             exit 0
           fi
