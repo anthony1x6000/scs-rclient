@@ -79,7 +79,7 @@ Standalone release binaries are also available from [GitHub Releases](https://gi
 
 ## Security
 
-This project is audited with the [Cloudflare security-audit skill](https://github.com/cloudflare/security-audit-skill). Confirmed findings are fixed before the release that ships them; the current pass hardened WebDAV listing and download handling against hostile or compromised servers (cancel- and deadline-bounded listing bodies, bounded derived folder state, and capped local path depth).
+This project is audited with the [Cloudflare security-audit skill](https://github.com/cloudflare/security-audit-skill). Confirmed findings are fixed before the release that ships them. Recent passes hardened WebDAV listing and download handling against hostile or compromised servers (cancel- and deadline-bounded listing bodies, bounded derived folder state, and capped local path depth), and bounded the metadata and listing cache read from those servers (checked date and size arithmetic, a byte-capped cache read, and fail-closed cache entries).
 
 Windows portable builds are scanned with VirusTotal before release, and the verdict is appended to the release notes.
 
