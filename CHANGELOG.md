@@ -1,5 +1,12 @@
 # Changelog
 
+## Live Transfer Progress
+
+- **Progress Strip Above the Console**: Every upload, download, and preview now streams a `webdav-progress` event with the phase, active folder, completed/total files, bytes done/total, and the current file. A thin strip above the console shows an indeterminate scan pulse, a live bar, and the active path instead of leaving a long transfer indistinguishable from a hang.
+- **Downloads Count Bytes, Uploads Count Files**: Downloads emit per-MiB byte progress, so one large file visibly advances the bar. Uploads emit per-file completion from the worker pool, plus an authoritative final snapshot after every worker stops (parallel completion order cannot rewind the counts).
+- **Terminal Feedback**: A finished run stays visible for five seconds; a failed one stays for twelve with a red strip. Bulk runs label the active folder on every event.
+- **Tests**: The Vitest suite covers byte formatting, file-vs-byte ratio selection, the indeterminate scan state, and count clamping. A live Copyparty/D2L test asserts the final upload/download snapshots and active file names.
+
 ## Empty Remote Folder Downloads
 
 - **An Empty Folder Still Arrives as a Folder**: Downloading a subdirectory that exists on the drive but holds no files now creates the matching `<mount>/<SUBDIR>` folder locally, empty, and says so in the console (`Remote folder has no files; created empty local folder …`). Previously the scan found nothing to copy and created nothing, so an emptied or brand-new remote folder looked like the download had never run.
