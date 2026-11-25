@@ -1,5 +1,13 @@
 # Changelog
 
+## Rust Memory-Safety Hardening
+
+- **Hostile Metadata Is Rejected, Not Trusted**: Server `getlastmodified` values are length-bounded before parsing, numeric fields are range-checked, and calendar arithmetic is checked, so an oversized or multi-byte-crafted date yields no timestamp instead of panicking. Server-advertised sizes and modification times saturate rather than overflow, so one hostile listing cannot crash listing, review, or transfer totals.
+- **Listing Cache Fails Closed**: The cache is read under a byte cap before deserialization, and an entry holding an oversized, over-deep, cross-origin, credential-bearing, or otherwise unrepresentable item is treated as a cache miss instead of a partial listing. A download whose remote modification time is out of range logs a warning and keeps the file's own timestamp.
+- **Worker Crashes Become Errors**: A panic in a progress callback or in a worker controller is reported as a failed operation; the app no longer aborts, and a partial transfer is never reported as success.
+- **Compile-Time Guards**: The WebDAV transport and listing modules forbid unsafe code, and unsafe operations inside an `unsafe fn` are denied crate-wide.
+- **Tests and CI**: Regression tests cover extreme dates, multi-byte timezone offsets, hostile sizes and timestamps, oversized and poisoned cache entries, and progress-callback panics. Rust unit tests with overflow checks now run on Linux and Windows, and the Copyparty job runs every Rust unit and integration test instead of a fixed subset.
+
 ## Review Changes
 
 - **Compare Is Now a Review View**: The old "Compare Local vs Remote" action is now "Review Changes" and opens a review instead of writing size differences to the console.
