@@ -304,18 +304,12 @@ jobs:
         if: success() && steps.diff.outputs.has_diff == 'true'
         run: node scripts/ai-code-review.mjs prepare-payload
 
-      # Two reviewers audit the same skill over the same diff, one call per
-      # model, all concurrent, both through the OpenCode Go inference gateway
-      # (the endpoint the Go model catalog advertises). The list, the
-      # endpoints, the secret each model needs, any per-model completion
-      # budget, and the reasoning level every reviewer runs at live in
-      # .github/ai-review-models.json; that level is high, the step under the
-      # endpoint's own ceiling, so a reviewer reasons harder than its default
-      # without spending its whole completion budget on the trace. A model that
-      # returns no review text abstains, so an unavailable endpoint cannot block
-      # a merge on its own. Each review is posted the moment that reviewer
-      # answers, so the one that stalls on its endpoint no longer keeps the
-      # other's review off the pull request for the rest of its timeout.
+      # Every reviewer audits the same skill over the same diff, one call per
+      # model, all concurrent, through the OpenCode Go inference gateway.
+      # The list, endpoints, secret, completion budgets, and reasoning levels
+      # live in .github/ai-review-models.json. A model that returns no review
+      # text abstains, so an unavailable endpoint cannot block a merge on its
+      # own. Each review is posted as soon as that reviewer answers.
       - name: Call AI Code Review Models
         if: success() && steps.diff.outputs.has_diff == 'true'
         env:
@@ -583,16 +577,14 @@ jobs:
         if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         run: node scripts/ai-code-review.mjs prepare-payload
 
-      # The security skill alone is 37KB, past the prompt budget a capped fleet
-      # entry accepts, so this job names the entry that can take the full skill
-      # instead of running the whole fleet.
+      # The whole fleet reviews the security skill concurrently, matching the
+      # code review job.
       - name: Call Security Review Models
         if: success() && (steps.diff.outputs.has_diff == 'true' || steps.thread.outputs.has_context == 'true')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           OCG_KEY: ${{ secrets.OCG_KEY }}
-          AI_MODEL_IDS: opencode-go-deepseek
         run: node scripts/ai-code-review.mjs call
 
       - name: Aggregate Security Review Verdict
@@ -600,7 +592,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
-          AI_MODEL_IDS: opencode-go-deepseek
         run: |
           # The call step posts one comment per model as it answers, strips bold
           # and emoji, and records each verdict. This step aggregates them and

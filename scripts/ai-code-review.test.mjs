@@ -7,8 +7,8 @@ import fs from "node:fs";
 import { isStaleCommit, parseVerdict, validateProvider } from "./ai-code-review.mjs";
 
 const fleetEntry = {
-  id: "opencode-go-deepseek",
-  model: "deepseek-v4.1-flash",
+  id: "opencode-go-hungerg",
+  model: "hungerg-free",
   endpoint: "https://opencode.ai/inference/go/openai/v1/chat/completions",
   apiKeyEnv: "OCG_KEY"
 };
@@ -22,7 +22,7 @@ test("a completion for a commit the pull request moved past is stale", () => {
 });
 
 test("accepts the fleet's own entry shape", () => {
-  assert.equal(validateProvider({ ...fleetEntry, maxTokens: 393216, maxPromptBytes: 20000, timeoutMs: 480000 }), "");
+  assert.equal(validateProvider({ ...fleetEntry, maxTokens: 65536, maxPromptBytes: 20000, timeoutMs: 480000 }), "");
 });
 
 test("the committed fleet passes validation", () => {
@@ -33,15 +33,28 @@ test("the committed fleet passes validation", () => {
   }
 });
 
-test("the committed deepseek reviewer is DeepSeek V4.1 Flash 1017 on the Go inference gateway", () => {
-  // https://opencode.ai/inference/go/v1/models: id deepseek-v4.1-flash,
-  // name "DeepSeek V4.1 Flash 1017", canonical_id deepseek/deepseek-v4.1-flash-1017,
-  // chat base_url https://opencode.ai/inference/go/openai/v1.
+test("the committed fleet runs HungerG, Hy4 Flash Free, and Iceman Contributor Free", () => {
+  // https://opencode.ai/inference/go/v1/models advertises all three on the
+  // OpenAI-compatible chat endpoint.
   const fleet = JSON.parse(fs.readFileSync(".github/ai-review-models.json", "utf8"));
-  const deepseek = fleet.find((entry) => entry.model === "deepseek-v4.1-flash");
-  assert.ok(deepseek, "the fleet has no deepseek-v4.1-flash reviewer");
-  assert.equal(fleet.filter((entry) => entry.model === "deepseek-v4.1-flash").length, 1);
-  assert.equal(deepseek.endpoint, "https://opencode.ai/inference/go/openai/v1/chat/completions");
+  assert.deepEqual(fleet.map((entry) => entry.model).sort(), [
+    "hungerg-free",
+    "hy4-flash-free",
+    "iceman-contributor-free"
+  ]);
+  for (const entry of fleet) {
+    assert.equal(entry.endpoint, "https://opencode.ai/inference/go/openai/v1/chat/completions");
+    assert.equal(entry.apiKeyEnv, "OCG_KEY");
+    assert.equal(entry.sessionHeader, true);
+  }
+  assert.equal(fleet.find((entry) => entry.model === "hungerg-free").maxTokens, 65536);
+  assert.equal(fleet.find((entry) => entry.model === "hy4-flash-free").maxTokens, 65536);
+  assert.equal(fleet.find((entry) => entry.model === "iceman-contributor-free").maxTokens, 131072);
+});
+
+test("security review runs the whole fleet instead of narrowing to one model", () => {
+  const workflow = fs.readFileSync(".github/workflows/ai-code-review.yml", "utf8");
+  assert.doesNotMatch(workflow, /AI_MODEL_IDS:/);
 });
 
 test("allows the go inference endpoint with the opencode go key", () => {

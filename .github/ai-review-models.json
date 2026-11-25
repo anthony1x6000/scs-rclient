@@ -1,23 +1,30 @@
 [
   {
-    "id": "opencode-go-beam",
-    "model": "beam-free",
+    "id": "opencode-go-hy4-flash",
+    "model": "hy4-flash-free",
     "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions",
     "apiKeyEnv": "OCG_KEY",
     "sessionHeader": true,
     "reasoningEffort": "high",
-    "maxTokens": 262144,
-    "timeoutMs": 300000,
-    "maxPromptBytes": 20000
+    "maxTokens": 65536,
+    "timeoutMs": 480000
   },
   {
-    "id": "opencode-go-deepseek",
-    "model": "deepseek-v4.1-flash",
+    "id": "opencode-go-hungerg",
+    "model": "hungerg-free",
     "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions",
     "apiKeyEnv": "OCG_KEY",
     "sessionHeader": true,
-    "reasoningEffort": "high",
-    "maxTokens": 393216,
+    "maxTokens": 65536,
+    "timeoutMs": 480000
+  },
+  {
+    "id": "opencode-go-iceman",
+    "model": "iceman-contributor-free",
+    "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions",
+    "apiKeyEnv": "OCG_KEY",
+    "sessionHeader": true,
+    "maxTokens": 131072,
     "timeoutMs": 480000
   }
 ]
