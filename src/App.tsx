@@ -9,6 +9,7 @@ import SettingsView from "./components/SettingsView";
 import { RcloneActions } from "./components/RcloneActions";
 import RcloneConsole from "./components/RcloneConsole";
 import ProgressPanel from "./components/ProgressPanel";
+import ReviewChanges from "./components/ReviewChanges";
 import { useRcloneExecution } from "./hooks/useRcloneExecution";
 import type { ProgressState } from "./progress";
 import { getBulkPresets, getTargetSubdir, setBulkPresets } from "./settings";
@@ -21,6 +22,7 @@ function App() {
   const [selectedSubdir, setSelectedSubdir] = useState<string>("");
   const [bulkTicks, setBulkTicks] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [reviewOpen, setReviewOpen] = useState<boolean>(false);
   const [logs, setLogs] = useState<string>("");
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [progress, setProgress] = useState<ProgressState | null>(null);
@@ -110,6 +112,7 @@ function App() {
             cancelCommand={cancelCommand}
             bulkFolders={bulkTicks}
             onBulkRun={handleBulkRun}
+            onReview={() => setReviewOpen(true)}
           />
         </div>
 
@@ -162,6 +165,13 @@ function App() {
           </div>
         </div>
       </div>
+      {reviewOpen && (
+        <ReviewChanges
+          subdir={selectedSubdir}
+          targetSubdir={targetSubdir}
+          onClose={() => setReviewOpen(false)}
+        />
+      )}
     </BackgroundWrapper>
   );
 }

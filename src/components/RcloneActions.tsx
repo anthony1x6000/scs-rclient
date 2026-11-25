@@ -14,6 +14,8 @@ interface RcloneActionsProps {
   bulkFolders?: string[];
   /** Fired when an action actually runs on a bulk selection (2+ folders). */
   onBulkRun?: (folders: string[]) => void;
+  /** Opens the Review Changes view (replaces the old console-only compare). */
+  onReview: () => void;
 }
 
 interface ActionDef {
@@ -26,7 +28,7 @@ const ACTIONS: ActionDef[] = [
   { id: "get", label: "Download (Remote to Local)" },
   { id: "put-dry", label: "Preview Upload (Dry Run)" },
   { id: "get-dry", label: "Preview Download (Dry Run)" },
-  { id: "check", label: "Compare Local vs Remote" },
+  { id: "check", label: "Review Changes" },
   { id: "ls", label: "List Remote" },
   { id: "get-backup-dated", label: "Backup" },
 ];
@@ -40,6 +42,7 @@ export function RcloneActions({
   cancelCommand,
   bulkFolders = [],
   onBulkRun,
+  onReview,
 }: RcloneActionsProps) {
   const [overwriteArmed, setOverwriteArmed] = useState(false);
   const uploadButtonRef = useRef<HTMLButtonElement>(null);
@@ -142,20 +145,30 @@ export function RcloneActions({
   return (
     <div className="p-2">
       <ul className="grid grid-cols-2 gap-2 list-none m-0 p-0">
-        {ACTIONS.map((action, index) => (
-          <li key={action.id} className="p-0 text-center">
-            <button
-              ref={index === 0 ? uploadButtonRef : undefined}
-              type="button"
-              disabled={isRunning}
-              onClick={() => runAction(action.id)}
-              className={ACTION_BUTTON_CLASS}
-            >
-              {action.label}
-              {bulkSuffix}
-            </button>
-          </li>
-        ))}
+        {ACTIONS.map((action, index) => {
+          const isReview = action.id === "check";
+          return (
+            <li key={action.id} className="p-0 text-center">
+              <button
+                ref={index === 0 ? uploadButtonRef : undefined}
+                type="button"
+                disabled={isRunning || (isReview && isBulk)}
+                onClick={() => (isReview ? onReview() : runAction(action.id))}
+                title={
+                  isReview && isBulk
+                    ? "Review one folder at a time"
+                    : isReview
+                      ? "Review local vs remote changes"
+                      : undefined
+                }
+                className={ACTION_BUTTON_CLASS}
+              >
+                {action.label}
+                {!isReview && bulkSuffix}
+              </button>
+            </li>
+          );
+        })}
         <li className="p-0 text-center">
           <button
             type="button"
