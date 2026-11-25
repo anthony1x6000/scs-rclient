@@ -868,6 +868,8 @@ fn write_cache_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+const MAX_CACHE_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Helper to safely read and deserialize the cache map from disk.
 fn read_cache_map(path: &Path) -> HashMap<String, CachedRemoteListing> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
@@ -875,15 +877,27 @@ fn read_cache_map(path: &Path) -> HashMap<String, CachedRemoteListing> {
             let _ = std::fs::remove_file(path);
             return HashMap::new();
         }
-    }
-    if let Ok(content) = std::fs::read_to_string(path) {
-        if content.len() <= 50 * 1024 * 1024 {
-            if let Ok(map) = serde_json::from_str(&content) {
-                return map;
-            }
+        if meta.len() > MAX_CACHE_BYTES {
+            return HashMap::new();
         }
     }
-    HashMap::new()
+    let Ok(file) = std::fs::File::open(path) else {
+        return HashMap::new();
+    };
+    parse_cache_reader(file)
+}
+
+fn parse_cache_reader(mut reader: impl Read) -> HashMap<String, CachedRemoteListing> {
+    let mut content = String::new();
+    if reader
+        .take(MAX_CACHE_BYTES + 1)
+        .read_to_string(&mut content)
+        .is_err()
+        || content.len() as u64 > MAX_CACHE_BYTES
+    {
+        return HashMap::new();
+    }
+    serde_json::from_str(&content).unwrap_or_default()
 }
 
 /// Helper to safely serialize and atomically write the cache map to disk.
@@ -6595,6 +6609,7 @@ mod tests {
         let client = Client::init_internal("u", "p", "http://127.0.0.1:9/dav/", true)
             .expect("loopback client must initialize in insecure test mode");
         let cancel = AtomicBool::new(false);
+        let panic_once = AtomicBool::new(true);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             upload_files_concurrently(
                 &client,
@@ -6607,7 +6622,11 @@ mod tests {
                 false,
                 "Copied",
                 "put",
-                &|_| panic!("progress callback panic"),
+                &|_| {
+                    if std::thread::panicking() || panic_once.swap(false, Ordering::SeqCst) {
+                        panic!("progress callback panic");
+                    }
+                },
                 &mut |_| {},
             )
         }));
@@ -6777,12 +6796,12 @@ mod tests {
             }
         }
 
-        let limit = 50 * 1024 * 1024;
-        let reader = CountingReader {
+        let limit: usize = 50 * 1024 * 1024;
+        let mut reader = CountingReader {
             inner: std::io::repeat(0).take(limit as u64 + 1),
             bytes_read: 0,
         };
-        assert!(parse_cache_reader(reader).is_empty());
+        assert!(parse_cache_reader(&mut reader).is_empty());
         assert!(reader.bytes_read <= limit + 1, "cache read exceeded its cap");
     }
 
