@@ -342,6 +342,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_extreme_and_multibyte_dates_without_panicking() {
+        for date in [
+            "Mon, 28 Sep 9223372036854775807 13:45:09 GMT",
+            "Mon, 28 Sep -9223372036854775808 13:45:09 GMT",
+            "Sunday, 28-Sep-9223372036854775807 13:45:09 GMT",
+            "Mon, 28 Sep 2026 -9223372036854775808:00:00 GMT",
+            "Mon, 28 Sep 2026 13:45:09 +-9223372036854775808:00",
+            "Mon, 28 Sep 2026 13:45:09 +00:-1",
+            "2026-09-28T13:45:09+éé",
+            "10000-01-01T00:00:00Z",
+        ] {
+            assert_eq!(parse_webdav_date(date), None, "date {date:?} must be rejected");
+        }
+        assert_eq!(
+            parse_webdav_date("9999-12-31T23:59:59Z"),
+            Some(253_402_300_799)
+        );
+    }
+
+    #[test]
     fn clamps_pre_epoch_dates() {
         assert_eq!(parse_webdav_date("1969-12-31T23:59:59Z"), Some(0));
     }

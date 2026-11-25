@@ -5693,6 +5693,12 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamp_comparisons_saturate_at_u64_max() {
+        assert!(!should_upload_file(100, Some(0), 100, Some(u64::MAX)));
+        assert!(!should_download_file(100, Some(0), 100, Some(u64::MAX)));
+    }
+
+    #[test]
     fn test_relative_path_traversal_guards() {
         assert!(is_safe_relative_path("file.txt"));
         assert!(is_safe_relative_path("sub/file.txt"));
@@ -7111,6 +7117,25 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregate_remote_folders_saturates_hostile_sizes() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let items = vec![
+            WebdavItem::new("/docs/a/one.bin", false, u64::MAX),
+            WebdavItem::new("/docs/a/two.bin", false, u64::MAX),
+        ];
+
+        let folders = aggregate_remote_folders(base, &items, &AtomicBool::new(false))
+            .expect("aggregation should bound hostile advertised sizes");
+        assert_eq!(
+            folders,
+            vec![
+                RemoteFolder { path: String::new(), size: u64::MAX },
+                RemoteFolder { path: "a".to_string(), size: u64::MAX },
+            ]
+        );
+    }
+
+    #[test]
     fn test_has_traversal_segments_rejects_literal_and_encoded_escapes() {
         for subdir in [
             "..",
@@ -7174,6 +7199,15 @@ mod tests {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(configured.max(1));
         assert!(deadline > std::time::Instant::now());
+    }
+
+    #[test]
+    fn test_max_file_size_leaves_room_for_overlimit_probe() {
+        std::env::set_var("MAX_WEBDAV_FILE_SIZE_BYTES", u64::MAX.to_string());
+        let configured = get_max_file_size();
+        std::env::remove_var("MAX_WEBDAV_FILE_SIZE_BYTES");
+        assert_eq!(configured, u64::MAX - 1);
+        assert_eq!(configured + 1, u64::MAX);
     }
 
     struct CancelingReader<'a> {
