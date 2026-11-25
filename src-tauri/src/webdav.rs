@@ -82,6 +82,33 @@ const _: fn() = || {
     assert_send_sync::<Client>();
 };
 
+/// Snapshot of an in-flight WebDAV action, streamed to the UI so a long
+/// transfer shows file/byte progress instead of a silent console.
+#[derive(Clone, Debug)]
+pub struct ActionProgress {
+    pub action: String,
+    pub phase: &'static str,
+    pub completed: usize,
+    pub total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub file: Option<String>,
+}
+
+impl ActionProgress {
+    fn new(action: &str, phase: &'static str) -> Self {
+        Self {
+            action: action.to_string(),
+            phase,
+            completed: 0,
+            total: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+            file: None,
+        }
+    }
+}
+
 /// Classification of a single WebDAV request attempt, used to decide whether a retry is worth it.
 enum AttemptError {
     /// Transport-level failure (timeout, connection reset, truncated body) that is safe to retry.
@@ -3574,7 +3601,7 @@ impl Drop for WorkerSlot<'_> {
 /// Error semantics match the former sequential loop: per-file failures (oversize,
 /// MKCOL, open, non-2xx status, and transport failures that survive every retry)
 /// are logged and skipped, while a worker panic still aborts the batch with `Err`.
-fn upload_files_concurrently<F>(
+fn upload_files_concurrently<F, P>(
     client: &Client,
     remote_url: &str,
     files: Vec<(PathBuf, String, u64)>,
@@ -3584,10 +3611,13 @@ fn upload_files_concurrently<F>(
     max_size: u64,
     with_checksum: bool,
     done_label: &str,
+    action: &str,
+    progress: &P,
     log: &mut F,
 ) -> Result<UploadOutcome, String>
 where
     F: FnMut(&str),
+    P: Fn(ActionProgress) + Sync,
 {
     let total = files.len();
     if total == 0 {
@@ -3602,6 +3632,11 @@ where
 
     let next_idx = AtomicUsize::new(0);
     let copied = AtomicUsize::new(0);
+    // Files whose upload attempt finished (success or failure), plus the bytes
+    // of the successful ones: the UI bar advances even when one file fails.
+    let processed = AtomicUsize::new(0);
+    let bytes_done = std::sync::atomic::AtomicU64::new(0);
+    let bytes_total: u64 = files.iter().map(|(_, _, size)| *size).sum();
     let stop = AtomicBool::new(false);
     let error: Mutex<Option<String>> = Mutex::new(None);
     let cache_write_lock = Mutex::new(());
@@ -3657,6 +3692,11 @@ where
         max_size: u64,
         with_checksum: bool,
         done_label: &'a str,
+        action: &'a str,
+        progress: &'a (dyn Fn(ActionProgress) + Sync),
+        processed: &'a AtomicUsize,
+        bytes_done: &'a std::sync::atomic::AtomicU64,
+        bytes_total: u64,
     }
 
     let ctx = UploadCtx {
@@ -3675,9 +3715,47 @@ where
         max_size,
         with_checksum,
         done_label,
+        action,
+        progress: progress as &(dyn Fn(ActionProgress) + Sync),
+        processed: &processed,
+        bytes_done: &bytes_done,
+        bytes_total,
     };
     let ctx_ref = &ctx;
     let control_arc = Arc::clone(&control);
+
+    /// Advances the processed counter (and successful bytes) when one file's
+    /// attempt ends, wherever it exits: success, size skip, MKCOL failure,
+    /// transport error, or cancellation. A guard keeps every `continue` path
+    /// from having to remember to report progress.
+    struct UploadProgressGuard<'a> {
+        processed: &'a AtomicUsize,
+        bytes_done: &'a std::sync::atomic::AtomicU64,
+        progress: &'a (dyn Fn(ActionProgress) + Sync),
+        action: &'a str,
+        total: usize,
+        bytes_total: u64,
+        size: u64,
+        uploaded: bool,
+    }
+
+    impl Drop for UploadProgressGuard<'_> {
+        fn drop(&mut self) {
+            if self.uploaded {
+                self.bytes_done.fetch_add(self.size, Ordering::SeqCst);
+            }
+            let completed = self.processed.fetch_add(1, Ordering::SeqCst) + 1;
+            (self.progress)(ActionProgress {
+                action: self.action.to_string(),
+                phase: "upload",
+                completed,
+                total: self.total,
+                bytes_done: self.bytes_done.load(Ordering::SeqCst),
+                bytes_total: self.bytes_total,
+                file: None,
+            });
+        }
+    }
 
     fn spawn_upload_worker<'scope, 'env: 'scope>(
         scope: &'scope std::thread::Scope<'scope, 'env>,
@@ -3704,6 +3782,11 @@ where
             max_size,
             with_checksum,
             done_label,
+            action,
+            progress,
+            processed,
+            bytes_done,
+            bytes_total,
         } = *ctx;
             let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 loop {
@@ -3721,6 +3804,25 @@ where
                     }
                     let (path, rel_str, size) = &files_ref[idx];
                     let current_num = idx + 1;
+                    let mut progress_guard = UploadProgressGuard {
+                        processed,
+                        bytes_done,
+                        progress,
+                        action,
+                        total,
+                        bytes_total,
+                        size: *size,
+                        uploaded: false,
+                    };
+                    (progress)(ActionProgress {
+                        action: action.to_string(),
+                        phase: "upload",
+                        completed: processed.load(Ordering::SeqCst),
+                        total,
+                        bytes_done: bytes_done.load(Ordering::SeqCst),
+                        bytes_total,
+                        file: Some(rel_str.clone()),
+                    });
                     if *size > max_size {
                         let _ = worker_log_tx.send(format!(
                             "[{}/{}] ERROR: File {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
@@ -3794,6 +3896,7 @@ where
                         }
                     };
                     if res.status().is_success() {
+                        progress_guard.uploaded = true;
                         copied_ref.fetch_add(1, Ordering::SeqCst);
                         if is_cache_enabled() {
                             let mtime = std::fs::metadata(path)
@@ -3867,6 +3970,19 @@ where
             log(&msg);
         }
         let _ = controller.join();
+    });
+
+    // Worker events can arrive out of completion order (the counter bump and
+    // the emit are not one atomic step), so publish the authoritative final
+    // snapshot here after every worker has stopped.
+    progress(ActionProgress {
+        action: action.to_string(),
+        phase: "upload",
+        completed: processed.load(Ordering::SeqCst),
+        total,
+        bytes_done: bytes_done.load(Ordering::SeqCst),
+        bytes_total,
+        file: None,
     });
 
     let copied = copied.load(Ordering::SeqCst);
@@ -3945,12 +4061,51 @@ pub fn execute_webdav_action_with_exclusions<F>(
     auth_user: Option<&str>,
     exclude_folders: &[String],
     extension_filter: Option<&ExtensionFilter>,
-    mut log: F,
+    log: F,
 ) -> Result<(), String>
 where
     F: FnMut(&str),
 {
+    execute_webdav_action_with_progress(
+        client,
+        action,
+        remote_url,
+        local_dir,
+        cancel_flag,
+        concurrency,
+        auth_user,
+        exclude_folders,
+        extension_filter,
+        |_| {},
+        log,
+    )
+}
+
+/// Same as [`execute_webdav_action_with_exclusions`], but streams coarse
+/// file/byte progress through `progress` in addition to the log lines. The
+/// callback is invoked from the download loop and from every upload worker,
+/// so it must be safe to call concurrently; callers that only log pass
+/// `|_| {}` through the wrapper above.
+pub fn execute_webdav_action_with_progress<F, P>(
+    client: &Client,
+    action: &str,
+    remote_url: &str,
+    local_dir: &Path,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
+    auth_user: Option<&str>,
+    exclude_folders: &[String],
+    extension_filter: Option<&ExtensionFilter>,
+    progress: P,
+    mut log: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str),
+    P: Fn(ActionProgress) + Sync,
+{
+    let progress = &progress;
     validate_webdav_url(remote_url)?;
+    progress(ActionProgress::new(action, "scan"));
     // Seed the live limit once per action. Passing `None` to the phase helpers
     // below keeps a Settings change made mid-action from being overwritten.
     if let Some(requested) = concurrency {
@@ -4150,13 +4305,41 @@ where
                         "[{}/{}] NOTICE: {}: Would copy (new or modified, {} bytes)\n",
                         current_num, total_to_upload, rel_str, size
                     ));
+                    progress(ActionProgress {
+                        action: action.to_string(),
+                        phase: "preview",
+                        completed: current_num,
+                        total: total_to_upload,
+                        bytes_done: 0,
+                        bytes_total: 0,
+                        file: Some(rel_str.clone()),
+                    });
                 }
+                progress(ActionProgress {
+                    action: action.to_string(),
+                    phase: "preview",
+                    completed: total_to_upload,
+                    total: total_to_upload,
+                    bytes_done: 0,
+                    bytes_total: 0,
+                    file: None,
+                });
                 log(&format!(
                     "\nPut operation finished: {} file(s) copied, {} file(s) skipped (already up to date).\n",
                     0, skipped_count
                 ));
                 return Ok(());
             }
+            let bytes_total: u64 = files_to_upload.iter().map(|(_, _, size)| *size).sum();
+            progress(ActionProgress {
+                action: action.to_string(),
+                phase: "upload",
+                completed: 0,
+                total: total_to_upload,
+                bytes_done: 0,
+                bytes_total,
+                file: None,
+            });
             let copied_count = match upload_files_concurrently(
                 client,
                 remote_url,
@@ -4167,6 +4350,8 @@ where
                 max_size,
                 with_checksum,
                 "Copied",
+                action,
+                progress,
                 &mut log,
             )? {
                 UploadOutcome::Completed(n) => n,
@@ -4270,10 +4455,33 @@ where
             }
 
             let max_size = get_max_file_size();
+            let bytes_total: u64 = files_to_download
+                .iter()
+                .map(|(item, _)| item.size as u64)
+                .sum();
+            let mut bytes_finished: u64 = 0;
+            progress(ActionProgress {
+                action: action.to_string(),
+                phase: if is_dry { "preview" } else { "download" },
+                completed: 0,
+                total: total_files,
+                bytes_done: 0,
+                bytes_total,
+                file: None,
+            });
             let mut count = 0;
             let mut total_bytes = 0;
             for (idx, (item, rel)) in files_to_download.iter().enumerate() {
                 let current_num = idx + 1;
+                progress(ActionProgress {
+                    action: action.to_string(),
+                    phase: if is_dry { "preview" } else { "download" },
+                    completed: idx,
+                    total: total_files,
+                    bytes_done: bytes_finished,
+                    bytes_total,
+                    file: Some(rel.clone()),
+                });
                 if cancel_flag.load(Ordering::SeqCst) {
                     log("Operation canceled by user.\n");
                     return Ok(());
@@ -4290,6 +4498,15 @@ where
                         "[{}/{}] NOTICE: {}: Would download (new or modified, {} bytes)\n",
                         current_num, total_files, rel, item.size
                     ));
+                    progress(ActionProgress {
+                        action: action.to_string(),
+                        phase: "preview",
+                        completed: current_num,
+                        total: total_files,
+                        bytes_done: 0,
+                        bytes_total,
+                        file: Some(rel.clone()),
+                    });
                     continue;
                 }
                 log(&format!(
@@ -4325,6 +4542,7 @@ where
                         continue;
                     }
                 };
+                let mut last_reported_mib = 0u64;
                 let download_result = retry_webdav_operation(
                     &format!("GET {download_url}"),
                     cancel_flag,
@@ -4429,6 +4647,18 @@ where
                                         ));
                                     }
                                     written += n as u64;
+                                    if written / (1024 * 1024) > last_reported_mib {
+                                        last_reported_mib = written / (1024 * 1024);
+                                        progress(ActionProgress {
+                                            action: action.to_string(),
+                                            phase: "download",
+                                            completed: idx,
+                                            total: total_files,
+                                            bytes_done: bytes_finished + written,
+                                            bytes_total,
+                                            file: Some(rel.clone()),
+                                        });
+                                    }
                                     if written > max_size {
                                         break;
                                     }
@@ -4550,6 +4780,17 @@ where
                     }
                 };
 
+                bytes_finished += downloaded_len as u64;
+                progress(ActionProgress {
+                    action: action.to_string(),
+                    phase: "download",
+                    completed: current_num,
+                    total: total_files,
+                    bytes_done: bytes_finished,
+                    bytes_total,
+                    file: Some(rel.clone()),
+                });
+
                 if let Some(mtime_sec) = item.mtime {
                     match std::fs::File::options().write(true).open(&target_file) {
                         Ok(file) => {
@@ -4590,6 +4831,15 @@ where
                     checksum_str
                 ));
             }
+            progress(ActionProgress {
+                action: action.to_string(),
+                phase: "download",
+                completed: total_files,
+                total: total_files,
+                bytes_done: bytes_finished,
+                bytes_total,
+                file: None,
+            });
             log(&format!(
                 "\nGet operation finished: {} file(s) downloaded ({} bytes), {} file(s) skipped (already up to date).\n",
                 count, total_bytes, skipped_count
@@ -4701,6 +4951,16 @@ where
             }
 
             let max_size = get_max_file_size();
+            let bytes_total: u64 = files_to_upload.iter().map(|(_, _, size)| *size).sum();
+            progress(ActionProgress {
+                action: action.to_string(),
+                phase: "upload",
+                completed: 0,
+                total: files_to_upload.len(),
+                bytes_done: 0,
+                bytes_total,
+                file: None,
+            });
             let uploaded = match upload_files_concurrently(
                 client,
                 remote_url,
@@ -4711,6 +4971,8 @@ where
                 max_size,
                 false,
                 "Synced",
+                action,
+                progress,
                 &mut log,
             )? {
                 UploadOutcome::Completed(n) => n,

@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useRcloneExecution, type RcloneActionType } from "../hooks/useRcloneExecution";
+import type { RcloneActionType } from "../hooks/useRcloneExecution";
 import { BULK_MIN_FOLDERS } from "../bulk";
 
 interface RcloneActionsProps {
-  onLog: (text: string | ((prev: string) => string)) => void;
   isRunning: boolean;
-  setIsRunning: (running: boolean) => void;
+  runRclone: (
+    action: RcloneActionType,
+    opts?: { folders?: string[]; onDone?: (code: number | null) => void }
+  ) => Promise<void>;
+  cancelCommand: () => void;
   /** Ticked subfolders; 2+ turns every action into a sequential bulk run. */
   bulkFolders?: string[];
   /** Fired when an action actually runs on a bulk selection (2+ folders). */
@@ -32,13 +35,12 @@ const ACTION_BUTTON_CLASS =
   "w-full bg-gray-800/25 border border-white/30 hover:border-white/70 text-white p-3 cursor-pointer transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-white";
 
 export function RcloneActions({
-  onLog,
   isRunning,
-  setIsRunning,
+  runRclone,
+  cancelCommand,
   bulkFolders = [],
   onBulkRun,
 }: RcloneActionsProps) {
-  const { runRclone, cancelCommand } = useRcloneExecution(onLog, isRunning, setIsRunning);
   const [overwriteArmed, setOverwriteArmed] = useState(false);
   const uploadButtonRef = useRef<HTMLButtonElement>(null);
   const isBulk = bulkFolders.length >= BULK_MIN_FOLDERS;
