@@ -10,11 +10,11 @@ name: Dependabot Upkeep
 #   3. Checks superseded by a rebase come back cancelled, which looks failed.
 #
 # The run below refreshes stale branches, re-runs the failed attempt of each
-# workflow once, and merges anything already green. Refresh requests go
-# through Dependabot so the refresh commit keeps its authorship: a commit
-# pushed with the workflow token strands its own checks in action_required. It never closes a PR: a blocked
-# security update must stay visible until a compatible version ships, and
-# Dependabot will propose that version on its own schedule.
+# workflow once, and merges anything already green. A refresh commit pushed
+# with the workflow token can park its checks in action_required; the next
+# sweep re-runs those workflows without waiting for a human. It never closes a
+# PR: a blocked security update must stay visible until a compatible version
+# ships, and Dependabot will propose that version on its own schedule.
 #
 # It runs daily because refreshing a stale branch and arming auto-merge are
 # cheap and are what unblock a PR today; re-running a failed workflow costs a
@@ -67,8 +67,9 @@ jobs:
             >/dev/null 2>&1 || true
 
           prs=$(gh pr list --repo "$REPO" --state open --limit 100 \
-            --json number,headRefName,isDraft,mergeStateStatus,labels \
+            --json number,headRefName,author,isDraft,mergeStateStatus,labels \
             --jq '.[]
+                  | select(.author.login == "dependabot[bot]")
                   | select(.headRefName | startswith("dependabot/"))
                   | select(.isDraft | not)
                   | select([.labels[].name] | index("dependabot-hold") | not)
@@ -83,6 +84,15 @@ jobs:
             [ -n "$pr" ] || continue
             echo "::group::pr #$pr ($merge_state)"
             sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid)
+
+            # One latest run per workflow: push and pull-request runs report the
+            # same check names, and a superseded attempt shares the head SHA.
+            # Re-running both would pay for the same matrix twice.
+            runs=$(gh api --paginate "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
+              --jq '.workflow_runs[]
+                     | {w: .workflow_id, e: .event, i: .id, c: (.conclusion // "")}' \
+              | jq -s '[group_by(.w)[] | max_by(.i)]')
+            waiting=$(jq '[.[] | select(.c == "action_required")] | length' <<<"$runs")
 
             # Latest run per check name: a rebase supersedes earlier runs, and
             # their cancelled copies share the same names as the fresh ones.
@@ -109,13 +119,20 @@ jobs:
               gh pr comment "$pr" --repo "$REPO" --body "@dependabot rebase" >/dev/null \
                 || echo "  could not comment on the PR."
             elif [ "$relation" != "ahead" ] && [ "$relation" != "identical" ]; then
-              # Dependabot has to make the refresh commit. A merge commit pushed
-              # with this workflow's token is authored by github-actions[bot],
-              # and GitHub parks the workflow runs for that commit in
-              # action_required, waiting for a human who is not there.
-              echo "branch is $relation against $base; asking Dependabot to rebase."
-              gh pr comment "$pr" --repo "$REPO" --body "@dependabot rebase" >/dev/null \
-                || echo "  could not comment on the PR."
+              echo "branch is $relation against $base; updating it to re-run the checks."
+              gh api -X PUT "repos/$REPO/pulls/$pr/update-branch" >/dev/null 2>&1 \
+                || gh pr comment "$pr" --repo "$REPO" --body "@dependabot rebase" >/dev/null 2>&1 \
+                || echo "  branch update and rebase request both refused."
+            elif [ "$waiting" -gt 0 ]; then
+              echo "$waiting workflow run(s) await approval; re-running them."
+              jq -r '.[] | select(.c == "action_required") | .i' <<<"$runs" |
+              while read -r run; do
+                [ -n "$run" ] || continue
+                gh api -X POST "repos/$REPO/actions/runs/$run/rerun" >/dev/null 2>&1 \
+                  || echo "  run $run could not be re-run (already queued or past the re-run limit)."
+              done
+              gh pr merge "$pr" --repo "$REPO" --auto --squash >/dev/null 2>&1 \
+                || echo "  auto-merge could not be armed yet."
             elif [ "$pending" -gt 0 ]; then
               echo "$pending check(s) still running; leaving it alone."
             elif [ "$failed" -gt 0 ]; then
@@ -129,19 +146,11 @@ jobs:
                 echo "::endgroup::"
                 continue
               fi
-              echo "  re-running the failed pull-request workflows."
-              # Pull-request runs only: the push twin reports the same check
-              # names, so re-running both would double the CI cost for one PR.
-              # One re-run per workflow and event: a superseded attempt shares
-              # the head SHA, so re-running it would pay for the same matrix
-              # twice for nothing.
-              gh api --paginate "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
-                --jq '.workflow_runs[]
-                       | {w: .workflow_id, e: .event, i: .id, c: (.conclusion // "")}' \
-                | jq -s '[group_by([.w, .e])[] | max_by(.i)]
-                         | .[] | select(.e == "pull_request")
-                         | select(.c == "failure" or .c == "cancelled" or .c == "timed_out")
-                         | .i' |
+              echo "  re-running the failed workflows."
+              # The latest run per workflow is enough: the push twin reports the
+              # same check names, so re-running both would double the CI cost.
+              jq -r '.[] | select(.c == "failure" or .c == "cancelled" or .c == "timed_out"
+                                     or .c == "startup_failure" or .c == "action_required") | .i' <<<"$runs" |
               while read -r run; do
                 [ -n "$run" ] || continue
                 gh api -X POST "repos/$REPO/actions/runs/$run/rerun" >/dev/null 2>&1 \
@@ -153,10 +162,10 @@ jobs:
               echo "checks are green; merging."
               if gh pr merge "$pr" --repo "$REPO" --squash >/dev/null 2>&1; then
                 gh pr edit "$pr" --repo "$REPO" --remove-label dependabot-retry >/dev/null 2>&1 || true
-              elif ! gh pr comment "$pr" --repo "$REPO" --body "@dependabot rebase" >/dev/null 2>&1; then
-                echo "  merge refused and the rebase request failed; the next run retries."
+              elif gh api -X PUT "repos/$REPO/pulls/$pr/update-branch" >/dev/null 2>&1; then
+                echo "  merge refused; refreshed the branch so the checks re-run."
               else
-                echo "  merge refused; asked Dependabot to rebase so the checks re-run."
+                echo "  merge refused and the branch could not be updated; the next run retries."
               fi
             else
               echo "no checks reported yet; leaving it alone."
