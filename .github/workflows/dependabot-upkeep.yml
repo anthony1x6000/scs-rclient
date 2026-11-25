@@ -93,12 +93,20 @@ jobs:
                                        or .c == "startup_failure" or .c == "action_required")] | length' <<<"$rollup")
             total=$(jq 'length' <<<"$rollup")
 
+            # Staleness comes from the compare API, not mergeStateStatus:
+            # GitHub reports UNKNOWN while it recomputes mergeability, and a
+            # dependabot branch with its own commit reads as "diverged", never
+            # "behind". Both spellings mean the same thing here: this branch is
+            # missing commits from main, so protection refuses to merge it.
+            base=$(gh pr view "$pr" --repo "$REPO" --json baseRefName --jq .baseRefName)
+            relation=$(gh api "repos/$REPO/compare/$base...$sha" --jq .status 2>/dev/null || echo unknown)
+
             if [ "$merge_state" = "DIRTY" ]; then
               echo "conflicts with main; asking Dependabot to rebase."
               gh pr comment "$pr" --repo "$REPO" --body "@dependabot rebase" >/dev/null \
                 || echo "  could not comment on the PR."
-            elif [ "$merge_state" = "BEHIND" ]; then
-              echo "branch is behind main; updating it to re-run the checks."
+            elif [ "$relation" != "ahead" ] && [ "$relation" != "identical" ]; then
+              echo "branch is $relation against $base; updating it to re-run the checks."
               gh api -X PUT "repos/$REPO/pulls/$pr/update-branch" >/dev/null 2>&1 \
                 || gh pr comment "$pr" --repo "$REPO" --body "@dependabot rebase" >/dev/null 2>&1 \
                 || echo "  branch update and rebase request both refused."
@@ -134,8 +142,10 @@ jobs:
               echo "checks are green; merging."
               if gh pr merge "$pr" --repo "$REPO" --squash >/dev/null 2>&1; then
                 gh pr edit "$pr" --repo "$REPO" --remove-label dependabot-retry >/dev/null 2>&1 || true
+              elif ! gh api -X PUT "repos/$REPO/pulls/$pr/update-branch" >/dev/null 2>&1; then
+                echo "  merge refused and the branch could not be updated; the next run retries."
               else
-                echo "  merge refused (branch may have moved); the next run retries."
+                echo "  merge refused; refreshed the branch so the checks re-run."
               fi
             else
               echo "no checks reported yet; leaving it alone."
