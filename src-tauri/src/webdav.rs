@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use crate::dav_client::{self, Client};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
@@ -535,6 +537,8 @@ pub fn get_max_file_size() -> u64 {
     std::env::var("MAX_WEBDAV_FILE_SIZE_BYTES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
+        // Leave one byte for the download reader's over-limit probe.
+        .map(|v| v.min(u64::MAX - 1))
         .unwrap_or(DEFAULT_MAX_FILE_SIZE)
 }
 
@@ -887,7 +891,7 @@ fn read_cache_map(path: &Path) -> HashMap<String, CachedRemoteListing> {
     parse_cache_reader(file)
 }
 
-fn parse_cache_reader(mut reader: impl Read) -> HashMap<String, CachedRemoteListing> {
+fn parse_cache_reader(reader: impl Read) -> HashMap<String, CachedRemoteListing> {
     let mut content = String::new();
     if reader
         .take(MAX_CACHE_BYTES + 1)
@@ -3120,6 +3124,8 @@ where
     std::thread::scope(|s| {
         // One controller thread owns spawning, so the pool starts at the current
         // limit and grows as Settings raises it instead of pre-allocating 64 threads.
+        let controller_log_tx = log_tx.clone();
+        drop(log_tx);
         let controller = s.spawn(move || {
             let mut spawned = 0usize;
             loop {
@@ -3140,7 +3146,7 @@ where
                         cvar_ref,
                         exclude_folders,
                         extension_filter,
-                        log_tx.clone(),
+                        controller_log_tx.clone(),
                     );
                     continue;
                 }
@@ -3151,7 +3157,15 @@ where
         while let Ok(msg) = log_rx.recv() {
             log(&msg);
         }
-        let _ = controller.join();
+        if controller.join().is_err() {
+            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+            if state.error.is_none() {
+                state.error = Some(
+                    "WebDAV scan controller thread panicked unexpectedly.".to_string(),
+                );
+            }
+            state.stopped = true;
+        }
     });
 
     let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
@@ -3469,14 +3483,16 @@ fn aggregate_remote_folders_with_budget(
             }
         } else {
             // Credit the root and every ancestor folder; never the file itself.
-            *charge_remote_folder(&mut sizes, &mut retained, budget, "")? += item.size;
+            let total = charge_remote_folder(&mut sizes, &mut retained, budget, "")?;
+            *total = total.saturating_add(item.size);
             let mut acc = String::new();
             for segment in &segments[..segments.len() - 1] {
                 if !acc.is_empty() {
                     acc.push('/');
                 }
                 acc.push_str(segment);
-                *charge_remote_folder(&mut sizes, &mut retained, budget, &acc)? += item.size;
+                let total = charge_remote_folder(&mut sizes, &mut retained, budget, &acc)?;
+                *total = total.saturating_add(item.size);
             }
         }
     }
@@ -3637,7 +3653,7 @@ pub fn should_upload_file(
         (Some(l_time), Some(r_time)) => {
             // Local file is considered newer if its mtime is strictly greater than
             // remote mtime + 1s (to avoid false positives due to HTTP-date 1-second rounding).
-            l_time > r_time + 1
+            l_time > r_time.saturating_add(1)
         }
         // If timestamps are not both available, but sizes match, consider it up-to-date
         _ => false,
@@ -3668,7 +3684,7 @@ pub fn should_download_file(
         (Some(r_time), Some(l_time)) => {
             // Remote file is considered newer if its mtime is strictly greater than
             // local mtime + 1s (to avoid false positives due to HTTP-date 1-second rounding or clock skew).
-            r_time > l_time + 1
+            r_time > l_time.saturating_add(1)
         }
         // If timestamps are not both available, but sizes match, consider it up-to-date
         _ => false,
@@ -3843,7 +3859,10 @@ where
     // of the successful ones: the UI bar advances even when one file fails.
     let processed = AtomicUsize::new(0);
     let bytes_done = std::sync::atomic::AtomicU64::new(0);
-    let bytes_total: u64 = files.iter().map(|(_, _, size)| *size).sum();
+    let bytes_total: u64 = files
+        .iter()
+        .map(|(_, _, size)| *size)
+        .fold(0, u64::saturating_add);
     let stop = AtomicBool::new(false);
     let error: Mutex<Option<String>> = Mutex::new(None);
     let cache_write_lock = Mutex::new(());
@@ -3949,9 +3968,16 @@ where
     impl Drop for UploadProgressGuard<'_> {
         fn drop(&mut self) {
             if self.uploaded {
-                self.bytes_done.fetch_add(self.size, Ordering::SeqCst);
+                let _ = self.bytes_done.try_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |done| Some(done.saturating_add(self.size)),
+                );
             }
             let completed = self.processed.fetch_add(1, Ordering::SeqCst) + 1;
+            if std::thread::panicking() {
+                return;
+            }
             (self.progress)(ActionProgress {
                 action: self.action.to_string(),
                 phase: "upload",
@@ -4152,6 +4178,8 @@ where
         let stop_ref = &stop;
         let cancel_ref = cancel_flag;
         let next_ref = &next_idx;
+        let controller_log_tx = log_tx.clone();
+        drop(log_tx);
         let controller = s.spawn(move || {
             let mut control = control_arc.0.lock().unwrap_or_else(|p| p.into_inner());
             loop {
@@ -4162,7 +4190,12 @@ where
                 if control.live_workers < target && next_ref.load(Ordering::SeqCst) < total {
                     control.live_workers += 1;
                     drop(control);
-                    spawn_upload_worker(s, ctx_ref, Arc::clone(&control_arc), log_tx.clone());
+                    spawn_upload_worker(
+                        s,
+                        ctx_ref,
+                        Arc::clone(&control_arc),
+                        controller_log_tx.clone(),
+                    );
                     control = control_arc.0.lock().unwrap_or_else(|p| p.into_inner());
                     continue;
                 }
@@ -4176,7 +4209,16 @@ where
         while let Ok(msg) = log_rx.recv() {
             log(&msg);
         }
-        let _ = controller.join();
+        if controller.join().is_err() {
+            let mut err_slot = error.lock().unwrap_or_else(|p| p.into_inner());
+            if err_slot.is_none() {
+                *err_slot = Some(
+                    "WebDAV upload controller thread panicked unexpectedly.".to_string(),
+                );
+            }
+            stop.store(true, Ordering::SeqCst);
+            gate.wake();
+        }
     });
 
     // Worker events can arrive out of completion order (the counter bump and
@@ -4356,7 +4398,7 @@ where
             )?;
             let mut file_count = 0;
             let mut dir_count = 0;
-            let mut total_size = 0;
+            let mut total_size = 0u64;
             for item in &items {
                 let rel = relative_item_path(remote_url, &item.href);
                 if rel.is_empty() {
@@ -4368,7 +4410,7 @@ where
                 } else {
                     log(&format!("{:>9} {}\n", item.size, rel));
                     file_count += 1;
-                    total_size += item.size;
+                    total_size = total_size.saturating_add(item.size);
                 }
             }
             log(&format!(
@@ -4537,7 +4579,10 @@ where
                 ));
                 return Ok(());
             }
-            let bytes_total: u64 = files_to_upload.iter().map(|(_, _, size)| *size).sum();
+            let bytes_total: u64 = files_to_upload
+                .iter()
+                .map(|(_, _, size)| *size)
+                .fold(0, u64::saturating_add);
             progress(ActionProgress {
                 action: action.to_string(),
                 phase: "upload",
@@ -4664,8 +4709,8 @@ where
             let max_size = get_max_file_size();
             let bytes_total: u64 = files_to_download
                 .iter()
-                .map(|(item, _)| item.size as u64)
-                .sum();
+                .map(|(item, _)| item.size)
+                .fold(0, u64::saturating_add);
             let mut bytes_finished: u64 = 0;
             progress(ActionProgress {
                 action: action.to_string(),
@@ -4677,7 +4722,7 @@ where
                 file: None,
             });
             let mut count = 0;
-            let mut total_bytes = 0;
+            let mut total_bytes = 0u64;
             for (idx, (item, rel)) in files_to_download.iter().enumerate() {
                 let current_num = idx + 1;
                 progress(ActionProgress {
@@ -4808,7 +4853,8 @@ where
                                     e
                                 ))
                             })?;
-                        let mut limited_reader = std::io::Read::take(get_res, max_size + 1);
+                        let mut limited_reader =
+                            std::io::Read::take(get_res, max_size.saturating_add(1));
                         // Manual copy loop: io::copy neither observes the
                         // cancel flag nor any whole-body deadline, and each
                         // blocking read gets a fresh 30s window from reqwest,
@@ -4853,7 +4899,7 @@ where
                                             &e,
                                         ));
                                     }
-                                    written += n as u64;
+                                    written = written.saturating_add(n as u64);
                                     if written / (1024 * 1024) > last_reported_mib {
                                         last_reported_mib = written / (1024 * 1024);
                                         progress(ActionProgress {
@@ -4861,7 +4907,7 @@ where
                                             phase: "download",
                                             completed: idx,
                                             total: total_files,
-                                            bytes_done: bytes_finished + written,
+                                            bytes_done: bytes_finished.saturating_add(written),
                                             bytes_total,
                                             file: Some(rel.clone()),
                                         });
@@ -4987,7 +5033,7 @@ where
                     }
                 };
 
-                bytes_finished += downloaded_len as u64;
+                bytes_finished = bytes_finished.saturating_add(downloaded_len);
                 progress(ActionProgress {
                     action: action.to_string(),
                     phase: "download",
@@ -5028,7 +5074,7 @@ where
                     String::new()
                 };
                 count += 1;
-                total_bytes += downloaded_len as usize;
+                total_bytes = total_bytes.saturating_add(downloaded_len);
                 log(&format!(
                     "[{}/{}] Downloaded: {} ({} bytes){}\n",
                     current_num,
@@ -5158,7 +5204,10 @@ where
             }
 
             let max_size = get_max_file_size();
-            let bytes_total: u64 = files_to_upload.iter().map(|(_, _, size)| *size).sum();
+            let bytes_total: u64 = files_to_upload
+                .iter()
+                .map(|(_, _, size)| *size)
+                .fold(0, u64::saturating_add);
             progress(ActionProgress {
                 action: action.to_string(),
                 phase: "upload",
@@ -6775,6 +6824,29 @@ mod tests {
                 .len(),
             items.len()
         );
+
+        let oversized_href = format!("https://example.com/remote/files/{}", "x".repeat(MAX_REMOTE_HREF_BYTES + 1));
+        save_remote_cache(
+            test_url,
+            alice_user,
+            &[WebdavItem::new(oversized_href, false, 1)],
+        );
+        assert!(load_remote_cache(test_url, alice_user).unwrap().is_empty());
+
+        let deep_href = format!(
+            "https://example.com/remote/files/{}file.bin",
+            "a/".repeat(MAX_REMOTE_PATH_SEGMENTS + 1)
+        );
+        save_remote_cache(test_url, alice_user, &[WebdavItem::new(deep_href, false, 1)]);
+        assert!(load_remote_cache(test_url, alice_user).unwrap().is_empty());
+
+        save_remote_cache(
+            test_url,
+            alice_user,
+            &[WebdavItem::new("https://example.com/remote/files/future.bin", false, 1)
+                .with_mtime(Some(u64::MAX))],
+        );
+        assert!(load_remote_cache(test_url, alice_user).unwrap().is_empty());
 
         clear_remote_cache().unwrap();
         assert!(!temp_cache.exists());

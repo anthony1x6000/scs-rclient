@@ -1,3 +1,5 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
 //! In-house date/time handling: WebDAV HTTP-date parsing and the local
 //! `YYYY-MM-DD` used to name dated backups.
 //!
@@ -7,6 +9,10 @@
 //! code: `localtime_r` / `GetLocalTime` for the local calendar date.
 
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// Bound server-controlled fields before tokenization or calendar arithmetic.
+const MAX_HTTP_DATE_BYTES: usize = 128;
+const MAX_HTTP_YEAR: i64 = 9_999;
 
 const MONTHS: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
@@ -23,7 +29,7 @@ fn month_number(token: &str) -> Option<u32> {
 /// Howard Hinnant's days-from-civil: days since 1970-01-01, `None` for an
 /// invalid calendar date (including leap-day checks).
 fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
-    if !(1..=12).contains(&month) || day == 0 {
+    if !(0..=MAX_HTTP_YEAR).contains(&year) || !(1..=12).contains(&month) || day == 0 {
         return None;
     }
     let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
@@ -44,13 +50,21 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
     if day > month_lengths[(month - 1) as usize] {
         return None;
     }
-    let year = if month <= 2 { year - 1 } else { year };
+    let year = year.checked_sub(if month <= 2 { 1 } else { 0 })?;
     let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
+    let year_of_era = year.checked_sub(era.checked_mul(400)?)?;
     let shifted_month = (month as i64 + 9) % 12;
     let day_of_year = (153 * shifted_month + 2) / 5 + day as i64 - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    Some(era * 146_097 + day_of_era - 719_468)
+    let day_of_era = year_of_era
+        .checked_mul(365)?
+        .checked_add(year_of_era / 4)?
+        .checked_sub(year_of_era / 100)?
+        .checked_add(day_of_year)?;
+    Some(
+        era.checked_mul(146_097)?
+            .checked_add(day_of_era)?
+            .checked_sub(719_468)?,
+    )
 }
 
 /// Inverse of [`days_from_civil`], used only for the UTC fallback.
@@ -75,13 +89,13 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 fn parse_time(token: &str) -> Option<(i64, i64, i64)> {
     let mut parts = token.split(':');
-    let hour: i64 = parts.next()?.parse().ok()?;
-    let minute: i64 = parts.next()?.parse().ok()?;
-    let second: i64 = parts.next()?.parse().ok()?;
+    let hour: u32 = parts.next()?.parse().ok()?;
+    let minute: u32 = parts.next()?.parse().ok()?;
+    let second: u32 = parts.next()?.parse().ok()?;
     if parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    Some((hour, minute, second))
+    Some((hour as i64, minute as i64, second as i64))
 }
 
 fn parse_zone(token: &str) -> Option<i64> {
@@ -97,15 +111,15 @@ fn parse_zone(token: &str) -> Option<i64> {
     let rest = &token[1..];
     let (hours, minutes) = match rest.split_once(':') {
         Some((hours, minutes)) => (hours, minutes),
-        None if rest.len() == 4 => (&rest[..2], &rest[2..]),
+        None if rest.len() == 4 && rest.is_ascii() => (&rest[..2], &rest[2..]),
         _ => return None,
     };
-    let hours: i64 = hours.parse().ok()?;
-    let minutes: i64 = minutes.parse().ok()?;
+    let hours: u32 = hours.parse().ok()?;
+    let minutes: u32 = minutes.parse().ok()?;
     if hours > 23 || minutes > 59 {
         return None;
     }
-    Some(sign * (hours * 3600 + minutes * 60))
+    Some(sign * (i64::from(hours) * 3600 + i64::from(minutes) * 60))
 }
 
 fn to_epoch(
@@ -118,7 +132,12 @@ fn to_epoch(
     offset_seconds: i64,
 ) -> Option<u64> {
     let days = days_from_civil(year, month, day)?;
-    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset_seconds;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?
+        .checked_sub(offset_seconds)?;
     Some(seconds.max(0) as u64)
 }
 
@@ -183,15 +202,15 @@ fn parse_rfc850(input: &str) -> Option<u64> {
     let mut parts = date_token.split('-');
     let day: u32 = parts.next()?.parse().ok()?;
     let month = month_number(parts.next()?)?;
-    let two_digit_year: i64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
+    let two_digit_year: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || two_digit_year > 99 {
         return None;
     }
-    let year = if two_digit_year >= 69 {
-        1900 + two_digit_year
-    } else {
-        2000 + two_digit_year
-    };
+    let year = i64::from(if two_digit_year >= 69 {
+            1900 + two_digit_year
+        } else {
+            2000 + two_digit_year
+        });
     let (hour, minute, second) = parse_time(tokens.get(time_index)?)?;
     let offset = parse_zone(tokens.get(time_index + 1)?)?;
     to_epoch(year, month, day, hour, minute, second, offset)
@@ -215,7 +234,7 @@ fn parse_asctime(input: &str) -> Option<u64> {
 /// implementation.
 pub fn parse_webdav_date(date_str: &str) -> Option<u64> {
     let trimmed = date_str.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.len() > MAX_HTTP_DATE_BYTES {
         return None;
     }
     parse_rfc3339(trimmed)
@@ -350,7 +369,7 @@ mod tests {
             "Mon, 28 Sep 2026 -9223372036854775808:00:00 GMT",
             "Mon, 28 Sep 2026 13:45:09 +-9223372036854775808:00",
             "Mon, 28 Sep 2026 13:45:09 +00:-1",
-            "2026-09-28T13:45:09+éé",
+            "2026-09-28T13:45:09+€a",
             "10000-01-01T00:00:00Z",
         ] {
             assert_eq!(parse_webdav_date(date), None, "date {date:?} must be rejected");
@@ -359,6 +378,11 @@ mod tests {
             parse_webdav_date("9999-12-31T23:59:59Z"),
             Some(253_402_300_799)
         );
+    }
+
+    #[test]
+    fn rejects_multibyte_timezone_without_slicing_panic() {
+        assert_eq!(parse_webdav_date("2026-09-28T13:45:09+€a"), None);
     }
 
     #[test]
