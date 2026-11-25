@@ -8,6 +8,10 @@ import CredentialsForm from "./components/CredentialsForm";
 import SettingsView from "./components/SettingsView";
 import { RcloneActions } from "./components/RcloneActions";
 import RcloneConsole from "./components/RcloneConsole";
+import ProgressPanel from "./components/ProgressPanel";
+import ReviewChanges from "./components/ReviewChanges";
+import { useRcloneExecution } from "./hooks/useRcloneExecution";
+import type { ProgressState } from "./progress";
 import { getBulkPresets, getTargetSubdir, setBulkPresets } from "./settings";
 import { upsertBulkPreset } from "./bulkPresets";
 import { BULK_MIN_FOLDERS } from "./bulk";
@@ -18,9 +22,17 @@ function App() {
   const [selectedSubdir, setSelectedSubdir] = useState<string>("");
   const [bulkTicks, setBulkTicks] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [reviewOpen, setReviewOpen] = useState<boolean>(false);
   const [logs, setLogs] = useState<string>("");
   const [isRunning, setIsRunning] = useState<boolean>(false);
+  const [progress, setProgress] = useState<ProgressState | null>(null);
   const mountSeq = useRef(0);
+  const { runRclone, cancelCommand } = useRcloneExecution(
+    setLogs,
+    isRunning,
+    setIsRunning,
+    setProgress,
+  );
 
   const updateMountDir = async (subdir?: string) => {
     const seq = ++mountSeq.current;
@@ -33,6 +45,14 @@ function App() {
       console.error("Failed to get mount dir:", e);
     }
   };
+
+  // Keep the finished/failed strip visible long enough to read, then clear it.
+  useEffect(() => {
+    if (!progress?.done) return;
+    const delay = progress.failed ? 12_000 : 5_000;
+    const timer = window.setTimeout(() => setProgress(null), delay);
+    return () => window.clearTimeout(timer);
+  }, [progress]);
 
   useEffect(() => {
     // Fetch target subdirectory from the single settings module.
@@ -87,15 +107,17 @@ function App() {
       <div className="flex flex-col h-screen w-full box-border overflow-hidden p-2 justify-between">
         <div className="shrink-0">
           <RcloneActions
-            onLog={setLogs}
             isRunning={isRunning}
-            setIsRunning={setIsRunning}
+            runRclone={runRclone}
+            cancelCommand={cancelCommand}
             bulkFolders={bulkTicks}
             onBulkRun={handleBulkRun}
+            onReview={() => setReviewOpen(true)}
           />
         </div>
 
         <div className="flex-1 min-h-0 flex flex-col overflow-hidden my-1 hide-on-compact-height">
+          {progress && <ProgressPanel progress={progress} />}
           <RcloneConsole
             logs={logs}
             onClear={() => setLogs("")}
@@ -143,6 +165,13 @@ function App() {
           </div>
         </div>
       </div>
+      {reviewOpen && (
+        <ReviewChanges
+          subdir={selectedSubdir}
+          targetSubdir={targetSubdir}
+          onClose={() => setReviewOpen(false)}
+        />
+      )}
     </BackgroundWrapper>
   );
 }

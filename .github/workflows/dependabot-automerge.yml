@@ -1,0 +1,56 @@
+name: Dependabot Auto-merge
+
+# Dependabot PRs merge without a human once the required checks on main pass.
+#
+# The trigger is pull_request_target, not pull_request: GitHub hands workflows
+# started by Dependabot a read-only GITHUB_TOKEN, which cannot enable a merge.
+# pull_request_target runs in the base-branch context with a write token, so it
+# is safe only because nothing from the PR is ever checked out here: this job
+# reads the PR number from the event and asks GitHub to merge, and no file,
+# script, or input from the branch under review reaches a shell.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to enable auto-merge on
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-automerge-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  enable:
+    name: Enable auto-merge
+    runs-on: ubuntu-slim
+    # A manual dispatch is the escape hatch for a PR that predates this file.
+    # The label check keeps a PR parked on purpose (see the upkeep workflow)
+    # from being re-armed by an unrelated push.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.user.login == 'dependabot[bot]' &&
+       github.event.pull_request.draft == false &&
+       !contains(github.event.pull_request.labels.*.name, 'dependabot-hold'))
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+    steps:
+      - name: Enable auto-merge for the Dependabot PR
+        run: |
+          set -euo pipefail
+          # Refusals are warnings, not failures: a conflicting branch cannot arm
+          # auto-merge, and the scheduled upkeep run is what resolves it. A red
+          # check here would only page a human for something already handled.
+          if ! OUT=$(gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash 2>&1); then
+            echo "::warning title=dependabot auto-merge not armed::pr #$PR_NUMBER: $OUT"
+            exit 0
+          fi
+          echo "auto-merge armed for pr #$PR_NUMBER: it merges when the required checks pass."

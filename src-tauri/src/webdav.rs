@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use crate::dav_client::{self, Client};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
@@ -81,6 +83,33 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Client>();
 };
+
+/// Snapshot of an in-flight WebDAV action, streamed to the UI so a long
+/// transfer shows file/byte progress instead of a silent console.
+#[derive(Clone, Debug)]
+pub struct ActionProgress {
+    pub action: String,
+    pub phase: &'static str,
+    pub completed: usize,
+    pub total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub file: Option<String>,
+}
+
+impl ActionProgress {
+    fn new(action: &str, phase: &'static str) -> Self {
+        Self {
+            action: action.to_string(),
+            phase,
+            completed: 0,
+            total: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+            file: None,
+        }
+    }
+}
 
 /// Classification of a single WebDAV request attempt, used to decide whether a retry is worth it.
 enum AttemptError {
@@ -508,6 +537,8 @@ pub fn get_max_file_size() -> u64 {
     std::env::var("MAX_WEBDAV_FILE_SIZE_BYTES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
+        // Leave one byte for the download reader's over-limit probe.
+        .map(|v| v.min(u64::MAX - 1))
         .unwrap_or(DEFAULT_MAX_FILE_SIZE)
 }
 
@@ -841,6 +872,8 @@ fn write_cache_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+const MAX_CACHE_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Helper to safely read and deserialize the cache map from disk.
 fn read_cache_map(path: &Path) -> HashMap<String, CachedRemoteListing> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
@@ -848,15 +881,27 @@ fn read_cache_map(path: &Path) -> HashMap<String, CachedRemoteListing> {
             let _ = std::fs::remove_file(path);
             return HashMap::new();
         }
-    }
-    if let Ok(content) = std::fs::read_to_string(path) {
-        if content.len() <= 50 * 1024 * 1024 {
-            if let Ok(map) = serde_json::from_str(&content) {
-                return map;
-            }
+        if meta.len() > MAX_CACHE_BYTES {
+            return HashMap::new();
         }
     }
-    HashMap::new()
+    let Ok(file) = std::fs::File::open(path) else {
+        return HashMap::new();
+    };
+    parse_cache_reader(file)
+}
+
+fn parse_cache_reader(reader: impl Read) -> HashMap<String, CachedRemoteListing> {
+    let mut content = String::new();
+    if reader
+        .take(MAX_CACHE_BYTES + 1)
+        .read_to_string(&mut content)
+        .is_err()
+        || content.len() as u64 > MAX_CACHE_BYTES
+    {
+        return HashMap::new();
+    }
+    serde_json::from_str(&content).unwrap_or_default()
 }
 
 /// Helper to safely serialize and atomically write the cache map to disk.
@@ -907,6 +952,36 @@ fn same_auth_user(stored: &Option<String>, requested: Option<&str>) -> bool {
     }
 }
 
+fn cached_item_is_safe(remote_url: &str, item: &WebdavItem) -> bool {
+    if item.href.is_empty()
+        || item.href.len() > MAX_REMOTE_HREF_BYTES
+        || has_traversal_sequence(&item.href)
+    {
+        return false;
+    }
+    let resolved = resolve_item_url(remote_url, &item.href);
+    if !same_remote_origin(remote_url, &resolved) {
+        return false;
+    }
+    if let Ok(url) = reqwest::Url::parse(&resolved) {
+        if !url.username().is_empty() || url.password().is_some() {
+            return false;
+        }
+    }
+    let rel = relative_item_path(remote_url, &item.href);
+    if (!rel.is_empty() && !is_within_collection(remote_url, &resolved))
+        || has_traversal_sequence(&rel)
+        || !download_rel_path_within_segments(&rel)
+    {
+        return false;
+    }
+    item.mtime.map_or(true, |mtime| {
+        std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(mtime))
+            .is_some()
+    })
+}
+
 pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Vec<WebdavItem>> {
     let path = get_cache_file_path()?;
     let cache = read_cache_map(&path);
@@ -925,6 +1000,9 @@ pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Ve
             && same_auth_user(&entry.auth_user, auth_user)
     })?;
 
+    if entry.items.len() > MAX_REMOTE_ITEMS {
+        return None;
+    }
 
     let ttl = get_cache_ttl_secs();
     if ttl > 0 {
@@ -932,21 +1010,19 @@ pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Ve
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_secs();
-        if now.saturating_sub(entry.timestamp) > ttl {
+        if entry.timestamp > now || now.saturating_sub(entry.timestamp) > ttl {
             return None;
         }
     }
 
     let mut valid_items = Vec::with_capacity(entry.items.len());
     for item in &entry.items {
-        if has_traversal_sequence(&item.href) {
-            continue;
+        if cached_item_is_safe(remote_url, item) {
+            valid_items.push(item.clone());
         }
-        let rel = relative_item_path(remote_url, &item.href);
-        if has_traversal_sequence(&rel) {
-            continue;
-        }
-        valid_items.push(item.clone());
+    }
+    if valid_items.len() != entry.items.len() {
+        return None;
     }
 
     Some(valid_items)
@@ -954,9 +1030,12 @@ pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Ve
 
 /// Saves remote items to the local cache file for remote_url and auth_user.
 ///
-/// Filters out any item with traversal sequences (`has_traversal_sequence`) to prevent cache poisoning.
+/// Filters out unsafe, oversized, over-deep, or unrepresentable items to prevent cache poisoning.
 /// Cached listings are keyed by normalized collection URL and authenticated user.
 pub fn save_remote_cache(remote_url: &str, auth_user: Option<&str>, items: &[WebdavItem]) {
+    if items.len() > MAX_REMOTE_ITEMS {
+        return;
+    }
     let path = match get_cache_file_path() {
         Some(p) => p,
         None => return,
@@ -970,14 +1049,12 @@ pub fn save_remote_cache(remote_url: &str, auth_user: Option<&str>, items: &[Web
 
     let mut safe_items = Vec::with_capacity(items.len());
     for item in items {
-        if has_traversal_sequence(&item.href) {
-            continue;
+        if cached_item_is_safe(remote_url, item) {
+            safe_items.push(item.clone());
         }
-        let rel = relative_item_path(remote_url, &item.href);
-        if has_traversal_sequence(&rel) {
-            continue;
-        }
-        safe_items.push(item.clone());
+    }
+    if safe_items.len() != items.len() {
+        return;
     }
 
     if ambiguous_username(auth_user) {
@@ -3079,6 +3156,8 @@ where
     std::thread::scope(|s| {
         // One controller thread owns spawning, so the pool starts at the current
         // limit and grows as Settings raises it instead of pre-allocating 64 threads.
+        let controller_log_tx = log_tx.clone();
+        drop(log_tx);
         let controller = s.spawn(move || {
             let mut spawned = 0usize;
             loop {
@@ -3099,7 +3178,7 @@ where
                         cvar_ref,
                         exclude_folders,
                         extension_filter,
-                        log_tx.clone(),
+                        controller_log_tx.clone(),
                     );
                     continue;
                 }
@@ -3110,7 +3189,15 @@ where
         while let Ok(msg) = log_rx.recv() {
             log(&msg);
         }
-        let _ = controller.join();
+        if controller.join().is_err() {
+            let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
+            if state.error.is_none() {
+                state.error = Some(
+                    "WebDAV scan controller thread panicked unexpectedly.".to_string(),
+                );
+            }
+            state.stopped = true;
+        }
     });
 
     let mut state = state_ref.lock().unwrap_or_else(|p| p.into_inner());
@@ -3156,6 +3243,199 @@ pub struct RemoteFolder {
     pub path: String,
     /// Sum of file sizes anywhere beneath this folder (0 when it holds no files).
     pub size: u64,
+}
+
+/// How one path differs between the local working copy and the remote drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChangeStatus {
+    /// Exists remotely, not locally: Download would create it.
+    Added,
+    /// Exists locally, not remotely: the remote copy was removed.
+    Removed,
+    /// Exists on both sides with a different size or modification time.
+    Modified,
+}
+
+/// One row in the Review Changes view, carrying both sides' metadata so the
+/// preview header and the two side bars need no extra round trip.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeEntry {
+    /// Slash-separated path relative to the reviewed collection.
+    pub path: String,
+    pub status: ChangeStatus,
+    pub local_size: Option<u64>,
+    pub local_mtime: Option<u64>,
+    pub remote_size: Option<u64>,
+    pub remote_mtime: Option<u64>,
+}
+
+/// Upper bound on the bytes fetched for one side of a text preview. The diff
+/// only needs enough to recognize a change; larger files fall back to metadata.
+pub const MAX_PREVIEW_BYTES: usize = 512 * 1024;
+
+/// What a preview side can show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PreviewKind {
+    Text,
+    Binary,
+    TooLarge,
+    Missing,
+}
+
+/// One side of a file preview (local or remote).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSide {
+    pub kind: PreviewKind,
+    pub size: u64,
+    pub mtime: Option<u64>,
+    /// Present only for `kind == Text`.
+    pub text: Option<String>,
+}
+
+impl PreviewSide {
+    pub fn missing() -> Self {
+        Self {
+            kind: PreviewKind::Missing,
+            size: 0,
+            mtime: None,
+            text: None,
+        }
+    }
+}
+
+/// Both sides of one changed file, ready for the diff panel.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangePreview {
+    pub path: String,
+    pub local: PreviewSide,
+    pub remote: PreviewSide,
+}
+
+/// Classifies a bounded read into a preview side. A body longer than
+/// [`MAX_PREVIEW_BYTES`] is reported as too large before binary detection:
+/// the truncated tail must never be mistaken for the whole file.
+pub fn preview_side_from_bytes(bytes: &[u8], size: u64, mtime: Option<u64>) -> PreviewSide {
+    if bytes.len() > MAX_PREVIEW_BYTES {
+        return PreviewSide {
+            kind: PreviewKind::TooLarge,
+            size,
+            mtime,
+            text: None,
+        };
+    }
+    // NUL in the first 8 KiB is the same cheap heuristic git uses; invalid
+    // UTF-8 catches most other binaries (compressed archives, images).
+    let probe = &bytes[..bytes.len().min(8192)];
+    let has_nul = probe.contains(&0);
+    let text = if has_nul {
+        None
+    } else {
+        String::from_utf8(bytes.to_vec()).ok()
+    };
+    match text {
+        Some(text) => PreviewSide {
+            kind: PreviewKind::Text,
+            size,
+            mtime,
+            text: Some(text),
+        },
+        None => PreviewSide {
+            kind: PreviewKind::Binary,
+            size,
+            mtime,
+            text: None,
+        },
+    }
+}
+
+/// Same size but different timestamps (beyond HTTP-date rounding) still counts
+/// as changed: local edits preserve size surprisingly often.
+fn file_changed(
+    local_size: u64,
+    local_mtime: Option<u64>,
+    remote_size: u64,
+    remote_mtime: Option<u64>,
+) -> bool {
+    if local_size != remote_size {
+        return true;
+    }
+    match (local_mtime, remote_mtime) {
+        (Some(local), Some(remote)) => local.abs_diff(remote) > 1,
+        _ => false,
+    }
+}
+
+/// Builds the changed-file list for the Review Changes view. Both inputs are
+/// already filtered (exclusions and extension filters), so the view shows
+/// exactly the files a Download or Upload would consider. Unchanged files are
+/// omitted; the result is sorted by path.
+pub fn compute_change_entries(
+    remote_url: &str,
+    remote_items: &[WebdavItem],
+    local_files: &[(PathBuf, String, u64, Option<u64>)],
+) -> Vec<ChangeEntry> {
+    let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
+    for item in remote_items {
+        if item.is_dir {
+            continue;
+        }
+        let rel = relative_item_path(remote_url, &item.href);
+        if rel.is_empty()
+            || !is_safe_relative_path(&rel)
+            || !download_rel_path_within_segments(&rel)
+        {
+            continue;
+        }
+        remote_map.insert(rel, (item.size, item.mtime));
+    }
+
+    let mut entries = Vec::new();
+    let mut local_paths: HashSet<String> = HashSet::new();
+    for (_, rel, local_size, local_mtime) in local_files {
+        local_paths.insert(rel.clone());
+        match remote_map.get(rel) {
+            None => entries.push(ChangeEntry {
+                path: rel.clone(),
+                status: ChangeStatus::Removed,
+                local_size: Some(*local_size),
+                local_mtime: *local_mtime,
+                remote_size: None,
+                remote_mtime: None,
+            }),
+            Some((remote_size, remote_mtime)) => {
+                if file_changed(*local_size, *local_mtime, *remote_size, *remote_mtime) {
+                    entries.push(ChangeEntry {
+                        path: rel.clone(),
+                        status: ChangeStatus::Modified,
+                        local_size: Some(*local_size),
+                        local_mtime: *local_mtime,
+                        remote_size: Some(*remote_size),
+                        remote_mtime: *remote_mtime,
+                    });
+                }
+            }
+        }
+    }
+    for (rel, (remote_size, remote_mtime)) in remote_map {
+        if local_paths.contains(&rel) {
+            continue;
+        }
+        entries.push(ChangeEntry {
+            path: rel,
+            status: ChangeStatus::Added,
+            local_size: None,
+            local_mtime: None,
+            remote_size: Some(remote_size),
+            remote_mtime,
+        });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
 }
 
 /// Server-derived download paths must stay shallow: a bounded listing would
@@ -3214,15 +3494,16 @@ fn aggregate_remote_folders_with_budget(
             return Err("Operation canceled by user.".to_string());
         }
         let rel = relative_item_path(remote_url, &item.href);
-        let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
-        if segments.is_empty() {
+        let segment_count = rel.split('/').filter(|s| !s.is_empty()).count();
+        if segment_count == 0 {
             continue;
         }
-        if segments.len() > MAX_REMOTE_PATH_SEGMENTS {
+        if segment_count > MAX_REMOTE_PATH_SEGMENTS {
             return Err(format!(
                 "Remote path exceeds the {MAX_REMOTE_PATH_SEGMENTS} segment limit. Aborting for security."
             ));
         }
+        let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
         if item.is_dir {
             // Register the folder (and, defensively, every ancestor).
             let mut acc = String::new();
@@ -3235,14 +3516,16 @@ fn aggregate_remote_folders_with_budget(
             }
         } else {
             // Credit the root and every ancestor folder; never the file itself.
-            *charge_remote_folder(&mut sizes, &mut retained, budget, "")? += item.size;
+            let total = charge_remote_folder(&mut sizes, &mut retained, budget, "")?;
+            *total = total.saturating_add(item.size);
             let mut acc = String::new();
             for segment in &segments[..segments.len() - 1] {
                 if !acc.is_empty() {
                     acc.push('/');
                 }
                 acc.push_str(segment);
-                *charge_remote_folder(&mut sizes, &mut retained, budget, &acc)? += item.size;
+                let total = charge_remote_folder(&mut sizes, &mut retained, budget, &acc)?;
+                *total = total.saturating_add(item.size);
             }
         }
     }
@@ -3403,7 +3686,7 @@ pub fn should_upload_file(
         (Some(l_time), Some(r_time)) => {
             // Local file is considered newer if its mtime is strictly greater than
             // remote mtime + 1s (to avoid false positives due to HTTP-date 1-second rounding).
-            l_time > r_time + 1
+            l_time > r_time.saturating_add(1)
         }
         // If timestamps are not both available, but sizes match, consider it up-to-date
         _ => false,
@@ -3434,7 +3717,7 @@ pub fn should_download_file(
         (Some(r_time), Some(l_time)) => {
             // Remote file is considered newer if its mtime is strictly greater than
             // local mtime + 1s (to avoid false positives due to HTTP-date 1-second rounding or clock skew).
-            r_time > l_time + 1
+            r_time > l_time.saturating_add(1)
         }
         // If timestamps are not both available, but sizes match, consider it up-to-date
         _ => false,
@@ -3574,7 +3857,7 @@ impl Drop for WorkerSlot<'_> {
 /// Error semantics match the former sequential loop: per-file failures (oversize,
 /// MKCOL, open, non-2xx status, and transport failures that survive every retry)
 /// are logged and skipped, while a worker panic still aborts the batch with `Err`.
-fn upload_files_concurrently<F>(
+fn upload_files_concurrently<F, P>(
     client: &Client,
     remote_url: &str,
     files: Vec<(PathBuf, String, u64)>,
@@ -3584,10 +3867,13 @@ fn upload_files_concurrently<F>(
     max_size: u64,
     with_checksum: bool,
     done_label: &str,
+    action: &str,
+    progress: &P,
     log: &mut F,
 ) -> Result<UploadOutcome, String>
 where
     F: FnMut(&str),
+    P: Fn(ActionProgress) + Sync,
 {
     let total = files.len();
     if total == 0 {
@@ -3602,6 +3888,14 @@ where
 
     let next_idx = AtomicUsize::new(0);
     let copied = AtomicUsize::new(0);
+    // Files whose upload attempt finished (success or failure), plus the bytes
+    // of the successful ones: the UI bar advances even when one file fails.
+    let processed = AtomicUsize::new(0);
+    let bytes_done = std::sync::atomic::AtomicU64::new(0);
+    let bytes_total: u64 = files
+        .iter()
+        .map(|(_, _, size)| *size)
+        .fold(0, u64::saturating_add);
     let stop = AtomicBool::new(false);
     let error: Mutex<Option<String>> = Mutex::new(None);
     let cache_write_lock = Mutex::new(());
@@ -3657,6 +3951,11 @@ where
         max_size: u64,
         with_checksum: bool,
         done_label: &'a str,
+        action: &'a str,
+        progress: &'a (dyn Fn(ActionProgress) + Sync),
+        processed: &'a AtomicUsize,
+        bytes_done: &'a std::sync::atomic::AtomicU64,
+        bytes_total: u64,
     }
 
     let ctx = UploadCtx {
@@ -3675,9 +3974,54 @@ where
         max_size,
         with_checksum,
         done_label,
+        action,
+        progress: progress as &(dyn Fn(ActionProgress) + Sync),
+        processed: &processed,
+        bytes_done: &bytes_done,
+        bytes_total,
     };
     let ctx_ref = &ctx;
     let control_arc = Arc::clone(&control);
+
+    /// Advances the processed counter (and successful bytes) when one file's
+    /// attempt ends, wherever it exits: success, size skip, MKCOL failure,
+    /// transport error, or cancellation. A guard keeps every `continue` path
+    /// from having to remember to report progress.
+    struct UploadProgressGuard<'a> {
+        processed: &'a AtomicUsize,
+        bytes_done: &'a std::sync::atomic::AtomicU64,
+        progress: &'a (dyn Fn(ActionProgress) + Sync),
+        action: &'a str,
+        total: usize,
+        bytes_total: u64,
+        size: u64,
+        uploaded: bool,
+    }
+
+    impl Drop for UploadProgressGuard<'_> {
+        fn drop(&mut self) {
+            if self.uploaded {
+                let _ = self.bytes_done.try_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |done| Some(done.saturating_add(self.size)),
+                );
+            }
+            let completed = self.processed.fetch_add(1, Ordering::SeqCst) + 1;
+            if std::thread::panicking() {
+                return;
+            }
+            (self.progress)(ActionProgress {
+                action: self.action.to_string(),
+                phase: "upload",
+                completed,
+                total: self.total,
+                bytes_done: self.bytes_done.load(Ordering::SeqCst),
+                bytes_total: self.bytes_total,
+                file: None,
+            });
+        }
+    }
 
     fn spawn_upload_worker<'scope, 'env: 'scope>(
         scope: &'scope std::thread::Scope<'scope, 'env>,
@@ -3704,6 +4048,11 @@ where
             max_size,
             with_checksum,
             done_label,
+            action,
+            progress,
+            processed,
+            bytes_done,
+            bytes_total,
         } = *ctx;
             let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 loop {
@@ -3721,6 +4070,25 @@ where
                     }
                     let (path, rel_str, size) = &files_ref[idx];
                     let current_num = idx + 1;
+                    let mut progress_guard = UploadProgressGuard {
+                        processed,
+                        bytes_done,
+                        progress,
+                        action,
+                        total,
+                        bytes_total,
+                        size: *size,
+                        uploaded: false,
+                    };
+                    (progress)(ActionProgress {
+                        action: action.to_string(),
+                        phase: "upload",
+                        completed: processed.load(Ordering::SeqCst),
+                        total,
+                        bytes_done: bytes_done.load(Ordering::SeqCst),
+                        bytes_total,
+                        file: Some(rel_str.clone()),
+                    });
                     if *size > max_size {
                         let _ = worker_log_tx.send(format!(
                             "[{}/{}] ERROR: File {} exceeds maximum size limit ({} bytes > {} bytes), skipping.\n",
@@ -3794,6 +4162,7 @@ where
                         }
                     };
                     if res.status().is_success() {
+                        progress_guard.uploaded = true;
                         copied_ref.fetch_add(1, Ordering::SeqCst);
                         if is_cache_enabled() {
                             let mtime = std::fs::metadata(path)
@@ -3842,6 +4211,8 @@ where
         let stop_ref = &stop;
         let cancel_ref = cancel_flag;
         let next_ref = &next_idx;
+        let controller_log_tx = log_tx.clone();
+        drop(log_tx);
         let controller = s.spawn(move || {
             let mut control = control_arc.0.lock().unwrap_or_else(|p| p.into_inner());
             loop {
@@ -3852,7 +4223,12 @@ where
                 if control.live_workers < target && next_ref.load(Ordering::SeqCst) < total {
                     control.live_workers += 1;
                     drop(control);
-                    spawn_upload_worker(s, ctx_ref, Arc::clone(&control_arc), log_tx.clone());
+                    spawn_upload_worker(
+                        s,
+                        ctx_ref,
+                        Arc::clone(&control_arc),
+                        controller_log_tx.clone(),
+                    );
                     control = control_arc.0.lock().unwrap_or_else(|p| p.into_inner());
                     continue;
                 }
@@ -3866,7 +4242,29 @@ where
         while let Ok(msg) = log_rx.recv() {
             log(&msg);
         }
-        let _ = controller.join();
+        if controller.join().is_err() {
+            let mut err_slot = error.lock().unwrap_or_else(|p| p.into_inner());
+            if err_slot.is_none() {
+                *err_slot = Some(
+                    "WebDAV upload controller thread panicked unexpectedly.".to_string(),
+                );
+            }
+            stop.store(true, Ordering::SeqCst);
+            gate.wake();
+        }
+    });
+
+    // Worker events can arrive out of completion order (the counter bump and
+    // the emit are not one atomic step), so publish the authoritative final
+    // snapshot here after every worker has stopped.
+    progress(ActionProgress {
+        action: action.to_string(),
+        phase: "upload",
+        completed: processed.load(Ordering::SeqCst),
+        total,
+        bytes_done: bytes_done.load(Ordering::SeqCst),
+        bytes_total,
+        file: None,
     });
 
     let copied = copied.load(Ordering::SeqCst);
@@ -3945,12 +4343,51 @@ pub fn execute_webdav_action_with_exclusions<F>(
     auth_user: Option<&str>,
     exclude_folders: &[String],
     extension_filter: Option<&ExtensionFilter>,
-    mut log: F,
+    log: F,
 ) -> Result<(), String>
 where
     F: FnMut(&str),
 {
+    execute_webdav_action_with_progress(
+        client,
+        action,
+        remote_url,
+        local_dir,
+        cancel_flag,
+        concurrency,
+        auth_user,
+        exclude_folders,
+        extension_filter,
+        |_| {},
+        log,
+    )
+}
+
+/// Same as [`execute_webdav_action_with_exclusions`], but streams coarse
+/// file/byte progress through `progress` in addition to the log lines. The
+/// callback is invoked from the download loop and from every upload worker,
+/// so it must be safe to call concurrently; callers that only log pass
+/// `|_| {}` through the wrapper above.
+pub fn execute_webdav_action_with_progress<F, P>(
+    client: &Client,
+    action: &str,
+    remote_url: &str,
+    local_dir: &Path,
+    cancel_flag: &AtomicBool,
+    concurrency: Option<usize>,
+    auth_user: Option<&str>,
+    exclude_folders: &[String],
+    extension_filter: Option<&ExtensionFilter>,
+    progress: P,
+    mut log: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str),
+    P: Fn(ActionProgress) + Sync,
+{
+    let progress = &progress;
     validate_webdav_url(remote_url)?;
+    progress(ActionProgress::new(action, "scan"));
     // Seed the live limit once per action. Passing `None` to the phase helpers
     // below keeps a Settings change made mid-action from being overwritten.
     if let Some(requested) = concurrency {
@@ -3994,7 +4431,7 @@ where
             )?;
             let mut file_count = 0;
             let mut dir_count = 0;
-            let mut total_size = 0;
+            let mut total_size = 0u64;
             for item in &items {
                 let rel = relative_item_path(remote_url, &item.href);
                 if rel.is_empty() {
@@ -4006,7 +4443,7 @@ where
                 } else {
                     log(&format!("{:>9} {}\n", item.size, rel));
                     file_count += 1;
-                    total_size += item.size;
+                    total_size = total_size.saturating_add(item.size);
                 }
             }
             log(&format!(
@@ -4150,13 +4587,44 @@ where
                         "[{}/{}] NOTICE: {}: Would copy (new or modified, {} bytes)\n",
                         current_num, total_to_upload, rel_str, size
                     ));
+                    progress(ActionProgress {
+                        action: action.to_string(),
+                        phase: "preview",
+                        completed: current_num,
+                        total: total_to_upload,
+                        bytes_done: 0,
+                        bytes_total: 0,
+                        file: Some(rel_str.clone()),
+                    });
                 }
+                progress(ActionProgress {
+                    action: action.to_string(),
+                    phase: "preview",
+                    completed: total_to_upload,
+                    total: total_to_upload,
+                    bytes_done: 0,
+                    bytes_total: 0,
+                    file: None,
+                });
                 log(&format!(
                     "\nPut operation finished: {} file(s) copied, {} file(s) skipped (already up to date).\n",
                     0, skipped_count
                 ));
                 return Ok(());
             }
+            let bytes_total: u64 = files_to_upload
+                .iter()
+                .map(|(_, _, size)| *size)
+                .fold(0, u64::saturating_add);
+            progress(ActionProgress {
+                action: action.to_string(),
+                phase: "upload",
+                completed: 0,
+                total: total_to_upload,
+                bytes_done: 0,
+                bytes_total,
+                file: None,
+            });
             let copied_count = match upload_files_concurrently(
                 client,
                 remote_url,
@@ -4167,6 +4635,8 @@ where
                 max_size,
                 with_checksum,
                 "Copied",
+                action,
+                progress,
                 &mut log,
             )? {
                 UploadOutcome::Completed(n) => n,
@@ -4270,10 +4740,33 @@ where
             }
 
             let max_size = get_max_file_size();
+            let bytes_total: u64 = files_to_download
+                .iter()
+                .map(|(item, _)| item.size)
+                .fold(0, u64::saturating_add);
+            let mut bytes_finished: u64 = 0;
+            progress(ActionProgress {
+                action: action.to_string(),
+                phase: if is_dry { "preview" } else { "download" },
+                completed: 0,
+                total: total_files,
+                bytes_done: 0,
+                bytes_total,
+                file: None,
+            });
             let mut count = 0;
-            let mut total_bytes = 0;
+            let mut total_bytes = 0u64;
             for (idx, (item, rel)) in files_to_download.iter().enumerate() {
                 let current_num = idx + 1;
+                progress(ActionProgress {
+                    action: action.to_string(),
+                    phase: if is_dry { "preview" } else { "download" },
+                    completed: idx,
+                    total: total_files,
+                    bytes_done: bytes_finished,
+                    bytes_total,
+                    file: Some(rel.clone()),
+                });
                 if cancel_flag.load(Ordering::SeqCst) {
                     log("Operation canceled by user.\n");
                     return Ok(());
@@ -4290,6 +4783,15 @@ where
                         "[{}/{}] NOTICE: {}: Would download (new or modified, {} bytes)\n",
                         current_num, total_files, rel, item.size
                     ));
+                    progress(ActionProgress {
+                        action: action.to_string(),
+                        phase: "preview",
+                        completed: current_num,
+                        total: total_files,
+                        bytes_done: 0,
+                        bytes_total,
+                        file: Some(rel.clone()),
+                    });
                     continue;
                 }
                 log(&format!(
@@ -4325,6 +4827,7 @@ where
                         continue;
                     }
                 };
+                let mut last_reported_mib = 0u64;
                 let download_result = retry_webdav_operation(
                     &format!("GET {download_url}"),
                     cancel_flag,
@@ -4383,7 +4886,8 @@ where
                                     e
                                 ))
                             })?;
-                        let mut limited_reader = std::io::Read::take(get_res, max_size + 1);
+                        let mut limited_reader =
+                            std::io::Read::take(get_res, max_size.saturating_add(1));
                         // Manual copy loop: io::copy neither observes the
                         // cancel flag nor any whole-body deadline, and each
                         // blocking read gets a fresh 30s window from reqwest,
@@ -4428,7 +4932,19 @@ where
                                             &e,
                                         ));
                                     }
-                                    written += n as u64;
+                                    written = written.saturating_add(n as u64);
+                                    if written / (1024 * 1024) > last_reported_mib {
+                                        last_reported_mib = written / (1024 * 1024);
+                                        progress(ActionProgress {
+                                            action: action.to_string(),
+                                            phase: "download",
+                                            completed: idx,
+                                            total: total_files,
+                                            bytes_done: bytes_finished.saturating_add(written),
+                                            bytes_total,
+                                            file: Some(rel.clone()),
+                                        });
+                                    }
                                     if written > max_size {
                                         break;
                                     }
@@ -4550,24 +5066,43 @@ where
                     }
                 };
 
+                bytes_finished = bytes_finished.saturating_add(downloaded_len);
+                progress(ActionProgress {
+                    action: action.to_string(),
+                    phase: "download",
+                    completed: current_num,
+                    total: total_files,
+                    bytes_done: bytes_finished,
+                    bytes_total,
+                    file: Some(rel.clone()),
+                });
+
                 if let Some(mtime_sec) = item.mtime {
-                    match std::fs::File::options().write(true).open(&target_file) {
-                        Ok(file) => {
-                            let sys_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_sec);
-                            let times = std::fs::FileTimes::new().set_modified(sys_time);
-                            if let Err(e) = file.set_times(times) {
+                    if let Some(sys_time) = std::time::UNIX_EPOCH
+                        .checked_add(std::time::Duration::from_secs(mtime_sec))
+                    {
+                        match std::fs::File::options().write(true).open(&target_file) {
+                            Ok(file) => {
+                                let times = std::fs::FileTimes::new().set_modified(sys_time);
+                                if let Err(e) = file.set_times(times) {
+                                    log(&format!(
+                                        "[{}/{}] WARNING: Could not preserve modification time on {}: {}\n",
+                                        current_num, total_files, rel, e
+                                    ));
+                                }
+                            }
+                            Err(e) => {
                                 log(&format!(
-                                    "[{}/{}] WARNING: Could not preserve modification time on {}: {}\n",
+                                    "[{}/{}] WARNING: Could not open {} to set modification time: {}\n",
                                     current_num, total_files, rel, e
                                 ));
                             }
                         }
-                        Err(e) => {
-                            log(&format!(
-                                "[{}/{}] WARNING: Could not open {} to set modification time: {}\n",
-                                current_num, total_files, rel, e
-                            ));
-                        }
+                    } else {
+                        log(&format!(
+                            "[{}/{}] WARNING: Remote modification time for {} is out of range.\n",
+                            current_num, total_files, rel
+                        ));
                     }
                 }
 
@@ -4580,7 +5115,7 @@ where
                     String::new()
                 };
                 count += 1;
-                total_bytes += downloaded_len as usize;
+                total_bytes = total_bytes.saturating_add(downloaded_len);
                 log(&format!(
                     "[{}/{}] Downloaded: {} ({} bytes){}\n",
                     current_num,
@@ -4590,6 +5125,15 @@ where
                     checksum_str
                 ));
             }
+            progress(ActionProgress {
+                action: action.to_string(),
+                phase: "download",
+                completed: total_files,
+                total: total_files,
+                bytes_done: bytes_finished,
+                bytes_total,
+                file: None,
+            });
             log(&format!(
                 "\nGet operation finished: {} file(s) downloaded ({} bytes), {} file(s) skipped (already up to date).\n",
                 count, total_bytes, skipped_count
@@ -4701,6 +5245,19 @@ where
             }
 
             let max_size = get_max_file_size();
+            let bytes_total: u64 = files_to_upload
+                .iter()
+                .map(|(_, _, size)| *size)
+                .fold(0, u64::saturating_add);
+            progress(ActionProgress {
+                action: action.to_string(),
+                phase: "upload",
+                completed: 0,
+                total: files_to_upload.len(),
+                bytes_done: 0,
+                bytes_total,
+                file: None,
+            });
             let uploaded = match upload_files_concurrently(
                 client,
                 remote_url,
@@ -4711,6 +5268,8 @@ where
                 max_size,
                 false,
                 "Synced",
+                action,
+                progress,
                 &mut log,
             )? {
                 UploadOutcome::Completed(n) => n,
@@ -5235,6 +5794,12 @@ mod tests {
         assert!(!should_upload_file(100, None, 100, Some(1000)));
         assert!(!should_upload_file(100, Some(1000), 100, None));
         assert!(!should_upload_file(100, None, 100, None));
+    }
+
+    #[test]
+    fn test_timestamp_comparisons_saturate_at_u64_max() {
+        assert!(!should_upload_file(100, Some(0), 100, Some(u64::MAX)));
+        assert!(!should_download_file(100, Some(0), 100, Some(u64::MAX)));
     }
 
     #[test]
@@ -6130,6 +6695,36 @@ mod tests {
     }
 
     #[test]
+    fn test_upload_progress_panic_is_reported_without_aborting() {
+        let client = Client::init_internal("u", "p", "http://127.0.0.1:9/dav/", true)
+            .expect("loopback client must initialize in insecure test mode");
+        let cancel = AtomicBool::new(false);
+        let panic_once = AtomicBool::new(true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            upload_files_concurrently(
+                &client,
+                "http://127.0.0.1:9/dav/",
+                vec![(PathBuf::from("unused.txt"), "unused.txt".to_string(), 1)],
+                &cancel,
+                None,
+                None,
+                100,
+                false,
+                "Copied",
+                "put",
+                &|_| {
+                    if std::thread::panicking() || panic_once.swap(false, Ordering::SeqCst) {
+                        panic!("progress callback panic");
+                    }
+                },
+                &mut |_| {},
+            )
+        }));
+        assert!(result.is_ok(), "a callback panic must not abort the process");
+        assert!(result.unwrap().is_err(), "the worker panic must fail the upload");
+    }
+
+    #[test]
     fn test_remote_cache_lifecycle() {
         let temp_cache = std::env::temp_dir().join(format!("scs_cache_test_{}.json", std::process::id()));
         std::env::set_var("WEBDAV_CACHE_FILE", &temp_cache);
@@ -6224,22 +6819,20 @@ mod tests {
         assert_eq!(after_removal.len(), 1);
         assert!(after_removal[0].href.ends_with(".gitignore"));
 
-        // Path traversal rejection in cache
+        // Path traversal rejection in cache: reject the whole listing, never a partial subset.
+        clear_remote_cache().unwrap();
         let malicious_items = vec![
             WebdavItem::new("https://example.com/remote/files/../../etc/passwd", false, 100),
             WebdavItem::new("https://example.com/remote/files/%2e%2e/shadow", false, 100),
             WebdavItem::new("https://example.com/remote/files/valid.txt", false, 200),
         ];
         save_remote_cache(test_url, alice_user, &malicious_items);
-        let safe_loaded = load_remote_cache(test_url, alice_user).unwrap();
-        assert_eq!(safe_loaded.len(), 1);
-        assert_eq!(safe_loaded[0].size, 200);
+        assert!(load_remote_cache(test_url, alice_user).is_none());
 
         // Invalid rel_path updates and removals are safely ignored
         update_remote_cache_item(test_url, alice_user, "../malicious", 500, None);
         remove_remote_cache_item(test_url, alice_user, "../malicious");
-        let still_safe = load_remote_cache(test_url, alice_user).unwrap();
-        assert_eq!(still_safe.len(), 1);
+        assert!(load_remote_cache(test_url, alice_user).is_none());
 
         // Verify traversal sequence helper
         assert!(has_traversal_sequence("../secret"));
@@ -6271,9 +6864,89 @@ mod tests {
             items.len()
         );
 
+        let oversized_href = format!(
+            "https://example.com/remote/files/{}",
+            "x".repeat(MAX_REMOTE_HREF_BYTES + 1)
+        );
+        let deep_href = format!(
+            "https://example.com/remote/files/{}file.bin",
+            "a/".repeat(MAX_REMOTE_PATH_SEGMENTS + 1)
+        );
+        for href in [
+            oversized_href.clone(),
+            deep_href,
+            "https://evil.example/remote/files/report.pdf".to_string(),
+            "https://example.com/other/report.pdf".to_string(),
+            "https://user:pass@example.com/remote/files/report.pdf".to_string(),
+        ] {
+            clear_remote_cache().unwrap();
+            save_remote_cache(test_url, alice_user, &[WebdavItem::new(href, false, 1)]);
+            assert!(
+                load_remote_cache(test_url, alice_user).is_none(),
+                "an invalid cache entry must force a fresh listing"
+            );
+        }
+
+        clear_remote_cache().unwrap();
+        save_remote_cache(
+            test_url,
+            alice_user,
+            &[WebdavItem::new("https://example.com/remote/files/future.bin", false, 1)
+                .with_mtime(Some(u64::MAX))],
+        );
+        assert!(load_remote_cache(test_url, alice_user).is_none());
+
+        let mixed_items = vec![
+            WebdavItem::new("https://example.com/remote/files/valid.bin", false, 1),
+            WebdavItem::new(oversized_href, false, 1),
+        ];
+        let mut mixed_cache = HashMap::new();
+        mixed_cache.insert(
+            cache_key(test_url, alice_user),
+            CachedRemoteListing {
+                remote_url: test_url.to_string(),
+                auth_user: Some("alice".to_string()),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                items: mixed_items,
+            },
+        );
+        write_cache_atomic(
+            &temp_cache,
+            &serde_json::to_string(&mixed_cache).unwrap(),
+        )
+        .unwrap();
+        assert!(load_remote_cache(test_url, alice_user).is_none());
+
         clear_remote_cache().unwrap();
         assert!(!temp_cache.exists());
         std::env::remove_var("WEBDAV_CACHE_FILE");
+    }
+
+    #[test]
+    fn test_cache_reader_stops_at_the_size_cap() {
+        struct CountingReader<R> {
+            inner: R,
+            bytes_read: usize,
+        }
+
+        impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.inner.read(buffer)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+
+        let limit: usize = 50 * 1024 * 1024;
+        let mut reader = CountingReader {
+            inner: std::io::repeat(0).take(limit as u64 + 1),
+            bytes_read: 0,
+        };
+        assert!(parse_cache_reader(&mut reader).is_empty());
+        assert!(reader.bytes_read <= limit + 1, "cache read exceeded its cap");
     }
 
     #[test]
@@ -6656,6 +7329,25 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregate_remote_folders_saturates_hostile_sizes() {
+        let base = "http://127.0.0.1:3923/docs/";
+        let items = vec![
+            WebdavItem::new("/docs/a/one.bin", false, u64::MAX),
+            WebdavItem::new("/docs/a/two.bin", false, u64::MAX),
+        ];
+
+        let folders = aggregate_remote_folders(base, &items, &AtomicBool::new(false))
+            .expect("aggregation should bound hostile advertised sizes");
+        assert_eq!(
+            folders,
+            vec![
+                RemoteFolder { path: String::new(), size: u64::MAX },
+                RemoteFolder { path: "a".to_string(), size: u64::MAX },
+            ]
+        );
+    }
+
+    #[test]
     fn test_has_traversal_segments_rejects_literal_and_encoded_escapes() {
         for subdir in [
             "..",
@@ -6719,6 +7411,15 @@ mod tests {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(configured.max(1));
         assert!(deadline > std::time::Instant::now());
+    }
+
+    #[test]
+    fn test_max_file_size_leaves_room_for_overlimit_probe() {
+        std::env::set_var("MAX_WEBDAV_FILE_SIZE_BYTES", u64::MAX.to_string());
+        let configured = get_max_file_size();
+        std::env::remove_var("MAX_WEBDAV_FILE_SIZE_BYTES");
+        assert_eq!(configured, u64::MAX - 1);
+        assert_eq!(configured + 1, u64::MAX);
     }
 
     struct CancelingReader<'a> {
@@ -6807,4 +7508,66 @@ mod tests {
         let deep = "a/".repeat(MAX_REMOTE_PATH_SEGMENTS + 1);
         assert!(!download_rel_path_within_segments(&format!("{deep}file.txt")));
     }
+    #[test]
+    fn test_compute_change_entries_classifies_added_removed_modified() {
+        let remote_url = "https://example.test/dav/course/";
+        let remote_items = vec![
+            WebdavItem::new("/dav/course/", true, 0),
+            WebdavItem::new("/dav/course/new.txt", false, 4).with_mtime(Some(300)),
+            WebdavItem::new("/dav/course/same.txt", false, 5).with_mtime(Some(100)),
+            WebdavItem::new("/dav/course/edited.txt", false, 5).with_mtime(Some(200)),
+            WebdavItem::new("/dav/course/resized.txt", false, 9).with_mtime(Some(100)),
+        ];
+        let local_files = vec![
+            (PathBuf::from("/tmp/same.txt"), "same.txt".to_string(), 5, Some(101)),
+            (PathBuf::from("/tmp/edited.txt"), "edited.txt".to_string(), 5, Some(100)),
+            (PathBuf::from("/tmp/resized.txt"), "resized.txt".to_string(), 8, Some(100)),
+            (PathBuf::from("/tmp/gone.txt"), "gone.txt".to_string(), 3, Some(50)),
+        ];
+
+        let entries = compute_change_entries(remote_url, &remote_items, &local_files);
+        let rows: Vec<(&str, ChangeStatus)> =
+            entries.iter().map(|e| (e.path.as_str(), e.status)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("edited.txt", ChangeStatus::Modified),
+                ("gone.txt", ChangeStatus::Removed),
+                ("new.txt", ChangeStatus::Added),
+                ("resized.txt", ChangeStatus::Modified),
+            ]
+        );
+
+        let gone = &entries[1];
+        assert_eq!(gone.local_size, Some(3));
+        assert_eq!(gone.remote_size, None);
+        let added = &entries[2];
+        assert_eq!(added.local_size, None);
+        assert_eq!(added.remote_size, Some(4));
+    }
+
+    #[test]
+    fn test_file_changed_ignores_one_second_http_date_skew() {
+        assert!(!file_changed(5, Some(100), 5, Some(101)));
+        assert!(file_changed(5, Some(100), 5, Some(102)));
+        assert!(file_changed(4, Some(100), 5, Some(100)));
+        assert!(!file_changed(5, None, 5, Some(100)));
+    }
+
+    #[test]
+    fn test_preview_side_classifies_text_binary_and_oversize() {
+        let text = preview_side_from_bytes(b"hello\nworld\n", 12, Some(7));
+        assert_eq!(text.kind, PreviewKind::Text);
+        assert_eq!(text.text.as_deref(), Some("hello\nworld\n"));
+
+        let binary = preview_side_from_bytes(&[0x00, 0xff, 0x01], 3, None);
+        assert_eq!(binary.kind, PreviewKind::Binary);
+        assert_eq!(binary.text, None);
+
+        let oversize = vec![b'a'; MAX_PREVIEW_BYTES + 1];
+        let too_large = preview_side_from_bytes(&oversize, 999_999, None);
+        assert_eq!(too_large.kind, PreviewKind::TooLarge);
+        assert_eq!(too_large.size, 999_999);
+    }
+
 }

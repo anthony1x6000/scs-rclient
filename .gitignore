@@ -145,3 +145,8 @@ vite.config.js
 vite.config.d.ts
 .vite/
 /src-tauri/binaries
+
+# Flatpak/OSTree repo and Pages build output (published via gh-pages, never committed here)
+repo/
+repo.tar.gz
+_site/

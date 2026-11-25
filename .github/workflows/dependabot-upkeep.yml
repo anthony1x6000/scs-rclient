@@ -1,0 +1,144 @@
+name: Dependabot Upkeep
+
+# Keeps Dependabot PRs moving with no human in the loop.
+#
+# Three things strand a Dependabot PR on this repo:
+#   1. main requires branches to be up to date, so every merge to main makes
+#      the PR stale until its branch is refreshed.
+#   2. A dependency that is too new for the current toolchain/build turns CI
+#      red, and Dependabot does not retry a version it already proposed.
+#   3. Checks superseded by a rebase come back cancelled, which looks failed.
+#
+# The run below refreshes stale branches, retries failed-and-cancelled
+# workflows, and merges anything already green. It never closes a PR: a blocked
+# security update must stay visible until a compatible version ships, and
+# Dependabot will propose that version on its own schedule.
+#
+# It runs daily because refreshing a stale branch and arming auto-merge are
+# cheap and are what unblock a PR today; re-running a failed workflow costs a
+# full CI pass, so that happens only on the Wednesday run after the weekly
+# Dependabot schedule. A manual dispatch does everything.
+on:
+  schedule:
+    # Wednesday is the retry day: after the weekly npm/actions (Monday) and
+    # cargo (Tuesday) updates have opened their PRs and had one CI pass.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-upkeep
+  cancel-in-progress: false
+
+jobs:
+  upkeep:
+    name: Rebase, retry, and merge Dependabot PRs
+    runs-on: ubuntu-slim
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Upkeep
+        run: |
+          set -euo pipefail
+
+          # A label is the only state this job needs between runs: it marks a PR
+          # whose checks failed once, so a red run is visibly "handled" rather
+          # than silently abandoned. `dependabot-hold` is the human escape hatch.
+          # Re-running a red workflow means a full CI pass, so it is a weekly
+          # action; a manual dispatch always takes it.
+          retry_day=true
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$(date -u +%u)" != "3" ]; then
+            retry_day=false
+          fi
+
+          gh label create dependabot-retry --repo "$REPO" --color 1d76db \
+            --description "Dependabot PR whose checks failed; retried automatically" \
+            >/dev/null 2>&1 || true
+
+          prs=$(gh pr list --repo "$REPO" --state open --limit 100 \
+            --json number,headRefName,isDraft,mergeStateStatus,labels \
+            --jq '.[]
+                  | select(.headRefName | startswith("dependabot/"))
+                  | select(.isDraft | not)
+                  | select([.labels[].name] | index("dependabot-hold") | not)
+                  | [.number, .mergeStateStatus] | @tsv')
+
+          if [ -z "$prs" ]; then
+            echo "no open Dependabot PRs; nothing to do."
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r pr merge_state; do
+            [ -n "$pr" ] || continue
+            echo "::group::pr #$pr ($merge_state)"
+            sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid)
+
+            # Latest run per check name: a rebase supersedes earlier runs, and
+            # their cancelled copies share the same names as the fresh ones.
+            # --paginate prints one document per page, so the stream is
+            # collected before grouping rather than parsed per page.
+            rollup=$(gh api --paginate "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+              --jq '.check_runs[] | {i: .id, n: .name, s: .status, c: (.conclusion // "")}' \
+              | jq -s '[group_by(.n)[] | max_by(.i)]')
+            pending=$(jq '[.[] | select(.s != "completed")] | length' <<<"$rollup")
+            failed=$(jq '[.[] | select(.c == "failure" or .c == "cancelled" or .c == "timed_out"
+                                       or .c == "startup_failure" or .c == "action_required")] | length' <<<"$rollup")
+            total=$(jq 'length' <<<"$rollup")
+
+            if [ "$merge_state" = "DIRTY" ]; then
+              echo "conflicts with main; asking Dependabot to rebase."
+              gh pr comment "$pr" --repo "$REPO" --body "@dependabot rebase" >/dev/null \
+                || echo "  could not comment on the PR."
+            elif [ "$merge_state" = "BEHIND" ]; then
+              echo "branch is behind main; updating it to re-run the checks."
+              gh api -X PUT "repos/$REPO/pulls/$pr/update-branch" >/dev/null 2>&1 \
+                || gh pr comment "$pr" --repo "$REPO" --body "@dependabot rebase" >/dev/null 2>&1 \
+                || echo "  branch update and rebase request both refused."
+            elif [ "$pending" -gt 0 ]; then
+              echo "$pending check(s) still running; leaving it alone."
+            elif [ "$failed" -gt 0 ]; then
+              echo "$failed check(s) failed; marking for retry."
+              gh pr edit "$pr" --repo "$REPO" --add-label dependabot-retry >/dev/null 2>&1 \
+                || echo "  could not add the retry label."
+              if [ "$retry_day" != "true" ]; then
+                echo "  retries run on the Wednesday sweep; arming auto-merge only."
+                gh pr merge "$pr" --repo "$REPO" --auto --squash >/dev/null 2>&1 \
+                  || echo "  auto-merge could not be armed yet."
+                echo "::endgroup::"
+                continue
+              fi
+              echo "  re-running the failed pull-request workflows."
+              # Pull-request runs only: the push twin reports the same check
+              # names, so re-running both would double the CI cost for one PR.
+              gh api --paginate "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
+                --jq '.workflow_runs[]
+                       | select(.event == "pull_request")
+                       | select(.conclusion == "failure" or .conclusion == "cancelled")
+                       | .id' |
+              while read -r run; do
+                [ -n "$run" ] || continue
+                gh api -X POST "repos/$REPO/actions/runs/$run/rerun" >/dev/null 2>&1 \
+                  || echo "  run $run could not be re-run (already queued or past the re-run limit)."
+              done
+              gh pr merge "$pr" --repo "$REPO" --auto --squash >/dev/null 2>&1 \
+                || echo "  auto-merge could not be armed yet."
+            elif [ "$total" -gt 0 ]; then
+              echo "checks are green; merging."
+              if gh pr merge "$pr" --repo "$REPO" --squash >/dev/null 2>&1; then
+                gh pr edit "$pr" --repo "$REPO" --remove-label dependabot-retry >/dev/null 2>&1 || true
+              else
+                echo "  merge refused (branch may have moved); the next run retries."
+              fi
+            else
+              echo "no checks reported yet; leaving it alone."
+            fi
+            echo "::endgroup::"
+          done <<<"$prs"

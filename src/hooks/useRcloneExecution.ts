@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { loadAppSettings, excludedFoldersFor, type ExcludedFoldersByDir } from "../settings";
 import { BULK_MIN_FOLDERS, formatBulkSummary, runBulkSequential } from "../bulk";
 import { resolveExtensionFilter, type ExtensionFilterState } from "../extensionFilter";
+import type { ProgressState, WebdavProgress } from "../progress";
 
 export interface RcloneSettings {
   baseUrl: string;
@@ -53,17 +54,24 @@ export async function loadSettings(): Promise<RcloneSettings> {
 export function useRcloneExecution(
   onLog: (text: string | ((prev: string) => string)) => void,
   isRunning: boolean,
-  setIsRunning: (running: boolean) => void
+  setIsRunning: (running: boolean) => void,
+  onProgress?: (progress: ProgressState | null) => void
 ) {
   const runningRef = useRef(false);
   const cancelRequestedRef = useRef(false);
   const unlistenRef = useRef<UnlistenFn | null>(null);
+  const unlistenProgressRef = useRef<UnlistenFn | null>(null);
+  const lastProgressRef = useRef<ProgressState | null>(null);
 
   useEffect(() => {
     return () => {
       if (unlistenRef.current) {
         unlistenRef.current();
         unlistenRef.current = null;
+      }
+      if (unlistenProgressRef.current) {
+        unlistenProgressRef.current();
+        unlistenProgressRef.current = null;
       }
       runningRef.current = false;
     };
@@ -83,13 +91,34 @@ export function useRcloneExecution(
     }
   };
 
-  const finishRun = (onDone?: (code: number | null) => void, code: number | null = null) => {
+  /** Marks the last snapshot terminal so the bar becomes a done/failed strip. */
+  const finishProgress = (failed: boolean) => {
+    const last = lastProgressRef.current;
+    if (!last) {
+      onProgress?.(null);
+      return;
+    }
+    const terminal: ProgressState = { ...last, done: true, failed };
+    lastProgressRef.current = terminal;
+    onProgress?.(terminal);
+  };
+
+  const finishRun = (
+    onDone?: (code: number | null) => void,
+    code: number | null = null,
+    failed = code !== null && code !== 0
+  ) => {
     if (unlistenRef.current) {
       unlistenRef.current();
       unlistenRef.current = null;
     }
+    if (unlistenProgressRef.current) {
+      unlistenProgressRef.current();
+      unlistenProgressRef.current = null;
+    }
     runningRef.current = false;
     setIsRunning(false);
+    finishProgress(failed);
     onDone?.(code);
   };
 
@@ -136,6 +165,8 @@ export function useRcloneExecution(
     if (runningRef.current || isRunning) return;
     runningRef.current = true;
     cancelRequestedRef.current = false;
+    lastProgressRef.current = null;
+    onProgress?.(null);
     setIsRunning(true);
     log("Loading configuration...\n");
 
@@ -145,7 +176,7 @@ export function useRcloneExecution(
       const settings = await loadSettings();
       if (!settings.baseUrl) {
         log("Error: WebDAV URL must be configured.\n");
-        finishRun(opts?.onDone, null);
+        finishRun(opts?.onDone, null, true);
         return;
       }
 
@@ -153,7 +184,7 @@ export function useRcloneExecution(
       const singleSubdir = bulkFolders[0] ?? settings.selectedSubdir;
       if (bulkFolders.length === 0 && !singleSubdir) {
         log("Error: Please select a subdirectory first.\n");
-        finishRun(opts?.onDone, null);
+        finishRun(opts?.onDone, null, true);
         return;
       }
 
@@ -162,6 +193,15 @@ export function useRcloneExecution(
         log(event.payload);
       });
       unlistenRef.current = unlisten;
+
+      // Progress is best-effort: a dropped event only makes the bar coarser.
+      const unlistenProgress = await listen<WebdavProgress>("webdav-progress", (event) => {
+        if (!runningRef.current) return;
+        const next: ProgressState = { ...event.payload, done: false, failed: false };
+        lastProgressRef.current = next;
+        onProgress?.(next);
+      });
+      unlistenProgressRef.current = unlistenProgress;
 
       if (bulkFolders.length < BULK_MIN_FOLDERS) {
         log(
@@ -172,7 +212,7 @@ export function useRcloneExecution(
         );
         await invokeWebdavAction(action, settings, singleSubdir);
         log(`\nWebDAV operation finished successfully.\n`);
-        finishRun(opts?.onDone, 0);
+        finishRun(opts?.onDone, 0, false);
         return;
       }
 
@@ -196,10 +236,10 @@ export function useRcloneExecution(
         () => cancelRequestedRef.current,
       );
       log(`\n${formatBulkSummary(outcome)}\n`);
-      finishRun(opts?.onDone, outcome.failed.length > 0 ? 1 : 0);
+      finishRun(opts?.onDone, outcome.failed.length > 0 ? 1 : 0, outcome.failed.length > 0);
     } catch (e: any) {
       log(`\nWebDAV Error: ${e?.message || e}\n`);
-      finishRun(opts?.onDone, 1);
+      finishRun(opts?.onDone, 1, true);
     }
   };
 

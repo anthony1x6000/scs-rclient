@@ -1,0 +1,27 @@
+name: Repo Bloat Guard
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-bloat-guard-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Repo Bloat Guard
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check tracked artifacts and history size
+        run: bash scripts/check-repo-bloat.sh

@@ -2,7 +2,8 @@ use scs_rclient_lib::dav_client::Client;
 use scs_rclient_lib::webdav::{
     ExtensionFilter, ExtensionFilterMode, build_file_url, collect_local_files,
     collect_local_files_excluding, compute_sha256, ensure_remote_parent_dirs,
-    execute_webdav_action, execute_webdav_action_with_exclusions, list_remote_folders,
+    execute_webdav_action, execute_webdav_action_with_exclusions,
+    execute_webdav_action_with_progress, list_remote_folders, ActionProgress,
     list_remote_recursive, list_remote_recursive_with_exclusions_and_log,
     list_remote_recursive_with_options_and_log, normalize_exclude_folders,
     parse_propfind_xml, parse_webdav_date, relative_item_path, resolve_item_url,
@@ -11,6 +12,7 @@ use scs_rclient_lib::webdav::{
 use std::collections::HashSet;
 use std::fs;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 /// Returns the live WebDAV base URL, or `None` when the e2e server is not configured.
 fn live_base_url() -> Option<String> {
@@ -2924,4 +2926,92 @@ fn test_live_list_remote_folders_aggregates_sizes() {
     );
 
     remove_remote_tree(&client, &root_url, &cancel_flag);
+}
+
+#[test]
+fn test_live_progress_events_report_upload_and_download_counts() {
+    let Some(base_url) = live_base_url() else {
+        return;
+    };
+    let client = live_client();
+    let cancel_flag = AtomicBool::new(false);
+
+    let unique = format!(
+        "progress-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let remote_url = format!("{}/{}/", base_url.trim_end_matches('/'), unique);
+    let local_put = std::env::temp_dir().join(format!("scs-progress-put-{unique}"));
+    let local_get = std::env::temp_dir().join(format!("scs-progress-get-{unique}"));
+
+    write_local_file(&local_put, "a.txt", b"hello");
+    write_local_file(&local_put, "nested/b.txt", b"world!!");
+
+    let put_events = Arc::new(Mutex::new(Vec::<ActionProgress>::new()));
+    let put_sink = Arc::clone(&put_events);
+    let put_res = execute_webdav_action_with_progress(
+        &client,
+        "put",
+        &remote_url,
+        &local_put,
+        &cancel_flag,
+        None,
+        None,
+        &[],
+        None,
+        |p| put_sink.lock().unwrap().push(p),
+        |_| {},
+    );
+    assert!(put_res.is_ok(), "PUT failed: {put_res:?}");
+
+    let put_events = put_events.lock().unwrap();
+    let put_last = put_events.last().expect("PUT must emit progress");
+    assert_eq!(put_last.phase, "upload");
+    assert_eq!(put_last.total, 2);
+    assert_eq!(put_last.completed, 2);
+    assert_eq!(put_last.bytes_total, 12);
+    assert_eq!(put_last.bytes_done, 12);
+    assert!(
+        put_events.iter().any(|p| p.file.as_deref() == Some("a.txt")),
+        "upload progress must name the active file: {put_events:?}"
+    );
+
+    let get_events = Arc::new(Mutex::new(Vec::<ActionProgress>::new()));
+    let get_sink = Arc::clone(&get_events);
+    let get_res = execute_webdav_action_with_progress(
+        &client,
+        "get",
+        &remote_url,
+        &local_get,
+        &cancel_flag,
+        None,
+        None,
+        &[],
+        None,
+        |p| get_sink.lock().unwrap().push(p),
+        |_| {},
+    );
+    assert!(get_res.is_ok(), "GET failed: {get_res:?}");
+
+    let get_events = get_events.lock().unwrap();
+    let get_last = get_events.last().expect("GET must emit progress");
+    assert_eq!(get_last.phase, "download");
+    assert_eq!(get_last.total, 2);
+    assert_eq!(get_last.completed, 2);
+    assert_eq!(get_last.bytes_done, 12);
+    assert!(get_events.iter().any(|p| p.phase == "download"));
+    assert!(
+        get_events
+            .iter()
+            .any(|p| p.file.as_deref() == Some("nested/b.txt")),
+        "download progress must name the active file: {get_events:?}"
+    );
+
+    remove_remote_tree(&client, &remote_url, &cancel_flag);
+    let _ = fs::remove_dir_all(&local_put);
+    let _ = fs::remove_dir_all(&local_get);
 }

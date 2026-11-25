@@ -1,5 +1,29 @@
 # Changelog
 
+## Rust Memory-Safety Hardening
+
+- **Hostile Metadata Is Rejected, Not Trusted**: Server `getlastmodified` values are length-bounded before parsing, numeric fields are range-checked, and calendar arithmetic is checked, so an oversized or multi-byte-crafted date yields no timestamp instead of panicking. Server-advertised sizes and modification times saturate rather than overflow, so one hostile listing cannot crash listing, review, or transfer totals.
+- **Listing Cache Fails Closed**: The cache is read under a byte cap before deserialization, and an entry holding an oversized, over-deep, cross-origin, credential-bearing, or otherwise unrepresentable item is treated as a cache miss instead of a partial listing. A download whose remote modification time is out of range logs a warning and keeps the file's own timestamp.
+- **Worker Crashes Become Errors**: A panic in a progress callback or in a worker controller is reported as a failed operation; the app no longer aborts, and a partial transfer is never reported as success.
+- **Compile-Time Guards**: The WebDAV transport and listing modules forbid unsafe code, and unsafe operations inside an `unsafe fn` are denied crate-wide.
+- **Tests and CI**: Regression tests cover extreme dates, multi-byte timezone offsets, hostile sizes and timestamps, oversized and poisoned cache entries, and progress-callback panics. Rust unit tests with overflow checks now run on Linux and Windows, and the Copyparty job runs every Rust unit and integration test instead of a fixed subset.
+
+## Review Changes
+
+- **Compare Is Now a Review View**: The old "Compare Local vs Remote" action is now "Review Changes" and opens a review instead of writing size differences to the console.
+- **Two Side Bars**: The left bar is the local working copy and the right bar is the remote drive. Each is segmented by modified/removed or modified/added counts, with a matching scrollable file list showing a status glyph, path, and size.
+- **Diff Preview**: Clicking a row fetches both sides lazily and renders a line-numbered unified diff (red removed, green added). Binary files and files over 512 KiB show side-by-side size and modification time instead.
+- **Same Scope as Transfers**: The scan applies the active folder exclusions and extension filter, so the review lists exactly what Download or Upload would consider. Review is disabled while a bulk folder selection is active.
+- **Backend Safety**: The preview command revalidates traversal, re-pins the stored origin, and caps each side at 512 KiB; the review scan uses its own cancel flag and never writes to the working copy.
+- **Tests**: Rust unit tests cover added/removed/modified classification, HTTP-date skew, sorting, and text/binary/too-large previews; Vitest covers status grouping, bar segments, mtime formatting, the LCS diff, and the line cap.
+
+## Live Transfer Progress
+
+- **Progress Strip Above the Console**: Every upload, download, and preview now streams a `webdav-progress` event with the phase, active folder, completed/total files, bytes done/total, and the current file. A thin strip above the console shows an indeterminate scan pulse, a live bar, and the active path instead of leaving a long transfer indistinguishable from a hang.
+- **Downloads Count Bytes, Uploads Count Files**: Downloads emit per-MiB byte progress, so one large file visibly advances the bar. Uploads emit per-file completion from the worker pool, plus an authoritative final snapshot after every worker stops (parallel completion order cannot rewind the counts).
+- **Terminal Feedback**: A finished run stays visible for five seconds; a failed one stays for twelve with a red strip. Bulk runs label the active folder on every event.
+- **Tests**: The Vitest suite covers byte formatting, file-vs-byte ratio selection, the indeterminate scan state, and count clamping. A live Copyparty/D2L test asserts the final upload/download snapshots and active file names.
+
 ## Empty Remote Folder Downloads
 
 - **An Empty Folder Still Arrives as a Folder**: Downloading a subdirectory that exists on the drive but holds no files now creates the matching `<mount>/<SUBDIR>` folder locally, empty, and says so in the console (`Remote folder has no files; created empty local folder …`). Previously the scan found nothing to copy and created nothing, so an emptied or brand-new remote folder looked like the download had never run.
