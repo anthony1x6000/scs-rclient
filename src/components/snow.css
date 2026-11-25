@@ -1,0 +1,52 @@
+/* Seasonal snowfall layer. Kept faint and slow so it reads as background
+   texture, never as UI. Opacity comes from each flake's inline style. */
+.snow-flake {
+  position: absolute;
+  top: -8vh;
+  display: block;
+  line-height: 1;
+  color: #fff;
+  will-change: transform;
+  animation-name: snow-fall;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+.snow-flake-dot {
+  width: var(--flake-size);
+  height: var(--flake-size);
+  border-radius: 9999px;
+  background: #fff;
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.6);
+}
+
+.snow-flake-glyph {
+  font-size: var(--flake-size);
+  text-align: center;
+}
+
+@keyframes snow-fall {
+  0% {
+    transform: translate3d(0, 0, 0);
+  }
+  25% {
+    transform: translate3d(var(--flake-sway), 28vh, 0);
+  }
+  50% {
+    transform: translate3d(calc(var(--flake-sway) * -0.7), 55vh, 0);
+  }
+  75% {
+    transform: translate3d(var(--flake-sway), 82vh, 0);
+  }
+  100% {
+    transform: translate3d(0, 115vh, 0);
+  }
+}
+
+/* Reduced motion: hold the flakes still, scattered across the viewport. */
+@media (prefers-reduced-motion: reduce) {
+  .snow-flake {
+    top: var(--flake-top);
+    animation: none;
+  }
+}
