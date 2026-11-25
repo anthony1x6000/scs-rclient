@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Hardened in-repo replacement for the `rustydav` 0.1.3 HTTP layer.
 //!
 //! `rustydav` builds its own `reqwest::blocking::Client::new()` and exposes no

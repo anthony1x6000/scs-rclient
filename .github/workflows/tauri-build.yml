@@ -84,6 +84,57 @@ jobs:
       - name: Run unit tests
         run: pnpm test:unit
 
+  test-rust-unit:
+    name: Rust Unit Tests
+    runs-on: ubuntu-24.04
+    needs: [audit-glib, audit-pnpm]
+    env:
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install Linux dependencies
+        run: |
+          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+
+      - name: Run Rust unit tests with overflow checks
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked -- --test-threads=1
+
+  test-rust-unit-windows:
+    name: Rust Unit Tests (Windows)
+    runs-on: windows-latest
+    needs: [audit-glib, audit-pnpm]
+    env:
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Run Rust unit tests with overflow checks
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked -- --test-threads=1
+
   test-webdav-e2e:
     name: Test WebDAV Operations (Copyparty)
     # Pinned: ubuntu-latest's 26.04 rollout makes copyparty reject WebDAV writes
