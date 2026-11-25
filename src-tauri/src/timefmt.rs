@@ -362,6 +362,12 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_date_fields_before_tokenizing() {
+        let oversized = format!("Mon, 28 Sep 2026 13:45:09 GMT {}", "x ".repeat(1_000));
+        assert_eq!(parse_webdav_date(&oversized), None);
+    }
+
+    #[test]
     fn clamps_pre_epoch_dates() {
         assert_eq!(parse_webdav_date("1969-12-31T23:59:59Z"), Some(0));
     }

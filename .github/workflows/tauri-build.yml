@@ -84,6 +84,27 @@ jobs:
       - name: Run unit tests
         run: pnpm test:unit
 
+  test-rust-unit:
+    name: Rust Unit Tests
+    runs-on: ubuntu-24.04
+    needs: [audit-glib, audit-pnpm]
+    env:
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Install Linux dependencies
+        run: |
+          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+
+      - name: Run Rust unit tests with overflow checks
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked -- --test-threads=1
+
   test-webdav-e2e:
     name: Test WebDAV Operations (Copyparty)
     # Pinned: ubuntu-latest's 26.04 rollout makes copyparty reject WebDAV writes

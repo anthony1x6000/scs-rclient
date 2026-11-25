@@ -6591,6 +6591,31 @@ mod tests {
     }
 
     #[test]
+    fn test_upload_progress_panic_is_reported_without_aborting() {
+        let client = Client::init_internal("u", "p", "http://127.0.0.1:9/dav/", true)
+            .expect("loopback client must initialize in insecure test mode");
+        let cancel = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            upload_files_concurrently(
+                &client,
+                "http://127.0.0.1:9/dav/",
+                vec![(PathBuf::from("unused.txt"), "unused.txt".to_string(), 1)],
+                &cancel,
+                None,
+                None,
+                100,
+                false,
+                "Copied",
+                "put",
+                &|_| panic!("progress callback panic"),
+                &mut |_| {},
+            )
+        }));
+        assert!(result.is_ok(), "a callback panic must not abort the process");
+        assert!(result.unwrap().is_err(), "the worker panic must fail the upload");
+    }
+
+    #[test]
     fn test_remote_cache_lifecycle() {
         let temp_cache = std::env::temp_dir().join(format!("scs_cache_test_{}.json", std::process::id()));
         std::env::set_var("WEBDAV_CACHE_FILE", &temp_cache);
@@ -6735,6 +6760,30 @@ mod tests {
         clear_remote_cache().unwrap();
         assert!(!temp_cache.exists());
         std::env::remove_var("WEBDAV_CACHE_FILE");
+    }
+
+    #[test]
+    fn test_cache_reader_stops_at_the_size_cap() {
+        struct CountingReader<R> {
+            inner: R,
+            bytes_read: usize,
+        }
+
+        impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.inner.read(buffer)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+
+        let limit = 50 * 1024 * 1024;
+        let reader = CountingReader {
+            inner: std::io::repeat(0).take(limit as u64 + 1),
+            bytes_read: 0,
+        };
+        assert!(parse_cache_reader(reader).is_empty());
+        assert!(reader.bytes_read <= limit + 1, "cache read exceeded its cap");
     }
 
     #[test]
