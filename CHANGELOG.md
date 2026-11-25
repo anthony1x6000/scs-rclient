@@ -1,5 +1,11 @@
 # Changelog
 
+## Seasonal Snowfall
+
+- **Faint Snow Behind the UI**: From November 20th through December 31st the background renders thirty slow, drifting snowflakes at roughly 10% opacity, above the background photo and grain but behind every control, so the layer reads as texture instead of decoration.
+- **Off the Rest of the Year**: The snowfall is skipped entirely outside the season, never blocks input, and holds the flakes still instead of animating them when the operating system asks for reduced motion.
+- **Tests**: Vitest covers both season edges (November 19/20 and December 31/January 1) and the flake geometry bounds for opacity, size, fall duration, and sway.
+
 ## Rust Memory-Safety Hardening
 
 - **Hostile Metadata Is Rejected, Not Trusted**: Server `getlastmodified` values are length-bounded before parsing, numeric fields are range-checked, and calendar arithmetic is checked, so an oversized or multi-byte-crafted date yields no timestamp instead of panicking. Server-advertised sizes and modification times saturate rather than overflow, so one hostile listing cannot crash listing, review, or transfer totals.

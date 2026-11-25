@@ -1,6 +1,7 @@
 import { ReactNode, useState, useEffect, useMemo, useRef } from "react";
 import "./App.css";
 import images from "./images.json";
+import Snowfall from "./components/Snowfall";
 
 interface BackgroundWrapperProps {
   children: ReactNode;
@@ -141,6 +142,9 @@ function BackgroundWrapper({ children }: BackgroundWrapperProps) {
         className="fixed inset-0 z-0 mix-blend-multiply pointer-events-none"
         style={{ filter: GRAIN_FILTER }}
       />
+
+      {/* Seasonal snowfall: faint, behind the UI, Nov 20 - Dec 31 only */}
+      <Snowfall />
 
       {/* Render whatever is inside the wrapper */}
       <div className="relative z-10 min-h-screen">
