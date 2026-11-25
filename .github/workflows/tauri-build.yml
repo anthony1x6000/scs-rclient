@@ -496,6 +496,9 @@ jobs:
           publish_dir: ./_site
           publish_branch: gh-pages
           keep_files: false
+          # ostree .filez objects are content-addressed, so every deploy adds new
+          # blobs. Without this, history grows ~4 MB per release (260 MB by v0.2.0).
+          force_orphan: true
           user_name: 'Anthony'
           user_email: '33004321+anthony1x6000@users.noreply.github.com'
 
