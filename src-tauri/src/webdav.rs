@@ -952,6 +952,36 @@ fn same_auth_user(stored: &Option<String>, requested: Option<&str>) -> bool {
     }
 }
 
+fn cached_item_is_safe(remote_url: &str, item: &WebdavItem) -> bool {
+    if item.href.is_empty()
+        || item.href.len() > MAX_REMOTE_HREF_BYTES
+        || has_traversal_sequence(&item.href)
+    {
+        return false;
+    }
+    let resolved = resolve_item_url(remote_url, &item.href);
+    if !same_remote_origin(remote_url, &resolved) {
+        return false;
+    }
+    if let Ok(url) = reqwest::Url::parse(&resolved) {
+        if !url.username().is_empty() || url.password().is_some() {
+            return false;
+        }
+    }
+    let rel = relative_item_path(remote_url, &item.href);
+    if (!rel.is_empty() && !is_within_collection(remote_url, &resolved))
+        || has_traversal_sequence(&rel)
+        || !download_rel_path_within_segments(&rel)
+    {
+        return false;
+    }
+    item.mtime.map_or(true, |mtime| {
+        std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(mtime))
+            .is_some()
+    })
+}
+
 pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Vec<WebdavItem>> {
     let path = get_cache_file_path()?;
     let cache = read_cache_map(&path);
@@ -970,6 +1000,9 @@ pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Ve
             && same_auth_user(&entry.auth_user, auth_user)
     })?;
 
+    if entry.items.len() > MAX_REMOTE_ITEMS {
+        return None;
+    }
 
     let ttl = get_cache_ttl_secs();
     if ttl > 0 {
@@ -977,21 +1010,19 @@ pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Ve
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_secs();
-        if now.saturating_sub(entry.timestamp) > ttl {
+        if entry.timestamp > now || now.saturating_sub(entry.timestamp) > ttl {
             return None;
         }
     }
 
     let mut valid_items = Vec::with_capacity(entry.items.len());
     for item in &entry.items {
-        if has_traversal_sequence(&item.href) {
-            continue;
+        if cached_item_is_safe(remote_url, item) {
+            valid_items.push(item.clone());
         }
-        let rel = relative_item_path(remote_url, &item.href);
-        if has_traversal_sequence(&rel) {
-            continue;
-        }
-        valid_items.push(item.clone());
+    }
+    if valid_items.len() != entry.items.len() {
+        return None;
     }
 
     Some(valid_items)
@@ -999,9 +1030,12 @@ pub fn load_remote_cache(remote_url: &str, auth_user: Option<&str>) -> Option<Ve
 
 /// Saves remote items to the local cache file for remote_url and auth_user.
 ///
-/// Filters out any item with traversal sequences (`has_traversal_sequence`) to prevent cache poisoning.
+/// Filters out unsafe, oversized, over-deep, or unrepresentable items to prevent cache poisoning.
 /// Cached listings are keyed by normalized collection URL and authenticated user.
 pub fn save_remote_cache(remote_url: &str, auth_user: Option<&str>, items: &[WebdavItem]) {
+    if items.len() > MAX_REMOTE_ITEMS {
+        return;
+    }
     let path = match get_cache_file_path() {
         Some(p) => p,
         None => return,
@@ -1015,14 +1049,12 @@ pub fn save_remote_cache(remote_url: &str, auth_user: Option<&str>, items: &[Web
 
     let mut safe_items = Vec::with_capacity(items.len());
     for item in items {
-        if has_traversal_sequence(&item.href) {
-            continue;
+        if cached_item_is_safe(remote_url, item) {
+            safe_items.push(item.clone());
         }
-        let rel = relative_item_path(remote_url, &item.href);
-        if has_traversal_sequence(&rel) {
-            continue;
-        }
-        safe_items.push(item.clone());
+    }
+    if safe_items.len() != items.len() {
+        return;
     }
 
     if ambiguous_username(auth_user) {
@@ -3462,15 +3494,16 @@ fn aggregate_remote_folders_with_budget(
             return Err("Operation canceled by user.".to_string());
         }
         let rel = relative_item_path(remote_url, &item.href);
-        let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
-        if segments.is_empty() {
+        let segment_count = rel.split('/').filter(|s| !s.is_empty()).count();
+        if segment_count == 0 {
             continue;
         }
-        if segments.len() > MAX_REMOTE_PATH_SEGMENTS {
+        if segment_count > MAX_REMOTE_PATH_SEGMENTS {
             return Err(format!(
                 "Remote path exceeds the {MAX_REMOTE_PATH_SEGMENTS} segment limit. Aborting for security."
             ));
         }
+        let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
         if item.is_dir {
             // Register the folder (and, defensively, every ancestor).
             let mut acc = String::new();
@@ -5045,23 +5078,31 @@ where
                 });
 
                 if let Some(mtime_sec) = item.mtime {
-                    match std::fs::File::options().write(true).open(&target_file) {
-                        Ok(file) => {
-                            let sys_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_sec);
-                            let times = std::fs::FileTimes::new().set_modified(sys_time);
-                            if let Err(e) = file.set_times(times) {
+                    if let Some(sys_time) = std::time::UNIX_EPOCH
+                        .checked_add(std::time::Duration::from_secs(mtime_sec))
+                    {
+                        match std::fs::File::options().write(true).open(&target_file) {
+                            Ok(file) => {
+                                let times = std::fs::FileTimes::new().set_modified(sys_time);
+                                if let Err(e) = file.set_times(times) {
+                                    log(&format!(
+                                        "[{}/{}] WARNING: Could not preserve modification time on {}: {}\n",
+                                        current_num, total_files, rel, e
+                                    ));
+                                }
+                            }
+                            Err(e) => {
                                 log(&format!(
-                                    "[{}/{}] WARNING: Could not preserve modification time on {}: {}\n",
+                                    "[{}/{}] WARNING: Could not open {} to set modification time: {}\n",
                                     current_num, total_files, rel, e
                                 ));
                             }
                         }
-                        Err(e) => {
-                            log(&format!(
-                                "[{}/{}] WARNING: Could not open {} to set modification time: {}\n",
-                                current_num, total_files, rel, e
-                            ));
-                        }
+                    } else {
+                        log(&format!(
+                            "[{}/{}] WARNING: Remote modification time for {} is out of range.\n",
+                            current_num, total_files, rel
+                        ));
                     }
                 }
 
@@ -6778,22 +6819,20 @@ mod tests {
         assert_eq!(after_removal.len(), 1);
         assert!(after_removal[0].href.ends_with(".gitignore"));
 
-        // Path traversal rejection in cache
+        // Path traversal rejection in cache: reject the whole listing, never a partial subset.
+        clear_remote_cache().unwrap();
         let malicious_items = vec![
             WebdavItem::new("https://example.com/remote/files/../../etc/passwd", false, 100),
             WebdavItem::new("https://example.com/remote/files/%2e%2e/shadow", false, 100),
             WebdavItem::new("https://example.com/remote/files/valid.txt", false, 200),
         ];
         save_remote_cache(test_url, alice_user, &malicious_items);
-        let safe_loaded = load_remote_cache(test_url, alice_user).unwrap();
-        assert_eq!(safe_loaded.len(), 1);
-        assert_eq!(safe_loaded[0].size, 200);
+        assert!(load_remote_cache(test_url, alice_user).is_none());
 
         // Invalid rel_path updates and removals are safely ignored
         update_remote_cache_item(test_url, alice_user, "../malicious", 500, None);
         remove_remote_cache_item(test_url, alice_user, "../malicious");
-        let still_safe = load_remote_cache(test_url, alice_user).unwrap();
-        assert_eq!(still_safe.len(), 1);
+        assert!(load_remote_cache(test_url, alice_user).is_none());
 
         // Verify traversal sequence helper
         assert!(has_traversal_sequence("../secret"));
@@ -6825,28 +6864,61 @@ mod tests {
             items.len()
         );
 
-        let oversized_href = format!("https://example.com/remote/files/{}", "x".repeat(MAX_REMOTE_HREF_BYTES + 1));
-        save_remote_cache(
-            test_url,
-            alice_user,
-            &[WebdavItem::new(oversized_href, false, 1)],
+        let oversized_href = format!(
+            "https://example.com/remote/files/{}",
+            "x".repeat(MAX_REMOTE_HREF_BYTES + 1)
         );
-        assert!(load_remote_cache(test_url, alice_user).unwrap().is_empty());
-
         let deep_href = format!(
             "https://example.com/remote/files/{}file.bin",
             "a/".repeat(MAX_REMOTE_PATH_SEGMENTS + 1)
         );
-        save_remote_cache(test_url, alice_user, &[WebdavItem::new(deep_href, false, 1)]);
-        assert!(load_remote_cache(test_url, alice_user).unwrap().is_empty());
+        for href in [
+            oversized_href.clone(),
+            deep_href,
+            "https://evil.example/remote/files/report.pdf".to_string(),
+            "https://example.com/other/report.pdf".to_string(),
+            "https://user:pass@example.com/remote/files/report.pdf".to_string(),
+        ] {
+            clear_remote_cache().unwrap();
+            save_remote_cache(test_url, alice_user, &[WebdavItem::new(href, false, 1)]);
+            assert!(
+                load_remote_cache(test_url, alice_user).is_none(),
+                "an invalid cache entry must force a fresh listing"
+            );
+        }
 
+        clear_remote_cache().unwrap();
         save_remote_cache(
             test_url,
             alice_user,
             &[WebdavItem::new("https://example.com/remote/files/future.bin", false, 1)
                 .with_mtime(Some(u64::MAX))],
         );
-        assert!(load_remote_cache(test_url, alice_user).unwrap().is_empty());
+        assert!(load_remote_cache(test_url, alice_user).is_none());
+
+        let mixed_items = vec![
+            WebdavItem::new("https://example.com/remote/files/valid.bin", false, 1),
+            WebdavItem::new(oversized_href, false, 1),
+        ];
+        let mut mixed_cache = HashMap::new();
+        mixed_cache.insert(
+            cache_key(test_url, alice_user),
+            CachedRemoteListing {
+                remote_url: test_url.to_string(),
+                auth_user: Some("alice".to_string()),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                items: mixed_items,
+            },
+        );
+        write_cache_atomic(
+            &temp_cache,
+            &serde_json::to_string(&mixed_cache).unwrap(),
+        )
+        .unwrap();
+        assert!(load_remote_cache(test_url, alice_user).is_none());
 
         clear_remote_cache().unwrap();
         assert!(!temp_cache.exists());
