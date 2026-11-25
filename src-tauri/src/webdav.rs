@@ -3185,6 +3185,199 @@ pub struct RemoteFolder {
     pub size: u64,
 }
 
+/// How one path differs between the local working copy and the remote drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChangeStatus {
+    /// Exists remotely, not locally: Download would create it.
+    Added,
+    /// Exists locally, not remotely: the remote copy was removed.
+    Removed,
+    /// Exists on both sides with a different size or modification time.
+    Modified,
+}
+
+/// One row in the Review Changes view, carrying both sides' metadata so the
+/// preview header and the two side bars need no extra round trip.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeEntry {
+    /// Slash-separated path relative to the reviewed collection.
+    pub path: String,
+    pub status: ChangeStatus,
+    pub local_size: Option<u64>,
+    pub local_mtime: Option<u64>,
+    pub remote_size: Option<u64>,
+    pub remote_mtime: Option<u64>,
+}
+
+/// Upper bound on the bytes fetched for one side of a text preview. The diff
+/// only needs enough to recognize a change; larger files fall back to metadata.
+pub const MAX_PREVIEW_BYTES: usize = 512 * 1024;
+
+/// What a preview side can show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PreviewKind {
+    Text,
+    Binary,
+    TooLarge,
+    Missing,
+}
+
+/// One side of a file preview (local or remote).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSide {
+    pub kind: PreviewKind,
+    pub size: u64,
+    pub mtime: Option<u64>,
+    /// Present only for `kind == Text`.
+    pub text: Option<String>,
+}
+
+impl PreviewSide {
+    pub fn missing() -> Self {
+        Self {
+            kind: PreviewKind::Missing,
+            size: 0,
+            mtime: None,
+            text: None,
+        }
+    }
+}
+
+/// Both sides of one changed file, ready for the diff panel.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangePreview {
+    pub path: String,
+    pub local: PreviewSide,
+    pub remote: PreviewSide,
+}
+
+/// Classifies a bounded read into a preview side. A body longer than
+/// [`MAX_PREVIEW_BYTES`] is reported as too large before binary detection:
+/// the truncated tail must never be mistaken for the whole file.
+pub fn preview_side_from_bytes(bytes: &[u8], size: u64, mtime: Option<u64>) -> PreviewSide {
+    if bytes.len() > MAX_PREVIEW_BYTES {
+        return PreviewSide {
+            kind: PreviewKind::TooLarge,
+            size,
+            mtime,
+            text: None,
+        };
+    }
+    // NUL in the first 8 KiB is the same cheap heuristic git uses; invalid
+    // UTF-8 catches most other binaries (compressed archives, images).
+    let probe = &bytes[..bytes.len().min(8192)];
+    let has_nul = probe.contains(&0);
+    let text = if has_nul {
+        None
+    } else {
+        String::from_utf8(bytes.to_vec()).ok()
+    };
+    match text {
+        Some(text) => PreviewSide {
+            kind: PreviewKind::Text,
+            size,
+            mtime,
+            text: Some(text),
+        },
+        None => PreviewSide {
+            kind: PreviewKind::Binary,
+            size,
+            mtime,
+            text: None,
+        },
+    }
+}
+
+/// Same size but different timestamps (beyond HTTP-date rounding) still counts
+/// as changed: local edits preserve size surprisingly often.
+fn file_changed(
+    local_size: u64,
+    local_mtime: Option<u64>,
+    remote_size: u64,
+    remote_mtime: Option<u64>,
+) -> bool {
+    if local_size != remote_size {
+        return true;
+    }
+    match (local_mtime, remote_mtime) {
+        (Some(local), Some(remote)) => local.abs_diff(remote) > 1,
+        _ => false,
+    }
+}
+
+/// Builds the changed-file list for the Review Changes view. Both inputs are
+/// already filtered (exclusions and extension filters), so the view shows
+/// exactly the files a Download or Upload would consider. Unchanged files are
+/// omitted; the result is sorted by path.
+pub fn compute_change_entries(
+    remote_url: &str,
+    remote_items: &[WebdavItem],
+    local_files: &[(PathBuf, String, u64, Option<u64>)],
+) -> Vec<ChangeEntry> {
+    let mut remote_map: HashMap<String, (u64, Option<u64>)> = HashMap::new();
+    for item in remote_items {
+        if item.is_dir {
+            continue;
+        }
+        let rel = relative_item_path(remote_url, &item.href);
+        if rel.is_empty()
+            || !is_safe_relative_path(&rel)
+            || !download_rel_path_within_segments(&rel)
+        {
+            continue;
+        }
+        remote_map.insert(rel, (item.size, item.mtime));
+    }
+
+    let mut entries = Vec::new();
+    let mut local_paths: HashSet<String> = HashSet::new();
+    for (_, rel, local_size, local_mtime) in local_files {
+        local_paths.insert(rel.clone());
+        match remote_map.get(rel) {
+            None => entries.push(ChangeEntry {
+                path: rel.clone(),
+                status: ChangeStatus::Removed,
+                local_size: Some(*local_size),
+                local_mtime: *local_mtime,
+                remote_size: None,
+                remote_mtime: None,
+            }),
+            Some((remote_size, remote_mtime)) => {
+                if file_changed(*local_size, *local_mtime, *remote_size, *remote_mtime) {
+                    entries.push(ChangeEntry {
+                        path: rel.clone(),
+                        status: ChangeStatus::Modified,
+                        local_size: Some(*local_size),
+                        local_mtime: *local_mtime,
+                        remote_size: Some(*remote_size),
+                        remote_mtime: *remote_mtime,
+                    });
+                }
+            }
+        }
+    }
+    for (rel, (remote_size, remote_mtime)) in remote_map {
+        if local_paths.contains(&rel) {
+            continue;
+        }
+        entries.push(ChangeEntry {
+            path: rel,
+            status: ChangeStatus::Added,
+            local_size: None,
+            local_mtime: None,
+            remote_size: Some(remote_size),
+            remote_mtime,
+        });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
+}
+
 /// Server-derived download paths must stay shallow: a bounded listing would
 /// otherwise amplify into unbounded local directory creation, since one
 /// 4096-byte href can legally carry about 2000 path segments.
@@ -7069,4 +7262,66 @@ mod tests {
         let deep = "a/".repeat(MAX_REMOTE_PATH_SEGMENTS + 1);
         assert!(!download_rel_path_within_segments(&format!("{deep}file.txt")));
     }
+    #[test]
+    fn test_compute_change_entries_classifies_added_removed_modified() {
+        let remote_url = "https://example.test/dav/course/";
+        let remote_items = vec![
+            WebdavItem::new("/dav/course/", true, 0),
+            WebdavItem::new("/dav/course/new.txt", false, 4).with_mtime(Some(300)),
+            WebdavItem::new("/dav/course/same.txt", false, 5).with_mtime(Some(100)),
+            WebdavItem::new("/dav/course/edited.txt", false, 5).with_mtime(Some(200)),
+            WebdavItem::new("/dav/course/resized.txt", false, 9).with_mtime(Some(100)),
+        ];
+        let local_files = vec![
+            (PathBuf::from("/tmp/same.txt"), "same.txt".to_string(), 5, Some(101)),
+            (PathBuf::from("/tmp/edited.txt"), "edited.txt".to_string(), 5, Some(100)),
+            (PathBuf::from("/tmp/resized.txt"), "resized.txt".to_string(), 8, Some(100)),
+            (PathBuf::from("/tmp/gone.txt"), "gone.txt".to_string(), 3, Some(50)),
+        ];
+
+        let entries = compute_change_entries(remote_url, &remote_items, &local_files);
+        let rows: Vec<(&str, ChangeStatus)> =
+            entries.iter().map(|e| (e.path.as_str(), e.status)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("edited.txt", ChangeStatus::Modified),
+                ("gone.txt", ChangeStatus::Removed),
+                ("new.txt", ChangeStatus::Added),
+                ("resized.txt", ChangeStatus::Modified),
+            ]
+        );
+
+        let gone = &entries[1];
+        assert_eq!(gone.local_size, Some(3));
+        assert_eq!(gone.remote_size, None);
+        let added = &entries[2];
+        assert_eq!(added.local_size, None);
+        assert_eq!(added.remote_size, Some(4));
+    }
+
+    #[test]
+    fn test_file_changed_ignores_one_second_http_date_skew() {
+        assert!(!file_changed(5, Some(100), 5, Some(101)));
+        assert!(file_changed(5, Some(100), 5, Some(102)));
+        assert!(file_changed(4, Some(100), 5, Some(100)));
+        assert!(!file_changed(5, None, 5, Some(100)));
+    }
+
+    #[test]
+    fn test_preview_side_classifies_text_binary_and_oversize() {
+        let text = preview_side_from_bytes(b"hello\nworld\n", 12, Some(7));
+        assert_eq!(text.kind, PreviewKind::Text);
+        assert_eq!(text.text.as_deref(), Some("hello\nworld\n"));
+
+        let binary = preview_side_from_bytes(&[0x00, 0xff, 0x01], 3, None);
+        assert_eq!(binary.kind, PreviewKind::Binary);
+        assert_eq!(binary.text, None);
+
+        let oversize = vec![b'a'; MAX_PREVIEW_BYTES + 1];
+        let too_large = preview_side_from_bytes(&oversize, 999_999, None);
+        assert_eq!(too_large.kind, PreviewKind::TooLarge);
+        assert_eq!(too_large.size, 999_999);
+    }
+
 }

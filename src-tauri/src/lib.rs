@@ -1,3 +1,4 @@
+use std::io::Read;
 use tauri::Manager;
 
 mod timefmt;
@@ -389,6 +390,102 @@ fn clear_webdav_cache() -> Result<(), String> {
     webdav::clear_remote_cache()
 }
 
+/// The Tauri store file that holds the WebDAV base URL and saved username.
+const SETTINGS_STORE_FILE: &str = "settings.json";
+
+fn stored_setting(app: &tauri::AppHandle, key: &str) -> Option<String> {
+    // `store()` loads-or-creates, so the command does not depend on the
+    // renderer having registered the store first.
+    tauri_plugin_store::StoreExt::store(app, SETTINGS_STORE_FILE)
+        .ok()
+        .and_then(|store| store.get(key))
+        .and_then(|value| value.get("value").and_then(|v| v.as_str()).map(str::to_string))
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// Loads the authenticated WebDAV origin from the settings store + keyring.
+/// A username with no keyring entry fails loudly instead of authenticating
+/// with an empty password.
+fn load_stored_webdav(app: &tauri::AppHandle) -> Result<(String, String, String), String> {
+    let base_url = stored_setting(app, "webdav_url")
+        .ok_or("WebDAV URL is not configured. Set it in Settings first.")?;
+    let username = stored_setting(app, "saved_username")
+        .ok_or("No saved username. Save your credentials first.")?;
+    let password = get_credentials(username.clone())?;
+    Ok((base_url, username, password))
+}
+
+/// Rejects a derived remote URL whose scheme/host/port differs from the stored
+/// base, so a credentialed request can never leave the configured origin.
+fn ensure_same_origin(base_url: &str, remote_url: &str) -> Result<(), String> {
+    let (base_origin, remote_origin) = (
+        reqwest::Url::parse(base_url).map_err(|e| format!("Invalid stored WebDAV URL: {e}"))?,
+        reqwest::Url::parse(remote_url).map_err(|e| format!("Invalid remote URL: {e}"))?,
+    );
+    if base_origin.scheme() != remote_origin.scheme()
+        || base_origin.host_str() != remote_origin.host_str()
+        || base_origin.port() != remote_origin.port()
+    {
+        return Err("Resolved remote URL leaves the configured WebDAV origin.".to_string());
+    }
+    Ok(())
+}
+
+/// Reads one local preview side, capped at [`webdav::MAX_PREVIEW_BYTES`].
+fn preview_local_side(path: &std::path::Path) -> Result<webdav::PreviewSide, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => return Ok(webdav::PreviewSide::missing()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(webdav::PreviewSide::missing())
+        }
+        Err(e) => return Err(format!("Could not inspect {}: {e}", path.display())),
+    };
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("Could not open {}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(webdav::MAX_PREVIEW_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    Ok(webdav::preview_side_from_bytes(
+        &bytes,
+        meta.len(),
+        webdav::get_metadata_mtime(&meta),
+    ))
+}
+
+/// Reads one remote preview side, capped at [`webdav::MAX_PREVIEW_BYTES`].
+/// Redirects are disabled by the client, so the URL that was origin-checked is
+/// the only host this GET can reach.
+fn preview_remote_side(
+    client: &dav_client::Client,
+    url: &str,
+) -> Result<webdav::PreviewSide, String> {
+    let mut response = client
+        .get(url)
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+        return Ok(webdav::PreviewSide::missing());
+    }
+    if !status.is_success() {
+        return Err(format!("GET {url} returned HTTP {status}"));
+    }
+    let mtime = response
+        .headers()
+        .get("last-modified")
+        .and_then(|value| value.to_str().ok())
+        .and_then(webdav::parse_webdav_date);
+    let advertised = response.content_length();
+    let mut bytes = Vec::new();
+    response
+        .take(webdav::MAX_PREVIEW_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Could not read {url}: {e}"))?;
+    let size = advertised.unwrap_or(bytes.len() as u64);
+    Ok(webdav::preview_side_from_bytes(&bytes, size, mtime))
+}
+
 /// Lists every folder beneath the remote directory `subdir`, each with the total
 /// size of the files beneath it (PROPFIND metadata only — no downloads).
 ///
@@ -406,21 +503,7 @@ async fn list_remote_folders(
     subdir: String,
     concurrency: Option<usize>,
 ) -> Result<Vec<webdav::RemoteFolder>, String> {
-    const STORE_FILE: &str = "settings.json";
-    let stored_setting = |key: &str| -> Option<String> {
-        // `store()` loads-or-creates, so the command does not depend on the
-        // renderer having registered the store first.
-        tauri_plugin_store::StoreExt::store(&app, STORE_FILE)
-            .ok()
-            .and_then(|store| store.get(key))
-            .and_then(|value| value.get("value").and_then(|v| v.as_str()).map(str::to_string))
-            .filter(|v| !v.trim().is_empty())
-    };
-
-    let base_url = stored_setting("webdav_url")
-        .ok_or("WebDAV URL is not configured. Set it in Settings first.")?;
-    let username = stored_setting("saved_username")
-        .ok_or("No saved username. Save your credentials first.")?;
+    let (base_url, username, pass) = load_stored_webdav(&app)?;
     let concurrency = concurrency.map(|c| c.clamp(1, webdav::MAX_SCAN_CONCURRENCY));
 
     if webdav::has_traversal_segments(&subdir) {
@@ -429,23 +512,8 @@ async fn list_remote_folders(
 
     let remote_url = webdav::build_remote_url(&base_url, &subdir);
     webdav::validate_webdav_url(&remote_url)?;
-    // Belt-and-braces origin pinning: the built URL must stay on the stored
-    // base's scheme/host/port before credentials are attached, whatever
-    // build_remote_url does to the path.
-    let (base_origin, remote_origin) = (
-        reqwest::Url::parse(&base_url).map_err(|e| format!("Invalid stored WebDAV URL: {e}"))?,
-        reqwest::Url::parse(&remote_url).map_err(|e| format!("Invalid remote URL: {e}"))?,
-    );
-    if base_origin.scheme() != remote_origin.scheme()
-        || base_origin.host_str() != remote_origin.host_str()
-        || base_origin.port() != remote_origin.port()
-    {
-        return Err("Resolved remote URL leaves the configured WebDAV origin.".to_string());
-    }
+    ensure_same_origin(&base_url, &remote_url)?;
 
-    // A username with no keyring entry must fail loudly instead of
-    // authenticating with an empty password.
-    let pass = get_credentials(username.clone())?;
     let client = dav_client::Client::init(&username, &pass, &remote_url)?;
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
@@ -458,6 +526,122 @@ async fn list_remote_folders(
             Some(username.as_str()),
             |_| {},
         )
+    })
+    .await
+    .map_err(|e| format!("Task execution error: {}", e))?
+}
+
+/// Computes the changed-file list behind the Review Changes view: one walk of
+/// the local mount and one fresh recursive listing of the remote collection,
+/// both filtered by the same exclusions and extension filter as a transfer.
+///
+/// Returns metadata only — file bodies are fetched lazily by
+/// [`read_change_preview`] for the row the user clicks.
+#[tauri::command]
+async fn review_changes(
+    app: tauri::AppHandle,
+    subdir: String,
+    target_subdir: Option<String>,
+    concurrency: Option<usize>,
+    exclude_folders: Option<Vec<String>>,
+    extension_filter: Option<ExtensionFilterArgs>,
+) -> Result<Vec<webdav::ChangeEntry>, String> {
+    let (base_url, username, pass) = load_stored_webdav(&app)?;
+    let concurrency = concurrency.map(|c| c.clamp(1, webdav::MAX_SCAN_CONCURRENCY));
+
+    if webdav::has_traversal_segments(&subdir) {
+        return Err("Invalid subdirectory: \"..\" segments are not allowed.".to_string());
+    }
+
+    let remote_url = webdav::build_remote_url(&base_url, &subdir);
+    webdav::validate_webdav_url(&remote_url)?;
+    ensure_same_origin(&base_url, &remote_url)?;
+
+    let exclude_folders = webdav::normalize_exclude_folders(&exclude_folders.unwrap_or_default());
+    let extension_filter = extension_filter.map(ExtensionFilterArgs::into_filter).transpose()?;
+
+    let mount_dir = get_mount_dir(app.clone(), target_subdir)?;
+    let local_dir = if subdir.trim().is_empty() {
+        std::path::PathBuf::from(mount_dir)
+    } else {
+        join_contained(std::path::Path::new(&mount_dir), &subdir)?
+    };
+
+    let client = dav_client::Client::init(&username, &pass, &remote_url)?;
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let items = webdav::list_remote_recursive_with_exclusions_and_log(
+            &client,
+            &remote_url,
+            &cancel_flag,
+            concurrency,
+            Some(username.as_str()),
+            false,
+            &exclude_folders,
+            extension_filter.as_ref(),
+            |_| {},
+        )?;
+        let local_files = webdav::collect_local_files_with_mtime_excluding(
+            &local_dir,
+            &exclude_folders,
+            extension_filter.as_ref(),
+        );
+        Ok::<_, String>(webdav::compute_change_entries(
+            &remote_url,
+            &items,
+            &local_files,
+        ))
+    })
+    .await
+    .map_err(|e| format!("Task execution error: {}", e))?
+}
+
+/// Fetches both sides of one changed file for the diff preview. Text bodies are
+/// capped at [`webdav::MAX_PREVIEW_BYTES`]; larger or binary files come back as
+/// metadata-only sides. Paths are re-validated here rather than trusting the
+/// review rows from the renderer.
+#[tauri::command]
+async fn read_change_preview(
+    app: tauri::AppHandle,
+    subdir: String,
+    rel_path: String,
+    target_subdir: Option<String>,
+) -> Result<webdav::ChangePreview, String> {
+    if webdav::has_traversal_segments(&subdir) {
+        return Err("Invalid subdirectory: \"..\" segments are not allowed.".to_string());
+    }
+    if webdav::has_traversal_segments(&rel_path) || !webdav::is_safe_relative_path(&rel_path) {
+        return Err("Invalid file path.".to_string());
+    }
+
+    let (base_url, username, pass) = load_stored_webdav(&app)?;
+    let remote_url = webdav::build_remote_url(&base_url, &subdir);
+    webdav::validate_webdav_url(&remote_url)?;
+    ensure_same_origin(&base_url, &remote_url)?;
+
+    let file_url = webdav::build_file_url(&remote_url, &rel_path);
+    webdav::validate_webdav_url(&file_url)?;
+    ensure_same_origin(&base_url, &file_url)?;
+
+    let mount_dir = get_mount_dir(app.clone(), target_subdir)?;
+    let local_root = if subdir.trim().is_empty() {
+        std::path::PathBuf::from(mount_dir)
+    } else {
+        join_contained(std::path::Path::new(&mount_dir), &subdir)?
+    };
+    let local_path = webdav::safe_join_path(&local_root, &rel_path)?;
+
+    let client = dav_client::Client::init(&username, &pass, &remote_url)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let local = preview_local_side(&local_path)?;
+        let remote = preview_remote_side(&client, &file_url)?;
+        Ok::<_, String>(webdav::ChangePreview {
+            path: rel_path,
+            local,
+            remote,
+        })
     })
     .await
     .map_err(|e| format!("Task execution error: {}", e))?
@@ -520,6 +704,8 @@ pub fn run() {
             set_scan_concurrency,
             run_webdav_action,
             list_remote_folders,
+            review_changes,
+            read_change_preview,
             clear_webdav_cache
         ])
         .run(tauri::generate_context!())

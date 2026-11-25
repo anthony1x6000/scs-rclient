@@ -1,5 +1,14 @@
 # Changelog
 
+## Review Changes
+
+- **Compare Is Now a Review View**: The old "Compare Local vs Remote" action is now "Review Changes" and opens a review instead of writing size differences to the console.
+- **Two Side Bars**: The left bar is the local working copy and the right bar is the remote drive. Each is segmented by modified/removed or modified/added counts, with a matching scrollable file list showing a status glyph, path, and size.
+- **Diff Preview**: Clicking a row fetches both sides lazily and renders a line-numbered unified diff (red removed, green added). Binary files and files over 512 KiB show side-by-side size and modification time instead.
+- **Same Scope as Transfers**: The scan applies the active folder exclusions and extension filter, so the review lists exactly what Download or Upload would consider. Review is disabled while a bulk folder selection is active.
+- **Backend Safety**: The preview command revalidates traversal, re-pins the stored origin, and caps each side at 512 KiB; the review scan uses its own cancel flag and never writes to the working copy.
+- **Tests**: Rust unit tests cover added/removed/modified classification, HTTP-date skew, sorting, and text/binary/too-large previews; Vitest covers status grouping, bar segments, mtime formatting, the LCS diff, and the line cap.
+
 ## Live Transfer Progress
 
 - **Progress Strip Above the Console**: Every upload, download, and preview now streams a `webdav-progress` event with the phase, active folder, completed/total files, bytes done/total, and the current file. A thin strip above the console shows an indeterminate scan pulse, a live bar, and the active path instead of leaving a long transfer indistinguishable from a hang.
