@@ -213,6 +213,22 @@ fn set_scan_concurrency(threads: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Frontend wire format for one progress snapshot. The event name is
+/// `webdav-progress`; fields are camelCase so the React hook consumes them
+/// without a mapping layer.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebdavProgressPayload {
+    subdir: String,
+    action: String,
+    phase: String,
+    completed: usize,
+    total: usize,
+    bytes_done: u64,
+    bytes_total: u64,
+    file: Option<String>,
+}
+
 /// Frontend wire format for an extension filter: `{ mode: "whitelist"|"blacklist", extensions: [...] }`.
 #[derive(serde::Deserialize)]
 struct ExtensionFilterArgs {
@@ -312,12 +328,43 @@ async fn run_webdav_action(
 
     let client = dav_client::Client::init(&user, &pass, &remote_url)?;
     let app_handle = app.clone();
+    let progress_app = app.clone();
+    let progress_subdir = subdir.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         let emit_log = move |msg: &str| {
             let _ = app_handle.emit("webdav-log", msg);
         };
-        webdav::execute_webdav_action_with_exclusions(
+        // Transfers can report thousands of chunks; cap event traffic at ~10/s
+        // so IPC stays cheap while the bar still moves smoothly.
+        let started = std::time::Instant::now();
+        let last_emit = std::sync::atomic::AtomicU64::new(0);
+        let subdir_for_progress = progress_subdir;
+        let emit_progress = move |p: webdav::ActionProgress| {
+            let elapsed = started.elapsed().as_millis() as u64;
+            let previous = last_emit.load(Ordering::Relaxed);
+            // Per-file summaries (file is None once a file finishes) are rare
+            // and carry the counts the UI leaves on screen, so never drop them.
+            let summary = p.file.is_none() && p.completed > 0;
+            if !summary && elapsed.saturating_sub(previous) < 100 {
+                return;
+            }
+            last_emit.store(elapsed, Ordering::Relaxed);
+            let _ = progress_app.emit(
+                "webdav-progress",
+                WebdavProgressPayload {
+                    subdir: subdir_for_progress.clone(),
+                    action: p.action,
+                    phase: p.phase.to_string(),
+                    completed: p.completed,
+                    total: p.total,
+                    bytes_done: p.bytes_done,
+                    bytes_total: p.bytes_total,
+                    file: p.file,
+                },
+            );
+        };
+        webdav::execute_webdav_action_with_progress(
             &client,
             &action,
             &remote_url,
@@ -327,6 +374,7 @@ async fn run_webdav_action(
             auth_user.as_deref(),
             &exclude_folders,
             extension_filter.as_ref(),
+            emit_progress,
             emit_log,
         )
     })
