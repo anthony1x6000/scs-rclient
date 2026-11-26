@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   barSegments,
+  changeKind,
+  countChangeFilters,
   countStatuses,
+  filterChangeEntries,
   formatMtime,
   localEntries,
   remoteEntries,
@@ -88,5 +91,46 @@ describe("formatMtime", () => {
 
   it("handles unknown timestamps", () => {
     expect(formatMtime(null)).toBe("unknown");
+  });
+});
+
+describe("change kind filtering", () => {
+  const entries = [
+    entry({ path: "added.txt", status: "added", localSize: null, localMtime: null }),
+    entry({ path: "removed.txt", status: "removed", remoteSize: null, remoteMtime: null }),
+    entry({ path: "grew.txt", status: "modified" }),
+    entry({ path: "touched.txt", status: "modified", localSize: 10, remoteSize: 10 }),
+  ];
+
+  it("treats added, removed, and resized files as content changes", () => {
+    expect(changeKind(entries[0]!)).toBe("content");
+    expect(changeKind(entries[1]!)).toBe("content");
+    expect(changeKind(entries[2]!)).toBe("content");
+  });
+
+  it("treats a timestamp-only edit as a metadata change", () => {
+    expect(changeKind(entries[3]!)).toBe("metadata");
+  });
+
+  it("filters each list down to one bucket", () => {
+    expect(filterChangeEntries(entries, "content").map((item) => item.path)).toEqual([
+      "added.txt",
+      "removed.txt",
+      "grew.txt",
+    ]);
+    expect(filterChangeEntries(entries, "metadata").map((item) => item.path)).toEqual([
+      "touched.txt",
+    ]);
+  });
+
+  it("returns an unchanged copy for the all filter", () => {
+    const all = filterChangeEntries(entries, "all");
+    expect(all).toEqual(entries);
+    expect(all).not.toBe(entries);
+  });
+
+  it("counts every bucket", () => {
+    expect(countChangeFilters(entries)).toEqual({ all: 4, content: 3, metadata: 1 });
+    expect(countChangeFilters([])).toEqual({ all: 0, content: 0, metadata: 0 });
   });
 });

@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { excludedFoldersFor, loadAppSettings } from "../settings";
 import { resolveExtensionFilter } from "../extensionFilter";
 import {
   barSegments,
+  countChangeFilters,
   countStatuses,
+  filterChangeEntries,
   formatBytes,
   formatMtime,
   localEntries,
@@ -14,11 +16,23 @@ import {
   statusLabel,
   statusTextClass,
   type ChangeEntry,
+  type ChangeFilter,
+  type ChangeFilterCounts,
   type ChangePreview,
   type PreviewSide,
   type StatusCounts,
 } from "../changes";
-import { canDiffText, diffLines, diffStats, MAX_DIFF_LINES, type DiffRow } from "../diff";
+import {
+  annotateWordDiffs,
+  canDiffText,
+  changedBlocks,
+  diffLines,
+  diffStats,
+  stepChangedBlock,
+  MAX_DIFF_LINES,
+  type DiffRow,
+  type WordSegment,
+} from "../diff";
 
 interface ReviewChangesProps {
   subdir: string;
@@ -43,6 +57,7 @@ export default function ReviewChanges({
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [filter, setFilter] = useState<ChangeFilter>("all");
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -76,7 +91,6 @@ export default function ReviewChanges({
         });
         if (cancelled) return;
         setEntries(changes);
-        setSelected(changes[0]?.path ?? null);
       } catch (error: any) {
         if (cancelled) return;
         setLoadError(error?.message || String(error));
@@ -117,10 +131,28 @@ export default function ReviewChanges({
     };
   }, [selected, subdir, targetSubdir]);
 
-  const counts = useMemo(() => countStatuses(entries ?? []), [entries]);
-  const leftEntries = useMemo(() => localEntries(entries ?? []), [entries]);
-  const rightEntries = useMemo(() => remoteEntries(entries ?? []), [entries]);
-  const selectedEntry = entries?.find((entry) => entry.path === selected) ?? null;
+  const filterCounts = useMemo(() => countChangeFilters(entries ?? []), [entries]);
+  const visibleEntries = useMemo(
+    () => filterChangeEntries(entries ?? [], filter),
+    [entries, filter],
+  );
+  const counts = useMemo(() => countStatuses(visibleEntries), [visibleEntries]);
+  const leftEntries = useMemo(() => localEntries(visibleEntries), [visibleEntries]);
+  const rightEntries = useMemo(() => remoteEntries(visibleEntries), [visibleEntries]);
+  const selectedEntry = visibleEntries.find((entry) => entry.path === selected) ?? null;
+  const summary =
+    entries === null
+      ? null
+      : filter === "all"
+        ? `${entries.length} changed file${entries.length === 1 ? "" : "s"}`
+        : `${visibleEntries.length} of ${entries.length} changed files`;
+
+  // A filter can hide the selected row; move to the first row still on screen
+  // instead of leaving the preview pointing at an invisible file.
+  useEffect(() => {
+    if (visibleEntries.some((entry) => entry.path === selected)) return;
+    setSelected(visibleEntries[0]?.path ?? null);
+  }, [visibleEntries, selected]);
 
   return (
     <div
@@ -141,7 +173,7 @@ export default function ReviewChanges({
             <h2 className="text-sm font-medium">Review changes</h2>
             <p className="truncate text-[10px] text-gray-400">
               {subdir ? `${subdir}/` : "mount root"}
-              {entries !== null && ` · ${entries.length} changed file${entries.length === 1 ? "" : "s"}`}
+              {summary !== null && ` · ${summary}`}
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-1">
@@ -180,6 +212,8 @@ export default function ReviewChanges({
 
         {entries !== null && (
           <>
+            <FilterBar filter={filter} counts={filterCounts} onChange={setFilter} />
+
             <div className="grid shrink-0 grid-cols-2 gap-2 px-2 pt-2">
               <SideBar side="local" counts={counts} />
               <SideBar side="remote" counts={counts} />
@@ -192,6 +226,7 @@ export default function ReviewChanges({
                 side="local"
                 selected={selected}
                 onSelect={setSelected}
+                emptyMessage={emptyMessage(filter)}
               />
               <ChangeList
                 title="Remote drive"
@@ -199,6 +234,7 @@ export default function ReviewChanges({
                 side="remote"
                 selected={selected}
                 onSelect={setSelected}
+                emptyMessage={emptyMessage(filter)}
               />
             </div>
 
@@ -211,6 +247,57 @@ export default function ReviewChanges({
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+const FILTER_LABELS: { key: ChangeFilter; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "content", label: "Content" },
+  { key: "metadata", label: "Metadata" },
+];
+
+function emptyMessage(filter: ChangeFilter): string {
+  if (filter === "metadata") return "No metadata-only changes";
+  if (filter === "content") return "No content changes";
+  return "No changes";
+}
+
+function FilterBar({
+  filter,
+  counts,
+  onChange,
+}: {
+  filter: ChangeFilter;
+  counts: ChangeFilterCounts;
+  onChange: (filter: ChangeFilter) => void;
+}) {
+  return (
+    <div
+      className="flex shrink-0 flex-wrap items-center gap-1 px-2 pt-2"
+      role="group"
+      aria-label="Filter changes by kind"
+    >
+      <span className="mr-1 text-[10px] uppercase tracking-wide text-gray-500">Show</span>
+      {FILTER_LABELS.map(({ key, label }) => {
+        const active = key === filter;
+        return (
+          <button
+            key={key}
+            type="button"
+            aria-pressed={active}
+            onClick={() => onChange(key)}
+            className={`border px-2 py-0.5 text-[10px] tabular-nums transition-colors ${
+              active
+                ? "border-white/70 bg-white/15 text-white"
+                : "border-white/20 text-gray-300 hover:border-white/50"
+            }`}
+          >
+            {label}{" "}
+            <span className={active ? "text-gray-300" : "text-gray-500"}>{counts[key]}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -256,21 +343,27 @@ function ChangeList({
   side,
   selected,
   onSelect,
+  emptyMessage,
 }: {
   title: string;
   entries: ChangeEntry[];
   side: "local" | "remote";
   selected: string | null;
   onSelect: (path: string) => void;
+  emptyMessage: string;
 }) {
   return (
     <div className="flex min-h-0 flex-col border border-white/10 bg-black/20">
       <div className="shrink-0 border-b border-white/10 px-2 py-1 text-[10px] uppercase tracking-wide text-gray-400">
         {title} · {entries.length}
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto" role="listbox" aria-label={title}>
+      <div
+        className="scs-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain"
+        role="listbox"
+        aria-label={title}
+      >
         {entries.length === 0 && (
-          <p className="px-2 py-2 text-[11px] text-gray-500">No changes</p>
+          <p className="px-2 py-2 text-[11px] text-gray-500">{emptyMessage}</p>
         )}
         {entries.map((entry) => {
           const size = sideSize(entry, side);
@@ -301,17 +394,14 @@ function ChangeList({
   );
 }
 
-function PreviewPane({
-  entry,
-  preview,
-  loading,
-  error,
-}: {
+interface PreviewProps {
   entry: ChangeEntry | null;
   preview: ChangePreview | null;
   loading: boolean;
   error: string | null;
-}) {
+}
+
+function PreviewPane({ entry, preview, loading, error }: PreviewProps) {
   if (!entry) {
     return (
       <div className="flex flex-1 items-center justify-center px-4 text-center text-[11px] text-gray-500">
@@ -319,19 +409,95 @@ function PreviewPane({
       </div>
     );
   }
+  return <PreviewBody entry={entry} preview={preview} loading={loading} error={error} />;
+}
 
-  const localSide = preview?.local ?? previewSideFromEntry(entry, "local");
-  const remoteSide = preview?.remote ?? previewSideFromEntry(entry, "remote");
+function PreviewBody({
+  entry,
+  preview,
+  loading,
+  error,
+}: Omit<PreviewProps, "entry"> & { entry: ChangeEntry }) {
+  // Ignore a preview from the previous selection while the new one loads.
+  const shownPreview = preview !== null && preview.path === entry.path ? preview : null;
+  const localSide = shownPreview?.local ?? previewSideFromEntry(entry, "local");
+  const remoteSide = shownPreview?.remote ?? previewSideFromEntry(entry, "remote");
   const diffable =
     (localSide.kind === "text" || localSide.kind === "missing") &&
     (remoteSide.kind === "text" || remoteSide.kind === "missing");
   const localText = localSide.text ?? "";
   const remoteText = remoteSide.text ?? "";
-  const tooManyLines = diffable && !canDiffText(localText, remoteText);
-  const rows =
-    diffable && !tooManyLines && preview ? diffLines(localText, remoteText) : null;
-  const stats = rows ? diffStats(rows) : null;
-  const hasLineChanges = stats !== null && stats.added + stats.removed > 0;
+  const tooManyLines = useMemo(
+    () => diffable && !canDiffText(localText, remoteText),
+    [diffable, localText, remoteText],
+  );
+  const rows = useMemo(() => {
+    if (shownPreview === null || !diffable || tooManyLines) return null;
+    return annotateWordDiffs(diffLines(localText, remoteText));
+  }, [shownPreview, diffable, tooManyLines, localText, remoteText]);
+  const blocks = useMemo(() => (rows === null ? [] : changedBlocks(rows)), [rows]);
+  const stats = useMemo(() => (rows === null ? null : diffStats(rows)), [rows]);
+  const hasLineChanges = blocks.length > 0;
+
+  const [blockIndex, setBlockIndex] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const pendingScroll = useRef(false);
+
+  useEffect(() => {
+    pendingScroll.current = false;
+    setBlockIndex(0);
+    containerRef.current?.scrollTo({ top: 0, left: 0 });
+  }, [entry.path]);
+
+  useEffect(() => {
+    setBlockIndex((current) =>
+      Math.min(current, Math.max(blocks.length - 1, 0)),
+    );
+  }, [blocks.length]);
+
+  const scrollToBlock = useCallback(
+    (index: number) => {
+      const block = blocks[index];
+      if (block === undefined) return;
+      containerRef.current
+        ?.querySelector<HTMLElement>(`[data-row-index="${block.start}"]`)
+        ?.scrollIntoView({ block: "center" });
+    },
+    [blocks],
+  );
+
+  const navigate = useCallback(
+    (direction: 1 | -1) => {
+      if (blocks.length === 0) return;
+      const next = stepChangedBlock(blockIndex, blocks.length, direction);
+      if (next === blockIndex) {
+        scrollToBlock(blockIndex);
+        return;
+      }
+      pendingScroll.current = true;
+      setBlockIndex(next);
+    },
+    [blockIndex, blocks.length, scrollToBlock],
+  );
+
+  useEffect(() => {
+    if (!pendingScroll.current) return;
+    pendingScroll.current = false;
+    scrollToBlock(blockIndex);
+  }, [blockIndex, scrollToBlock]);
+
+  // Alt+↑/↓ mirrors the arrow buttons while the diff has changes to visit.
+  useEffect(() => {
+    if (blocks.length === 0) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+      event.preventDefault();
+      navigate(event.key === "ArrowDown" ? 1 : -1);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [blocks.length, navigate]);
 
   return (
     <section className="mt-2 flex min-h-0 flex-1 flex-col border-t border-white/15">
@@ -339,9 +505,14 @@ function PreviewPane({
         <span className="min-w-0 truncate font-mono text-[11px]" title={entry.path}>
           {entry.path}
         </span>
-        <span className={`shrink-0 text-[10px] ${statusTextClass(entry.status)}`}>
-          {statusLabel(entry.status)}
-        </span>
+        <div className="flex shrink-0 items-center gap-2">
+          <span className={`text-[10px] ${statusTextClass(entry.status)}`}>
+            {statusLabel(entry.status)}
+          </span>
+          {hasLineChanges && (
+            <ChangeNav index={blockIndex} count={blocks.length} onStep={navigate} />
+          )}
+        </div>
       </div>
 
       <div className="flex shrink-0 gap-2 px-2 pb-1.5">
@@ -355,17 +526,20 @@ function PreviewPane({
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto border-t border-white/10 font-mono text-[11px] leading-5">
+      <div
+        ref={containerRef}
+        className="scs-scrollbar min-h-0 flex-1 overflow-auto overscroll-contain border-t border-white/10 font-mono text-[11px] leading-5"
+      >
         {loading && <p className="px-2 py-2 text-gray-500">Loading preview…</p>}
         {!loading && error && (
           <p className="px-2 py-2 text-red-300">Could not load preview: {error}</p>
         )}
-        {!loading && !error && preview && !diffable && (
+        {!loading && !error && shownPreview && !diffable && (
           <p className="px-2 py-2 text-gray-400">
             {previewReason(localSide, remoteSide)} Metadata is shown above.
           </p>
         )}
-        {!loading && !error && preview && diffable && tooManyLines && (
+        {!loading && !error && shownPreview && diffable && tooManyLines && (
           <p className="px-2 py-2 text-gray-400">
             Too many lines to preview inline (limit {MAX_DIFF_LINES}); showing metadata
             only.
@@ -379,6 +553,46 @@ function PreviewPane({
         {!loading && !error && rows && hasLineChanges && <DiffView rows={rows} />}
       </div>
     </section>
+  );
+}
+
+function ChangeNav({
+  index,
+  count,
+  onStep,
+}: {
+  index: number;
+  count: number;
+  onStep: (direction: 1 | -1) => void;
+}) {
+  return (
+    <div
+      className="flex items-center gap-1 border border-white/10 px-1 text-[10px]"
+      role="group"
+      aria-label="Change navigation"
+    >
+      <button
+        type="button"
+        onClick={() => onStep(-1)}
+        aria-label="Previous change"
+        title="Previous change (Alt+↑)"
+        className="px-1 text-gray-300 hover:text-white"
+      >
+        ↑
+      </button>
+      <span className="min-w-8 text-center tabular-nums text-gray-400" aria-live="polite">
+        {Math.min(index + 1, count)} / {count}
+      </span>
+      <button
+        type="button"
+        onClick={() => onStep(1)}
+        aria-label="Next change"
+        title="Next change (Alt+↓)"
+        className="px-1 text-gray-300 hover:text-white"
+      >
+        ↓
+      </button>
+    </div>
   );
 }
 
@@ -401,6 +615,7 @@ function DiffView({ rows }: { rows: DiffRow[] }) {
         <div
           key={`${index}:${row.kind}`}
           role="row"
+          data-row-index={index}
           className={`grid grid-cols-[3rem_3rem_1.25rem_1fr] ${
             row.kind === "added"
               ? "bg-emerald-950/40"
@@ -426,21 +641,38 @@ function DiffView({ rows }: { rows: DiffRow[] }) {
           >
             {row.kind === "added" ? "+" : row.kind === "removed" ? "−" : " "}
           </span>
-          <span
-            className={`whitespace-pre pr-3 ${
-              row.kind === "added"
-                ? "text-emerald-100"
-                : row.kind === "removed"
-                  ? "text-red-100"
-                  : "text-gray-300"
-            }`}
-          >
-            {row.text || " "}
+          <span className={`whitespace-pre pr-3 ${lineTextClass(row.kind)}`}>
+            {row.segments === undefined ? (
+              row.text || " "
+            ) : (
+              row.segments.map((segment, segmentIndex) => (
+                <span key={segmentIndex} className={wordSegmentClass(segment)}>
+                  {segment.text}
+                </span>
+              ))
+            )}
           </span>
         </div>
       ))}
     </div>
   );
+}
+
+function lineTextClass(kind: DiffRow["kind"]): string {
+  if (kind === "added") return "text-emerald-100";
+  if (kind === "removed") return "text-red-100";
+  return "text-gray-300";
+}
+
+/** Changed words keep the line tint; the changed run gets its own solid tint. */
+function wordSegmentClass(segment: WordSegment): string {
+  if (segment.kind === "added") {
+    return "bg-emerald-500/40 text-emerald-50";
+  }
+  if (segment.kind === "removed") {
+    return "bg-red-500/40 text-red-50 line-through decoration-red-300/80";
+  }
+  return "";
 }
 
 /** Metadata-only fallback used until the preview request resolves. */
