@@ -1,5 +1,13 @@
 # Changelog
 
+## Review Change Filters, Word Diff, and Change Jumps
+
+- **Filter by Change Kind**: The review view has an All / Content / Metadata switch above the side bars. Added or removed files, and modified files whose size differs, count as content; a modified file with the same size but a newer timestamp counts as metadata. The switch carries per-bucket counts, and the file lists, side bars, and header summary follow the visible rows.
+- **Jump Between Changes**: A ↑/↓ control in the preview header (also Alt+↑ and Alt+↓) moves to the previous or next run of added and removed lines, wraps at both ends, and shows a position counter such as "2 / 7". No control is shown when the file has no line changes.
+- **Word-Level Highlights**: When a removed and added line differ by only part of their words, the edited words are highlighted in place — red with a strikethrough on the old line, green on the new line — instead of relying on the line tint alone. Pairs that share less than half their words stay whole-line.
+- **Themed Scrollbars**: The local and remote file lists and the diff pane now use the app's thin translucent scrollbar instead of the native one.
+- **Tests**: Vitest covers content-vs-metadata classification and filtering, word token diffing and row pairing, changed-block detection, and wrapped block navigation.
+
 ## Seasonal Snowfall
 
 - **Faint Snow Behind the UI**: From November 20th through December 31st the background renders thirty slow, drifting snowflakes at roughly 10% opacity, above the background photo and grain but behind every control, so the layer reads as texture instead of decoration.

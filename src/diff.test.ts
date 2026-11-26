@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  annotateWordDiffs,
   canDiffText,
+  changedBlocks,
   diffLines,
   diffStats,
+  diffWords,
   MAX_DIFF_LINES,
   splitLines,
+  stepChangedBlock,
 } from "./diff";
 
 describe("splitLines", () => {
@@ -77,5 +81,127 @@ describe("diffLines", () => {
   it("counts added and removed rows for the summary", () => {
     const rows = diffLines("a\nb\nc\n", "a\nB\nc\nd\n");
     expect(diffStats(rows)).toEqual({ added: 2, removed: 1 });
+  });
+});
+
+describe("diffWords", () => {
+  it("highlights only the changed word on each side", () => {
+    const diff = diffWords("the quick brown fox", "the quick red fox");
+    expect(diff).not.toBeNull();
+    expect(diff!.old.map((segment) => [segment.kind, segment.text])).toEqual([
+      ["equal", "the quick "],
+      ["removed", "brown"],
+      ["equal", " fox"],
+    ]);
+    expect(diff!.new.map((segment) => [segment.kind, segment.text])).toEqual([
+      ["equal", "the quick "],
+      ["added", "red"],
+      ["equal", " fox"],
+    ]);
+  });
+
+  it("keeps punctuation and spacing when reconstructing either side", () => {
+    const diff = diffWords("call(foo, bar)", "call(foo, baz)");
+    expect(diff).not.toBeNull();
+    expect(diff!.old.map((segment) => segment.text).join("")).toBe("call(foo, bar)");
+    expect(diff!.new.map((segment) => segment.text).join("")).toBe("call(foo, baz)");
+    expect(diff!.old.filter((segment) => segment.kind === "removed")).toEqual([
+      { kind: "removed", text: "bar" },
+    ]);
+    expect(diff!.new.filter((segment) => segment.kind === "added")).toEqual([
+      { kind: "added", text: "baz" },
+    ]);
+  });
+
+  it("declines a rewrite with too little in common", () => {
+    expect(diffWords("alpha beta", "gamma delta")).toBeNull();
+  });
+
+  it("ignores shared punctuation when judging similarity", () => {
+    expect(diffWords("f(x)", "g(y)")).toBeNull();
+    expect(diffWords("f(x)", "f(y)")).not.toBeNull();
+  });
+
+  it("declines a one-sided line", () => {
+    expect(diffWords("", "new line")).toBeNull();
+    expect(diffWords("old line", "")).toBeNull();
+  });
+});
+
+describe("annotateWordDiffs", () => {
+  it("attaches word segments to the paired removed and added rows", () => {
+    const rows = annotateWordDiffs(
+      diffLines("const color = red;\n", "const color = blue;\n"),
+    );
+    const removed = rows.find((row) => row.kind === "removed");
+    const added = rows.find((row) => row.kind === "added");
+    expect(removed?.segments).toEqual([
+      { kind: "equal", text: "const color = " },
+      { kind: "removed", text: "red" },
+      { kind: "equal", text: ";" },
+    ]);
+    expect(added?.segments).toEqual([
+      { kind: "equal", text: "const color = " },
+      { kind: "added", text: "blue" },
+      { kind: "equal", text: ";" },
+    ]);
+  });
+
+  it("pairs rows in order inside a multi-line block", () => {
+    const rows = annotateWordDiffs(
+      diffLines("red apple\nblue sky\n", "red berry\nblue sea\n"),
+    );
+    const removed = rows.filter((row) => row.kind === "removed");
+    expect(removed.map((row) => row.segments?.find((s) => s.kind === "removed")?.text)).toEqual([
+      "apple",
+      "sky",
+    ]);
+  });
+
+  it("finds the similar row when the positional row is a rewrite", () => {
+    const rows = annotateWordDiffs(
+      diffLines("return foo(1);\n", "return baz(3);\nreturn foo(2);\n"),
+    );
+    const removed = rows.find((row) => row.kind === "removed");
+    const [firstAdded, secondAdded] = rows.filter((row) => row.kind === "added");
+    expect(removed?.segments?.find((segment) => segment.kind === "removed")?.text).toBe("1");
+    expect(firstAdded?.segments).toBeUndefined();
+    expect(secondAdded?.segments?.find((segment) => segment.kind === "added")?.text).toBe("2");
+  });
+
+  it("leaves unpaired insertions, deletions, and rewrites without word segments", () => {
+    const insertion = annotateWordDiffs(diffLines("alpha\n", "alpha\nbeta\n"));
+    expect(insertion.find((row) => row.kind === "added")?.segments).toBeUndefined();
+
+    const rewrite = annotateWordDiffs(diffLines("alpha beta\n", "gamma delta\n"));
+    expect(rewrite.every((row) => row.segments === undefined)).toBe(true);
+  });
+});
+
+describe("changedBlocks", () => {
+  it("groups adjacent added and removed rows into one block", () => {
+    const rows = diffLines("a\nb\nc\nd\n", "a\nB\nC\nd\n");
+    expect(changedBlocks(rows)).toEqual([{ start: 1, end: 5 }]);
+  });
+
+  it("splits blocks on context rows and ignores unchanged text", () => {
+    const rows = diffLines("a\nb\nc\nd\ne\n", "a\nB\nc\nd\nE\n");
+    expect(changedBlocks(rows)).toEqual([
+      { start: 1, end: 3 },
+      { start: 5, end: 7 },
+    ]);
+    expect(changedBlocks(diffLines("same\n", "same\n"))).toEqual([]);
+  });
+});
+
+describe("stepChangedBlock", () => {
+  it("wraps at both ends", () => {
+    expect(stepChangedBlock(0, 3, 1)).toBe(1);
+    expect(stepChangedBlock(2, 3, 1)).toBe(0);
+    expect(stepChangedBlock(0, 3, -1)).toBe(2);
+  });
+
+  it("stays at -1 when there is nothing to jump to", () => {
+    expect(stepChangedBlock(0, 0, 1)).toBe(-1);
   });
 });

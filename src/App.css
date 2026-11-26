@@ -25,10 +25,10 @@ body {
   .no-scrollbar::-webkit-scrollbar {
     display: none;
   }
-  /* Thin themed scrollbar for the subdir dropdown list. */
+  /* Thin themed scrollbar shared by the folder dropdown, review lists, and diff. */
   .scs-scrollbar {
     scrollbar-width: thin;
-    scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+    scrollbar-color: rgba(255, 255, 255, 0.3) transparent;
   }
   .scs-scrollbar::-webkit-scrollbar {
     width: 6px;
@@ -38,10 +38,13 @@ body {
     background: transparent;
   }
   .scs-scrollbar::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.25);
+    background: rgba(255, 255, 255, 0.3);
   }
   .scs-scrollbar::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.45);
+    background: rgba(255, 255, 255, 0.5);
+  }
+  .scs-scrollbar::-webkit-scrollbar-corner {
+    background: transparent;
   }
   .fade-top {
     mask-image: linear-gradient(to bottom, transparent, black 18px);
