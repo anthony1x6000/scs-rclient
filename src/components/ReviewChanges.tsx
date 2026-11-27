@@ -15,6 +15,7 @@ import {
   statusGlyph,
   statusLabel,
   statusTextClass,
+  uploadDiff,
   type ChangeEntry,
   type ChangeFilter,
   type ChangeFilterCounts,
@@ -26,7 +27,6 @@ import {
   annotateWordDiffs,
   canDiffText,
   changedBlocks,
-  diffLines,
   diffStats,
   stepChangedBlock,
   MAX_DIFF_LINES,
@@ -41,9 +41,11 @@ interface ReviewChangesProps {
 }
 
 /**
- * GitHub-Desktop-style change review: a Local bar and a Remote bar whose
- * segments show removed/added/modified counts, two matching file lists, and a
- * preview pane with a line diff for text (metadata only for binaries).
+ * GitHub-Desktop-style change review, read from the upload side: the left bar
+ * and list are the working copy (new files green, edits amber), the right ones
+ * are the drive (edits plus remote-only files in red), and the preview pane
+ * diffs remote (old) against local (new) so green lines are what an upload
+ * writes.
  */
 export default function ReviewChanges({
   subdir,
@@ -433,7 +435,7 @@ function PreviewBody({
   );
   const rows = useMemo(() => {
     if (shownPreview === null || !diffable || tooManyLines) return null;
-    return annotateWordDiffs(diffLines(localText, remoteText));
+    return annotateWordDiffs(uploadDiff(localText, remoteText));
   }, [shownPreview, diffable, tooManyLines, localText, remoteText]);
   const blocks = useMemo(() => (rows === null ? [] : changedBlocks(rows)), [rows]);
   const stats = useMemo(() => (rows === null ? null : diffStats(rows)), [rows]);
@@ -516,8 +518,10 @@ function PreviewBody({
       </div>
 
       <div className="flex shrink-0 gap-2 px-2 pb-1.5">
-        <MetaCard label="Local" side={localSide} />
-        <MetaCard label="Remote" side={remoteSide} />
+        {/* Matches the diff's old/new column order: remote is the current
+            copy, local is what the upload writes. */}
+        <MetaCard label="Remote (current)" side={remoteSide} />
+        <MetaCard label="Local (upload)" side={localSide} />
         {stats && (
           <div className="flex shrink-0 items-center gap-2 border border-white/10 px-2 text-[10px] tabular-nums">
             <span className="text-emerald-300">+{stats.added}</span>

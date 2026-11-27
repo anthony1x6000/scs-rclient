@@ -3246,12 +3246,16 @@ pub struct RemoteFolder {
 }
 
 /// How one path differs between the local working copy and the remote drive.
+///
+/// Rows are classified from the working copy's side because Review Changes
+/// answers "what will the upload send?", never "what changed on the drive?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChangeStatus {
-    /// Exists remotely, not locally: Download would create it.
+    /// Exists locally, not remotely: an Upload creates it.
     Added,
-    /// Exists locally, not remotely: the remote copy was removed.
+    /// Exists remotely, not locally: the working copy has no copy to upload.
+    /// Only a mirror (sync) would delete it.
     Removed,
     /// Exists on both sides with a different size or modification time.
     Modified,
@@ -3372,8 +3376,11 @@ fn file_changed(
 
 /// Builds the changed-file list for the Review Changes view. Both inputs are
 /// already filtered (exclusions and extension filters), so the view shows
-/// exactly the files a Download or Upload would consider. Unchanged files are
-/// omitted; the result is sorted by path.
+/// exactly the files an Upload or Download would consider. Statuses are read
+/// from the upload side: a file that exists only in the working copy is
+/// [`ChangeStatus::Added`] (the upload creates it), and a file that exists only
+/// remotely is [`ChangeStatus::Removed`] (there is nothing local to upload).
+/// Unchanged files are omitted; the result is sorted by path.
 pub fn compute_change_entries(
     remote_url: &str,
     remote_items: &[WebdavItem],
@@ -3399,9 +3406,10 @@ pub fn compute_change_entries(
     for (_, rel, local_size, local_mtime) in local_files {
         local_paths.insert(rel.clone());
         match remote_map.get(rel) {
+            // New locally: the upload is what creates it on the drive.
             None => entries.push(ChangeEntry {
                 path: rel.clone(),
-                status: ChangeStatus::Removed,
+                status: ChangeStatus::Added,
                 local_size: Some(*local_size),
                 local_mtime: *local_mtime,
                 remote_size: None,
@@ -3425,9 +3433,10 @@ pub fn compute_change_entries(
         if local_paths.contains(&rel) {
             continue;
         }
+        // Remote-only: the working copy has nothing to upload for this path.
         entries.push(ChangeEntry {
             path: rel,
-            status: ChangeStatus::Added,
+            status: ChangeStatus::Removed,
             local_size: None,
             local_mtime: None,
             remote_size: Some(remote_size),
@@ -7513,7 +7522,7 @@ mod tests {
         let remote_url = "https://example.test/dav/course/";
         let remote_items = vec![
             WebdavItem::new("/dav/course/", true, 0),
-            WebdavItem::new("/dav/course/new.txt", false, 4).with_mtime(Some(300)),
+            WebdavItem::new("/dav/course/remote-only.txt", false, 4).with_mtime(Some(300)),
             WebdavItem::new("/dav/course/same.txt", false, 5).with_mtime(Some(100)),
             WebdavItem::new("/dav/course/edited.txt", false, 5).with_mtime(Some(200)),
             WebdavItem::new("/dav/course/resized.txt", false, 9).with_mtime(Some(100)),
@@ -7522,7 +7531,12 @@ mod tests {
             (PathBuf::from("/tmp/same.txt"), "same.txt".to_string(), 5, Some(101)),
             (PathBuf::from("/tmp/edited.txt"), "edited.txt".to_string(), 5, Some(100)),
             (PathBuf::from("/tmp/resized.txt"), "resized.txt".to_string(), 8, Some(100)),
-            (PathBuf::from("/tmp/gone.txt"), "gone.txt".to_string(), 3, Some(50)),
+            (
+                PathBuf::from("/tmp/local-only.txt"),
+                "local-only.txt".to_string(),
+                3,
+                Some(50),
+            ),
         ];
 
         let entries = compute_change_entries(remote_url, &remote_items, &local_files);
@@ -7532,18 +7546,37 @@ mod tests {
             rows,
             vec![
                 ("edited.txt", ChangeStatus::Modified),
-                ("gone.txt", ChangeStatus::Removed),
-                ("new.txt", ChangeStatus::Added),
+                ("local-only.txt", ChangeStatus::Added),
+                ("remote-only.txt", ChangeStatus::Removed),
                 ("resized.txt", ChangeStatus::Modified),
             ]
         );
 
-        let gone = &entries[1];
-        assert_eq!(gone.local_size, Some(3));
-        assert_eq!(gone.remote_size, None);
-        let added = &entries[2];
-        assert_eq!(added.local_size, None);
-        assert_eq!(added.remote_size, Some(4));
+        let local_only = &entries[1];
+        assert_eq!(local_only.local_size, Some(3));
+        assert_eq!(local_only.remote_size, None);
+        let remote_only = &entries[2];
+        assert_eq!(remote_only.local_size, None);
+        assert_eq!(remote_only.remote_size, Some(4));
+    }
+
+    #[test]
+    fn test_local_only_file_is_added_because_upload_creates_it() {
+        let remote_url = "https://example.test/dav/course/";
+        let remote_items = vec![WebdavItem::new("/dav/course/", true, 0)];
+        let local_files = vec![(
+            PathBuf::from("/tmp/fresh.txt"),
+            "fresh.txt".to_string(),
+            7,
+            Some(400),
+        )];
+
+        let entries = compute_change_entries(remote_url, &remote_items, &local_files);
+        assert_eq!(entries.len(), 1);
+        // A green `+` row: the file is new locally, so an upload creates it.
+        assert_eq!(entries[0].status, ChangeStatus::Added);
+        assert_eq!(entries[0].local_size, Some(7));
+        assert_eq!(entries[0].remote_size, None);
     }
 
     #[test]

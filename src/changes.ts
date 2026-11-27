@@ -1,6 +1,14 @@
 
+import { diffLines, type DiffRow } from "./diff";
+
 export { formatBytes } from "./progress";
 
+/**
+ * `added` and `removed` describe the local working copy, because Review Changes
+ * answers "what will the upload send?". `added` exists only locally (the upload
+ * creates it); `removed` exists only remotely (there is no local copy to send).
+ * Neither word ever refers to the drive having changed.
+ */
 export type ChangeStatus = "added" | "removed" | "modified";
 
 /** Mirrors the camelCase `ChangeEntry` serialized by the Rust command. */
@@ -84,16 +92,16 @@ export function countStatuses(entries: readonly ChangeEntry[]): StatusCounts {
 }
 
 /**
- * Left bar: what exists locally and is not identical remotely. Remote-only
- * additions have no local row, so they are excluded.
+ * Left bar: the rows the working copy has: new files and edits. Remote-only
+ * rows have no local copy, so they belong on the right.
  */
 export function localEntries(entries: readonly ChangeEntry[]): ChangeEntry[] {
-  return entries.filter((entry) => entry.status !== "added");
+  return entries.filter((entry) => entry.status !== "removed");
 }
 
-/** Right bar: remote rows. Locally-removed files have no remote row. */
+/** Right bar: remote rows. A new local file has no remote row yet. */
 export function remoteEntries(entries: readonly ChangeEntry[]): ChangeEntry[] {
-  return entries.filter((entry) => entry.status !== "removed");
+  return entries.filter((entry) => entry.status !== "added");
 }
 
 export interface BarSegment {
@@ -104,8 +112,9 @@ export interface BarSegment {
 }
 
 /**
- * The statuses each side bar can show. Local can show removed + modified;
- * remote can show added + modified. Order is the visual segment order.
+ * The statuses each side bar can show. The local bar is the working copy's
+ * rows (new files green, edits amber); the remote bar shows edits and
+ * remote-only files (red). Order is the visual segment order.
  */
 export function barSegments(
   side: "local" | "remote",
@@ -114,24 +123,37 @@ export function barSegments(
   if (side === "local") {
     return [
       { key: "modified", label: "modified", count: counts.modified, className: "bg-amber-400/80" },
-      { key: "removed", label: "removed", count: counts.removed, className: "bg-red-400/80" },
+      { key: "added", label: "new", count: counts.added, className: "bg-emerald-400/80" },
     ];
   }
   return [
     { key: "modified", label: "modified", count: counts.modified, className: "bg-amber-400/80" },
-    { key: "added", label: "added", count: counts.added, className: "bg-emerald-400/80" },
+    { key: "removed", label: "remote only", count: counts.removed, className: "bg-red-400/80" },
   ];
 }
 
+/**
+ * Wording answers "what will the upload do with this path?" instead of
+ * describing the drive, so a file that only exists locally reads as a new
+ * upload rather than as a remote removal.
+ */
 export function statusLabel(status: ChangeStatus): string {
   switch (status) {
     case "added":
-      return "Added remotely";
+      return "New · will upload";
     case "removed":
-      return "Removed remotely";
+      return "Remote only · no local copy";
     case "modified":
       return "Modified";
   }
+}
+
+/**
+ * Line diff for the review: the remote copy is the old side and the local copy
+ * is the new side, so the green lines are what the upload writes to the drive.
+ */
+export function uploadDiff(localText: string, remoteText: string): DiffRow[] {
+  return diffLines(remoteText, localText);
 }
 
 export function statusGlyph(status: ChangeStatus): string {
