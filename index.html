@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>scs-rclient Flatpak Repository (scs-rclient)</title>
+</head>
+<body>
+  <main>
+<h1 dir="auto">scs-rclient</h1>
+<p dir="auto">Native WebDAV desktop client</p>
+<p dir="auto"><a target="_blank" rel="noopener noreferrer" href="docs/screenshot.png"><img src="docs/screenshot.png" alt="scs-rclient main window" style="max-width: 100%;"></a></p>
+<p dir="auto"><a target="_blank" rel="noopener noreferrer" href="src-tauri/icons/128x128@2x.png"><img src="src-tauri/icons/128x128@2x.png" alt="scs-rclient Icon" style="max-width: 100%;"></a></p>
+<h2 dir="auto">Installation</h2>
+<h3 dir="auto">Install on Windows</h3>
+<p dir="auto">Grab the installer from the <a href="https://github.com/anthony1x6000/scs-rclient/releases/latest">latest release</a>: download <code class="notranslate">scs-rclient-win-installer.exe</code> and run it.</p>
+<h3 dir="auto">Install from Flatpak repository</h3>
+<p dir="auto">With the Flatpak repository, you get automatic updates whenever a new version is released.</p>
+<p dir="auto">Ensure Flathub and the scs-rclient repository are added:</p>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate"><span class="pl-c"><span class="pl-c">#</span> Add Flathub for runtime dependencies</span>
+flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+<span class="pl-c"><span class="pl-c">#</span> Add scs-rclient repository</span>
+flatpak remote-add --if-not-exists --user scs-rclient https://anthony1x6000.github.io/scs-rclient/online.anthonyis.scs-rclient.flatpakrepo</pre></div>
+<p dir="auto">Install:</p>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate">flatpak install --user scs-rclient online.anthonyis.scs-rclient</pre></div>
+<p dir="auto">With the repo added, you can check for updates with:</p>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate">flatpak update</pre></div>
+<h3 dir="auto">Install the standalone .flatpak (no repository)</h3>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate">flatpak install --user https://github.com/anthony1x6000/scs-rclient/releases/latest/download/scs-rclient-linux.flatpak</pre></div>
+<h2 dir="auto">Run the app</h2>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate">flatpak run online.anthonyis.scs-rclient</pre></div>
+<h2 dir="auto">Default permissions (Flatpak build only)</h2>
+<blockquote>
+<p dir="auto">These apply to the Flatpak build, which runs sandboxed. The native packages<br>
+below (AppImage, DEB, RPM, NSIS/portable EXE) run with full user privileges.</p>
+</blockquote>
+<ul dir="auto">
+<li><code class="notranslate">~/Documents/scs-rclient</code> (create)</li>
+<li>Secret Service / Keyring (<code class="notranslate">org.freedesktop.secrets</code>, <code class="notranslate">org.freedesktop.portal.Secret</code>, <code class="notranslate">org.kde.kwalletd5/6</code>)</li>
+<li>Network access (<code class="notranslate">--share=network</code>)</li>
+<li>Display server access (X11 &amp; Wayland), GPU (<code class="notranslate">--device=dri</code>) + IPC (<code class="notranslate">--share=ipc</code>)</li>
+<li><code class="notranslate">WEBKIT_DISABLE_DMABUF_RENDERER=1</code> env workaround</li>
+</ul>
+<p dir="auto">If you need access to other directories for file synchronization, use <a href="https://flathub.org/en/apps/com.github.tchx84.Flatseal" rel="nofollow">Flatseal</a> or grant a specific folder:</p>
+<div class="highlight highlight-source-shell" dir="auto"><pre class="notranslate"><span class="pl-c"><span class="pl-c">#</span> Grant access to Documents folder</span>
+flatpak override --user --filesystem=<span class="pl-k">~</span>/Documents online.anthonyis.scs-rclient</pre></div>
+<blockquote>
+<p dir="auto">Avoid <code class="notranslate">flatpak override --filesystem=host</code>: it exposes your entire home<br>
+directory to the app. Prefer per-folder grants.</p>
+</blockquote>
+<h2 dir="auto">Other release packages</h2>
+<p dir="auto">Standalone release binaries are also available from <a href="https://github.com/anthony1x6000/scs-rclient/releases/latest">GitHub Releases</a>:</p>
+<ul dir="auto">
+<li><strong>Linux</strong>: AppImage, DEB, RPM, Flatpak</li>
+<li><strong>Windows</strong>: Portable EXE, Icon-free portable EXE, Installer EXE</li>
+</ul>
+<h2 dir="auto">Security</h2>
+<p dir="auto">This project is audited with the <a href="https://github.com/cloudflare/security-audit-skill">Cloudflare security-audit skill</a>. Confirmed findings are fixed before the release that ships them. Recent passes hardened WebDAV listing and download handling against hostile or compromised servers (cancel- and deadline-bounded listing bodies, bounded derived folder state, and capped local path depth), and bounded the metadata and listing cache read from those servers (checked date and size arithmetic, a byte-capped cache read, and fail-closed cache entries).</p>
+<p dir="auto">Windows portable builds are scanned with VirusTotal before release, and the verdict is appended to the release notes.</p>
+<p dir="auto">To report a vulnerability, use <a href="https://github.com/anthony1x6000/scs-rclient/security/advisories/new">GitHub security advisories</a> instead of a public issue.</p>
+  </main>
+</body>
+</html>
