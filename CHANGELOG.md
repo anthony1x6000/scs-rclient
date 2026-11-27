@@ -1,5 +1,13 @@
 # Changelog
 
+## Review Changes: Upload Perspective
+
+- **Green Means Upload**: Review Changes now classifies each row by what it means for the working copy, not by what the drive did. A file that exists only in the working copy is **Added** (green `+`, "New · will upload"), so a new local file reads as the upload that creates it instead of the old red "Removed remotely", which only meant the drive does not have it yet.
+- **Remote-Only Rows Say So**: A row that exists only on the drive is **Removed** and labeled "Remote only · no local copy"; there is nothing local to upload, and only a mirror sync would delete it.
+- **Side Bars Follow Suit**: The local bar counts the working copy's new (green) and modified (amber) files, and the remote bar counts modified (amber) and remote-only (red) files, so a file that only exists locally no longer shows up on the remote side.
+- **Diffs Read in Upload Direction**: The remote copy is the diff's old side and the local copy the new side, so green lines are what the upload writes. The metadata cards order Remote (current) → Local (upload) to match.
+- **Tests**: Rust covers a local-only file classifying as `Added`; Vitest covers the side-bar split, segment colors and order, the upload-direction diff, and the new labels.
+
 ## Review Change Filters, Word Diff, and Change Jumps
 
 - **Filter by Change Kind**: The review view has an All / Content / Metadata switch above the side bars. Added or removed files, and modified files whose size differs, count as content; a modified file with the same size but a newer timestamp counts as metadata. The switch carries per-bucket counts, and the file lists, side bars, and header summary follow the visible rows.

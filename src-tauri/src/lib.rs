@@ -536,6 +536,8 @@ async fn list_remote_folders(
 /// Computes the changed-file list behind the Review Changes view: one walk of
 /// the local mount and one fresh recursive listing of the remote collection,
 /// both filtered by the same exclusions and extension filter as a transfer.
+/// Rows describe the upload: a file that exists only in the working copy is
+/// `added` (it will be uploaded), not a remote removal.
 ///
 /// Returns metadata only — file bodies are fetched lazily by
 /// [`read_change_preview`] for the row the user clicks.

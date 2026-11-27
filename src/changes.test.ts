@@ -10,6 +10,7 @@ import {
   remoteEntries,
   statusGlyph,
   statusLabel,
+  uploadDiff,
   type ChangeEntry,
 } from "./changes";
 
@@ -42,44 +43,61 @@ describe("countStatuses", () => {
 });
 
 describe("side bars", () => {
+  // `added` means the file exists only in the working copy, so only a local
+  // row can show it; `removed` is the remote-only mirror image.
   const entries = [
-    entry({ path: "added.txt", status: "added", localSize: null, localMtime: null }),
-    entry({ path: "removed.txt", status: "removed", remoteSize: null, remoteMtime: null }),
+    entry({ path: "new-local.txt", status: "added", remoteSize: null, remoteMtime: null }),
+    entry({ path: "remote-only.txt", status: "removed", localSize: null, localMtime: null }),
     entry({ path: "changed.txt", status: "modified" }),
   ];
 
-  it("splits modified files onto both sides and single-sided files to one", () => {
+  it("keeps a new local file on the local side and a remote-only file on the remote side", () => {
     expect(localEntries(entries).map((e) => e.path)).toEqual([
-      "removed.txt",
+      "new-local.txt",
       "changed.txt",
     ]);
     expect(remoteEntries(entries).map((e) => e.path)).toEqual([
-      "added.txt",
+      "remote-only.txt",
       "changed.txt",
     ]);
   });
 
-  it("builds local and remote bar segments in display order", () => {
+  it("paints new local files green locally and remote-only files red remotely", () => {
     const counts = countStatuses(entries);
-    expect(barSegments("local", counts).map((s) => [s.key, s.count])).toEqual([
-      ["modified", 1],
-      ["removed", 1],
+    expect(barSegments("local", counts).map((s) => [s.key, s.count, s.className])).toEqual([
+      ["modified", 1, "bg-amber-400/80"],
+      ["added", 1, "bg-emerald-400/80"],
     ]);
-    expect(barSegments("remote", counts).map((s) => [s.key, s.count])).toEqual([
-      ["modified", 1],
-      ["added", 1],
+    expect(barSegments("remote", counts).map((s) => [s.key, s.count, s.className])).toEqual([
+      ["modified", 1, "bg-amber-400/80"],
+      ["removed", 1, "bg-red-400/80"],
     ]);
   });
 });
 
 describe("status presentation", () => {
-  it("labels statuses from the local working-copy perspective", () => {
-    expect(statusLabel("added")).toBe("Added remotely");
-    expect(statusLabel("removed")).toBe("Removed remotely");
+  it("labels statuses by what the upload does with the file", () => {
+    expect(statusLabel("added")).toBe("New · will upload");
+    expect(statusLabel("removed")).toBe("Remote only · no local copy");
     expect(statusLabel("modified")).toBe("Modified");
+  });
+
+  it("keeps the green/red glyphs for add and remove", () => {
     expect(statusGlyph("added")).toBe("+");
     expect(statusGlyph("removed")).toBe("−");
     expect(statusGlyph("modified")).toBe("~");
+  });
+});
+
+describe("uploadDiff", () => {
+  it("treats the local copy as the new side so upload lines are green", () => {
+    const rows = uploadDiff("kept\nlocal addition\n", "kept\nremote addition\n");
+    expect(rows.filter((row) => row.kind === "added").map((row) => row.text)).toEqual([
+      "local addition",
+    ]);
+    expect(rows.filter((row) => row.kind === "removed").map((row) => row.text)).toEqual([
+      "remote addition",
+    ]);
   });
 });
 
